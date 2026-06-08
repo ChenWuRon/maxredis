@@ -10,12 +10,26 @@ namespace dfly {
 
 class RaftNode {
  public:
+  explicit RaftNode(NodeId node_id = "");
+
+  const NodeId& node_id() const {
+    return node_id_;
+  }
+
   RaftRole role() const {
     return role_;
   }
 
   Term term() const {
     return term_;
+  }
+
+  const NodeId& voted_for() const {
+    return voted_for_;
+  }
+
+  uint32_t vote_count() const {
+    return vote_count_;
   }
 
   void BecomeFollower(Term term);
@@ -27,8 +41,11 @@ class RaftNode {
   void OnElectionTimeout();
 
  private:
+  NodeId node_id_;
   RaftRole role_ = RaftRole::Follower;
   Term term_ = 0;
+  NodeId voted_for_;
+  uint32_t vote_count_ = 0;
 };
 
 }  // namespace dfly

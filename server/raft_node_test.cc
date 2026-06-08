@@ -16,40 +16,50 @@ class RaftNodeTest : public Test {
 };
 
 TEST_F(RaftNodeTest, InitialState) {
-  RaftNode node;
+  RaftNode node("node1");
+  EXPECT_EQ("node1", node.node_id());
   EXPECT_EQ(RaftRole::Follower, node.role());
   EXPECT_EQ(0u, node.term());
+  EXPECT_TRUE(node.voted_for().empty());
+  EXPECT_EQ(0u, node.vote_count());
 }
 
 TEST_F(RaftNodeTest, BecomeFollower) {
-  RaftNode node;
+  RaftNode node("n1");
   node.BecomeFollower(3);
   EXPECT_EQ(RaftRole::Follower, node.role());
   EXPECT_EQ(3u, node.term());
+  EXPECT_TRUE(node.voted_for().empty());
+  EXPECT_EQ(0u, node.vote_count());
 }
 
 TEST_F(RaftNodeTest, BecomeFollowerHigherTerm) {
-  RaftNode node;
+  RaftNode node("n1");
   node.BecomeFollower(1);
   EXPECT_EQ(1u, node.term());
   node.BecomeFollower(5);
   EXPECT_EQ(RaftRole::Follower, node.role());
   EXPECT_EQ(5u, node.term());
+  EXPECT_TRUE(node.voted_for().empty());
 }
 
 TEST_F(RaftNodeTest, BecomeCandidate) {
-  RaftNode node;
+  RaftNode node("node1");
   node.BecomeCandidate();
   EXPECT_EQ(RaftRole::Candidate, node.role());
   EXPECT_EQ(1u, node.term());
+  EXPECT_EQ("node1", node.voted_for());
+  EXPECT_EQ(1u, node.vote_count());
 }
 
 TEST_F(RaftNodeTest, BecomeCandidateIncrementsTerm) {
-  RaftNode node;
+  RaftNode node("mynode");
   node.BecomeFollower(5);
   node.BecomeCandidate();
   EXPECT_EQ(RaftRole::Candidate, node.role());
   EXPECT_EQ(6u, node.term());
+  EXPECT_EQ("mynode", node.voted_for());
+  EXPECT_EQ(1u, node.vote_count());
 }
 
 TEST_F(RaftNodeTest, BecomeLeader) {
