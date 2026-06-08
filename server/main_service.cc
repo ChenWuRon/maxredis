@@ -218,15 +218,54 @@ void Service::Debug(CmdArgList args, ConnectionContext* cntx) {
 void Service::Info(CmdArgList args, ConnectionContext* cntx) {
   string info;
   absl::StrAppend(&info, "# Server\r\n");
-  absl::StrAppend(&info, "redis_version:7.0.0\r\n");
+  absl::StrAppend(&info, "redis_version:7.2.0\r\n");
   absl::StrAppend(&info, "os:Linux\r\n");
   absl::StrAppend(&info, "tcp_port:6380\r\n");
+  absl::StrAppend(&info, "arch_bits:64\r\n");
+  absl::StrAppend(&info, "multiplexing_api:iouring\r\n");
+  absl::StrAppend(&info, "process_id:", getpid(), "\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Clients\r\n");
+  absl::StrAppend(&info, "connected_clients:1\r\n");
+  absl::StrAppend(&info, "blocked_clients:0\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Memory\r\n");
+  absl::StrAppend(&info, "used_memory:0\r\n");
+  absl::StrAppend(&info, "used_memory_human:0B\r\n");
+  absl::StrAppend(&info, "maxmemory:0\r\n");
+  absl::StrAppend(&info, "maxmemory_policy:noeviction\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Persistence\r\n");
+  absl::StrAppend(&info, "loading:0\r\n");
+  absl::StrAppend(&info, "rdb_enabled:0\r\n");
+  absl::StrAppend(&info, "aof_enabled:0\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Stats\r\n");
+  absl::StrAppend(&info, "total_connections_received:1\r\n");
+  absl::StrAppend(&info, "total_commands_processed:0\r\n");
+  absl::StrAppend(&info, "instantaneous_ops_per_sec:0\r\n");
+  absl::StrAppend(&info, "keyspace_hits:0\r\n");
+  absl::StrAppend(&info, "keyspace_misses:0\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Replication\r\n");
+  absl::StrAppend(&info, "role:master\r\n");
+  absl::StrAppend(&info, "connected_slaves:0\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# CPU\r\n");
+  absl::StrAppend(&info, "used_cpu_sys:0.000000\r\n");
+  absl::StrAppend(&info, "used_cpu_user:0.000000\r\n");
   absl::StrAppend(&info, "\r\n");
 
   absl::StrAppend(&info, "# Keyspace\r\n");
   atomic_ulong num_keys{0};
   shard_set_.RunBriefInParallel([&](EngineShard* es) { num_keys += es->db_slice.DbSize(0); });
-  absl::StrAppend(&info, "db0:keys=", num_keys.load(), ",expires=0\r\n");
+  absl::StrAppend(&info, "db0:keys=", num_keys.load(), ",expires=0,avg_ttl=0\r\n");
 
   cntx->SendRespBlob(absl::StrCat("$", info.size(), "\r\n", info, "\r\n"));
 }
