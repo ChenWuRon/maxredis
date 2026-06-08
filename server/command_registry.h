@@ -15,6 +15,7 @@
 namespace dfly {
 
 class ConnectionContext;
+struct ParsedCommand;
 
 namespace CO {
 
@@ -139,6 +140,9 @@ class CommandRegistry {
  private:
   // Implements COMMAND functionality.
   void Command(CmdArgList args, ConnectionContext* cntx);
+  void CommandDoc(ConnectionContext* cntx);
+  void CommandInfo(const ParsedCommand& pcmd, ConnectionContext* cntx);
+  void CommandCount(ConnectionContext* cntx);
 };
 
 }  // namespace dfly
