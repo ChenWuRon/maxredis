@@ -8,6 +8,7 @@
 #include "server/command_registry.h"
 #include "server/engine_shard_set.h"
 #include "server/snapshot_fiber.h"
+#include "server/state_machine.h"
 #include "util/http/http_handler.h"
 #include "server/memcache_parser.h"
 
@@ -75,6 +76,7 @@ class Service {
   PersistenceManager* persistence_manager_ = nullptr;
   bool replay_mode_ = false;
   SnapshotFiber snapshot_fiber_{this};
+  std::unique_ptr<IStateMachine> state_machine_;
 };
 
 }  // namespace dfly

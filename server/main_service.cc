@@ -49,6 +49,7 @@ Service::Service(ProactorPool* pp) : shard_set_(pp), pp_(*pp) {
   engine_varz.emplace("engine", [this] { return GetVarzStats(); });
 
   persistence_manager_ = new PersistenceManager;
+  state_machine_ = std::make_unique<KvStateMachine>(&shard_set_, &pp_);
 }
 
 Service::~Service() {
@@ -285,12 +286,7 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   string_view val = string_view(pcmd.tokens[2], sdslen(pcmd.tokens[2]));
   VLOG(2) << "Set " << key << " " << val;
 
-  ShardId sid = Shard(key, shard_count());
-  shard_set_.Await(sid, [&] {
-    EngineShard* es = EngineShard::tlocal();
-    auto [it, res] = es->db_slice.AddOrFind(0, key);
-    it->second.value = val;
-  });
+  state_machine_->Set(0, key, val);
 
   cntx->SendStored();
 
@@ -308,29 +304,10 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
 void Service::Get(CmdArgList args, ConnectionContext* cntx) {
   const ParsedCommand& pcmd = *cntx->to_execute;
   string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
-  ShardId sid = Shard(key, shard_count());
 
-  #if 0
-  OpResult<string> opres = shard_set_.Await(sid, [&]() -> OpResult<string> {
-    EngineShard* es = EngineShard::tlocal();
-    OpResult<MainIterator> res = es->db_slice.Find(0, key);
-    if (res) {
-      return res.value()->second;
-    }
-    return res.status();
-  });
-
-  if (opres) {
-    // cntx->SendGetReply(key, 0, opres.value());
-  } else if (opres.status() == OpStatus::KEY_NOTFOUND) {
-    cntx->SendGetNotFound();
-  }
-  cntx->EndMultilineReply();
-#else
   CHECK(cntx->to_execute);
   cntx->to_execute->execute_async = 1;
-  auto cb = [cntx, cmd = cntx->to_execute] {
-    EngineShard* es = EngineShard::tlocal();
+  auto cb = [cntx, cmd = cntx->to_execute](EngineShard* es) {
     string_view key = string_view(cmd->tokens[1], sdslen(cmd->tokens[1]));
     OpResult<MainIterator> res = es->db_slice.Find(0, key);
     if (res) {
@@ -339,8 +316,7 @@ void Service::Get(CmdArgList args, ConnectionContext* cntx) {
       cntx->SendGetNotFound(cmd);
     }
   };
-  shard_set_.Add(sid, cb);
-#endif
+  state_machine_->Schedule(0, key, std::move(cb));
 }
 
 void Service::Del(CmdArgList args, ConnectionContext* cntx) {
@@ -348,11 +324,7 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
   VLOG(2) << "Del " << key;
 
-  ShardId sid = Shard(key, shard_count());
-  bool deleted = shard_set_.Await(sid, [&] {
-    EngineShard* es = EngineShard::tlocal();
-    return es->db_slice.Del(0, key);
-  });
+  bool deleted = state_machine_->Del(0, key);
 
   cntx->SendLong(deleted ? 1 : 0);
 
@@ -378,12 +350,8 @@ void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
     return cntx->SendError("value is not an integer or out of range");
   }
 
-  ShardId sid = Shard(key, shard_count());
-  bool found = shard_set_.Await(sid, [&] {
-    EngineShard* es = EngineShard::tlocal();
-    uint64_t expire_at_ms = NowMs() + seconds * 1000;
-    return es->db_slice.SetExpire(0, key, expire_at_ms) == OpStatus::OK;
-  });
+  uint64_t expire_at_ms = NowMs() + seconds * 1000;
+  bool found = state_machine_->Expire(0, key, expire_at_ms);
 
   cntx->SendLong(found ? 1 : 0);
 }
@@ -503,9 +471,7 @@ void Service::Info(CmdArgList args, ConnectionContext* cntx) {
   absl::StrAppend(&info, "\r\n");
 
   absl::StrAppend(&info, "# Keyspace\r\n");
-  atomic_ulong num_keys{0};
-  shard_set_.RunBriefInParallel([&](EngineShard* es) { num_keys += es->db_slice.DbSize(0); });
-  absl::StrAppend(&info, "db0:keys=", num_keys.load(), ",expires=0,avg_ttl=0\r\n");
+  absl::StrAppend(&info, "db0:keys=", state_machine_->DbSize(0), ",expires=0,avg_ttl=0\r\n");
 
   cntx->SendRespBlob(absl::StrCat("$", info.size(), "\r\n", info, "\r\n"));
 }
@@ -513,9 +479,7 @@ void Service::Info(CmdArgList args, ConnectionContext* cntx) {
 VarzValue::Map Service::GetVarzStats() {
   VarzValue::Map res;
 
-  atomic_ulong num_keys{0};
-  shard_set_.RunBriefInParallel([&](EngineShard* es) { num_keys += es->db_slice.DbSize(0); });
-  res.emplace_back("keys", VarzValue::FromInt(num_keys.load()));
+  res.emplace_back("keys", VarzValue::FromInt(state_machine_->DbSize(0)));
 
   return res;
 }

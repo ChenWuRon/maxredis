@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,15 @@ enum class RaftRole : uint8_t {
   Candidate = 1,
   Leader = 2,
 };
+
+inline std::ostream& operator<<(std::ostream& os, RaftRole role) {
+  switch (role) {
+    case RaftRole::Follower: return os << "Follower";
+    case RaftRole::Candidate: return os << "Candidate";
+    case RaftRole::Leader: return os << "Leader";
+  }
+  return os << "Unknown(" << static_cast<int>(role) << ")";
+}
 
 using Term = uint64_t;
 using LogIndex = uint64_t;
