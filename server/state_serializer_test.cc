@@ -2,14 +2,14 @@
 // See LICENSE for licensing terms.
 //
 
-#include "server/state_serializer.h"
+#include "server/service/state_serializer.h"
 
 #include <gmock/gmock.h>
 
 #include <absl/strings/str_cat.h>
 
 #include "base/gtest.h"
-#include "server/db_slice.h"
+#include "server/storage/db_slice.h"
 
 namespace dfly {
 

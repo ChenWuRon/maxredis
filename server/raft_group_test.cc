@@ -2,7 +2,7 @@
 // See LICENSE for licensing terms.
 //
 
-#include "server/raft_group.h"
+#include "server/raft/raft_group.h"
 
 #include <gmock/gmock.h>
 

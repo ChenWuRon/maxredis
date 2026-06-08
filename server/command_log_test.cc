@@ -2,7 +2,7 @@
 // See LICENSE for licensing terms.
 //
 
-#include "server/command_log.h"
+#include "server/raft/command_log.h"
 
 #include <gmock/gmock.h>
 

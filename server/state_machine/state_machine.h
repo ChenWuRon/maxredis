@@ -1,0 +1,45 @@
+// Copyright 2021, Roman Gershman.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <functional>
+#include <cstdint>
+#include <string_view>
+
+#include "server/storage/common_types.h"
+#include "server/storage/op_status.h"
+
+namespace dfly {
+
+class CommandId;
+class EngineShard;
+
+enum class ApplyOp : uint8_t {
+  OK = 0,
+  NOT_FOUND = 1,
+  ERROR = 2,
+};
+
+struct ApplyResult {
+  ApplyOp op = ApplyOp::OK;
+  uint64_t affected_rows = 0;
+};
+
+class IStateMachine {
+ public:
+  virtual ~IStateMachine() = default;
+
+  virtual ApplyResult Apply(const CommandId* cid, CmdArgList args) = 0;
+
+  virtual void Set(DbIndex db_ind, std::string_view key, std::string_view val) = 0;
+  virtual bool Del(DbIndex db_ind, std::string_view key) = 0;
+  virtual bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) = 0;
+  virtual OpResult<std::string> Get(DbIndex db_ind, std::string_view key) = 0;
+  virtual size_t DbSize(DbIndex db_ind) const = 0;
+  virtual void Schedule(DbIndex db_ind, std::string_view key,
+                         std::function<void(EngineShard*)> cb) = 0;
+};
+
+}  // namespace dfly

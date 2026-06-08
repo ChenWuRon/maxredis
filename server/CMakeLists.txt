@@ -1,22 +1,27 @@
-add_executable(midi-redis dfly_main.cc)
+add_subdirectory(persistence)
+
+add_executable(midi-redis service/dfly_main.cc)
 cxx_link(midi-redis base dragonfly_lib persistence_lib TRDP::mimalloc2)
 
-add_library(dragonfly_lib command_log.cc command_registry.cc command_serializer.cc common_types.cc config_flags.cc 
-            conn_context.cc db_slice.cc debugcmd.cc dragonfly_listener.cc
-            dragonfly_connection.cc engine_shard_set.cc 
-            main_service.cc memcache_parser.cc 
-            raft_engine.cc raft_node.cc raft_storage.cc redis_parser.cc resp_expr.cc reply_builder.cc
-            snapshot_fiber.cc state_machine.cc state_serializer.cc)
+add_library(dragonfly_lib 
+            protocol/conn_context.cc protocol/redis_parser.cc protocol/memcache_parser.cc
+            protocol/resp_expr.cc protocol/reply_builder.cc
+            raft/command_log.cc raft/raft_engine.cc raft/raft_node.cc raft/raft_storage.cc
+            service/command_registry.cc service/command_serializer.cc service/config_flags.cc
+            service/debugcmd.cc service/dragonfly_connection.cc service/dragonfly_listener.cc
+            service/main_service.cc service/snapshot_fiber.cc service/state_serializer.cc
+            state_machine/kv_state_machine.cc
+            storage/common_types.cc storage/db_slice.cc storage/engine_shard_set.cc)
 
 cxx_link(dragonfly_lib 
          fibers2 strings_lib http_server_lib tls_lib redis_dict)
 
-add_library(dfly_test_lib test_utils.cc)
+add_library(dfly_test_lib service/test_utils.cc)
 cxx_link(dfly_test_lib dragonfly_lib gtest_main_ext)
 
-cxx_test(redis_parser_test dfly_test_lib LABELS DFLY)
-cxx_test(memcache_parser_test dfly_test_lib LABELS DFLY)
-cxx_test(command_serializer_test dragonfly_lib LABELS DFLY)
+cxx_test(protocol/redis_parser_test dfly_test_lib LABELS DFLY)
+cxx_test(protocol/memcache_parser_test dfly_test_lib LABELS DFLY)
+cxx_test(service/command_serializer_test dragonfly_lib LABELS DFLY)
 cxx_test(command_log_test dragonfly_lib LABELS DFLY)
 cxx_test(raft_group_test dragonfly_lib LABELS DFLY)
 cxx_test(raft_node_test dragonfly_lib LABELS DFLY)
