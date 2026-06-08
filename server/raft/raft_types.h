@@ -41,4 +41,9 @@ struct LogEntry {
   }
 };
 
+struct ElectionResult {
+  uint32_t votes_received = 0;
+  uint32_t votes_rejected = 0;
+};
+
 }  // namespace dfly

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "server/raft/raft_types.h"
 #include "server/raft/vote_rpc.h"
 
@@ -33,6 +35,8 @@ class RaftNode {
     return vote_count_;
   }
 
+  void AddPeer(RaftNode* peer);
+
   void BecomeFollower(Term term);
   void BecomeCandidate();
   void BecomeLeader();
@@ -44,12 +48,26 @@ class RaftNode {
   // Processes an incoming VoteRequest according to Raft rules.
   VoteResponse OnRequestVote(const VoteRequest& request);
 
+  // Transitions to Candidate, sends VoteRequest to all peers,
+  // collects responses, and returns the tally.
+  ElectionResult StartElection();
+
+  // Checks if votes_received >= majority (N/2+1).
+  // If so, calls BecomeLeader() and returns true.
+  bool TryBecomeLeader(const ElectionResult& result);
+
+  Term leader_term() const {
+    return leader_term_;
+  }
+
  private:
   NodeId node_id_;
   RaftRole role_ = RaftRole::Follower;
   Term term_ = 0;
+  Term leader_term_ = 0;
   NodeId voted_for_;
   uint32_t vote_count_ = 0;
+  std::vector<RaftNode*> peers_;
 };
 
 }  // namespace dfly

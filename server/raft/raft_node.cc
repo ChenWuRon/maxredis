@@ -15,6 +15,7 @@ void RaftNode::BecomeFollower(Term term) {
   DCHECK_GE(term, term_);
   term_ = term;
   role_ = RaftRole::Follower;
+  leader_term_ = 0;
   voted_for_.clear();
   vote_count_ = 0;
 }
@@ -35,6 +36,7 @@ void RaftNode::BecomeCandidate() {
 void RaftNode::BecomeLeader() {
   DCHECK_EQ(role_, RaftRole::Candidate);
   role_ = RaftRole::Leader;
+  leader_term_ = term_;
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
@@ -58,6 +60,47 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   // Rule 4: Grant vote.
   voted_for_ = request.candidate_id;
   return {term_, true};
+}
+
+void RaftNode::AddPeer(RaftNode* peer) {
+  peers_.push_back(peer);
+}
+
+ElectionResult RaftNode::StartElection() {
+  BecomeCandidate();
+
+  VoteRequest request;
+  request.term = term_;
+  request.candidate_id = node_id_;
+  request.last_log_index = 0;
+  request.last_log_term = 0;
+
+  ElectionResult result;
+  result.votes_received = vote_count_;  // self vote
+
+  for (RaftNode* peer : peers_) {
+    VoteResponse rsp = peer->OnRequestVote(request);
+    if (rsp.vote_granted) {
+      result.votes_received++;
+    } else {
+      result.votes_rejected++;
+    }
+  }
+
+  vote_count_ = result.votes_received;
+  TryBecomeLeader(result);
+  return result;
+}
+
+bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
+  size_t total_nodes = peers_.size() + 1;  // self + peers
+  size_t majority = total_nodes / 2 + 1;
+
+  if (result.votes_received >= majority) {
+    BecomeLeader();
+    return true;
+  }
+  return false;
 }
 
 }  // namespace dfly

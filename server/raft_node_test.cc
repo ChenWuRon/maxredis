@@ -180,4 +180,140 @@ TEST_F(RaftNodeTest, GrantVoteToSameCandidateAgain) {
   EXPECT_EQ("Node2", node.voted_for());
 }
 
+// --- StartElection tests ---
+
+TEST_F(RaftNodeTest, ThreeNodesAllGrant) {
+  RaftNode n1("Node1");
+  RaftNode n2("Node2");
+  RaftNode n3("Node3");
+
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  ElectionResult result = n1.StartElection();
+
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+  EXPECT_EQ(1u, n1.term());
+  EXPECT_EQ(1u, n1.leader_term());
+  EXPECT_EQ(3u, result.votes_received);
+  EXPECT_EQ(0u, result.votes_rejected);
+}
+
+TEST_F(RaftNodeTest, OnePeerRejects) {
+  RaftNode n1("Node1");
+  RaftNode n2("Node2");
+  RaftNode n3("Node3");
+
+  // n2 already voted for someone else in this term
+  n2.BecomeFollower(1);
+  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  ElectionResult result = n1.StartElection();
+
+  EXPECT_EQ(2u, result.votes_received);  // self + n3
+  EXPECT_EQ(1u, result.votes_rejected);  // n2
+}
+
+TEST_F(RaftNodeTest, StaleTermPeerRejects) {
+  RaftNode n1("Node1");
+  RaftNode n2("Node2");
+
+  // n2 has a higher term
+  n2.BecomeFollower(5);
+
+  n1.AddPeer(&n2);
+
+  ElectionResult result = n1.StartElection();
+
+  // n1's term starts at 0, becomes 1 after StartElection
+  // n2 has term 5 > 1, so n2 rejects n1's vote request
+  EXPECT_EQ(1u, result.votes_received);  // only self
+  EXPECT_EQ(1u, result.votes_rejected);
+  EXPECT_EQ(1u, n1.term());
+  EXPECT_EQ(5u, n2.term());
+  EXPECT_EQ(RaftRole::Candidate, n1.role());
+}
+
+// --- TryBecomeLeader tests ---
+
+TEST_F(RaftNodeTest, ThreeNodesThreeVotesBecomesLeader) {
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  ElectionResult r = n1.StartElection();
+  EXPECT_EQ(3u, r.votes_received);
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
+TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  // n2 already voted for other in this term
+  n2.BecomeFollower(1);
+  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  ElectionResult r = n1.StartElection();
+  // n1 term = 2 (since n2 has term 1, n1 becomes term 2 via Follower step-down)
+  // Actually: n1.StartElection → BecomeCandidate → term 0→1
+  // n2 rejects (voted for Other), n3 grants
+  // votes = self(1) + n3(1) = 2
+  // Majority = 3/2+1 = 2
+  EXPECT_EQ(2u, r.votes_received);
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
+TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  // both peers already voted for other
+  n2.BecomeFollower(1);
+  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n3.BecomeFollower(1);
+  n3.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  ElectionResult r = n1.StartElection();
+  EXPECT_EQ(1u, r.votes_received);  // only self
+  EXPECT_EQ(RaftRole::Candidate, n1.role());
+}
+
+TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
+  RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+  n1.AddPeer(&n4);
+  n1.AddPeer(&n5);
+
+  ElectionResult r = n1.StartElection();
+  EXPECT_EQ(5u, r.votes_received);
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
+TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
+  RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
+  // three peers already voted for other
+  n2.BecomeFollower(1);
+  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n3.BecomeFollower(1);
+  n3.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n4.BecomeFollower(1);
+  n4.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+  n1.AddPeer(&n4);
+  n1.AddPeer(&n5);
+
+  ElectionResult r = n1.StartElection();
+  EXPECT_EQ(2u, r.votes_received);  // self + n5
+  EXPECT_EQ(RaftRole::Candidate, n1.role());
+}
+
 }  // namespace dfly
