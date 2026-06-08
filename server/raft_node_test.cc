@@ -7,6 +7,7 @@
 #include <gmock/gmock.h>
 
 #include "base/gtest.h"
+#include "server/raft/raft_storage.h"
 
 namespace dfly {
 
@@ -394,6 +395,112 @@ TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
   EXPECT_EQ(RaftRole::Follower, n2.role());
   EXPECT_EQ(RaftRole::Follower, n3.role());
   EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
+// --- AppendEntries tests ---
+
+TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
+  RaftStorage leader_storage, follower_storage;
+  RaftNode leader("L1"), follower("F1");
+  leader.SetStorage(&leader_storage);
+  follower.SetStorage(&follower_storage);
+  leader.AddPeer(&follower);
+
+  leader_storage.AppendLog(LogEntry{1, 0, "cmd1"});
+  leader_storage.AppendLog(LogEntry{1, 0, "cmd2"});
+  leader_storage.AppendLog(LogEntry{2, 0, "cmd3"});
+
+  leader.ReplicateLog();
+
+  EXPECT_EQ(3, follower_storage.LogSize());
+  EXPECT_EQ("cmd1", follower_storage.EntryAt(1).command);
+  EXPECT_EQ("cmd2", follower_storage.EntryAt(2).command);
+  EXPECT_EQ("cmd3", follower_storage.EntryAt(3).command);
+}
+
+TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
+  RaftStorage leader_storage, follower_storage;
+  RaftNode leader("L1"), follower("F1");
+  leader.SetStorage(&leader_storage);
+  follower.SetStorage(&follower_storage);
+  leader.AddPeer(&follower);
+
+  leader_storage.AppendLog(LogEntry{1, 0, "a"});
+  leader_storage.AppendLog(LogEntry{1, 0, "b"});
+  leader_storage.AppendLog(LogEntry{2, 0, "c"});
+
+  // Follower already has first entry
+  follower_storage.AppendLog(LogEntry{1, 0, "a"});
+
+  leader.ReplicateLog();
+
+  EXPECT_EQ(3, follower_storage.LogSize());
+  EXPECT_EQ("b", follower_storage.EntryAt(2).command);
+  EXPECT_EQ("c", follower_storage.EntryAt(3).command);
+}
+
+TEST_F(RaftNodeTest, AppendEntriesRejectsPrevLogMismatch) {
+  RaftStorage leader_storage, follower_storage;
+  RaftNode leader("L1"), follower("F1");
+  leader.SetStorage(&leader_storage);
+  follower.SetStorage(&follower_storage);
+  leader.AddPeer(&follower);
+
+  leader_storage.AppendLog(LogEntry{2, 0, "x"});
+
+  // Follower has a different entry at index 1
+  follower_storage.AppendLog(LogEntry{1, 0, "y"});
+
+  // Manually send with specific prev_log_index/term that won't match
+  AppendEntriesRequest req;
+  req.term = 2;
+  req.leader_id = "L1";
+  req.prev_log_index = 1;
+  req.prev_log_term = 999;  // won't match follower's term at index 1
+
+  AppendEntriesResponse rsp = follower.OnAppendEntries(req);
+
+  EXPECT_FALSE(rsp.success);
+  EXPECT_EQ(0u, rsp.last_log_index);
+}
+
+TEST_F(RaftNodeTest, AppendEntriesAcceptsMatchingPrevLog) {
+  RaftStorage follower_storage;
+  RaftNode follower("F1");
+  follower.SetStorage(&follower_storage);
+
+  follower_storage.AppendLog(LogEntry{1, 0, "a"});
+  follower_storage.AppendLog(LogEntry{2, 0, "b"});
+
+  AppendEntriesRequest req;
+  req.term = 2;
+  req.leader_id = "L1";
+  req.prev_log_index = 2;
+  req.prev_log_term = 2;  // matches follower's entry at index 2
+  LogEntry new_entry{2, 0, "c"};
+  new_entry.index = 3;  // this will be the next index after prev_log_index
+  req.entries = {new_entry};
+
+  AppendEntriesResponse rsp = follower.OnAppendEntries(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(3, follower_storage.LogSize());
+  EXPECT_EQ("c", follower_storage.EntryAt(3).command);
+}
+
+TEST_F(RaftNodeTest, AppendEntriesStaleTermRejected) {
+  RaftStorage follower_storage;
+  RaftNode follower("F1");
+  follower.SetStorage(&follower_storage);
+  follower.BecomeFollower(10);
+
+  AppendEntriesRequest req;
+  req.term = 5;  // stale
+
+  AppendEntriesResponse rsp = follower.OnAppendEntries(req);
+
+  EXPECT_FALSE(rsp.success);
+  EXPECT_EQ(10u, rsp.term);
 }
 
 }  // namespace dfly

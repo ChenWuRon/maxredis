@@ -7,12 +7,15 @@
 #include <atomic>
 #include <vector>
 
+#include "server/raft/append_entries_rpc.h"
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/vote_rpc.h"
 #include "util/fibers/fibers.h"
 
 namespace dfly {
+
+class RaftStorage;
 
 class RaftNode {
  public:
@@ -75,6 +78,17 @@ class RaftNode {
   // Stops the heartbeat fiber.
   void StopHeartbeat();
 
+  // Associates a RaftStorage for log operations.
+  void SetStorage(RaftStorage* storage) {
+    storage_ = storage;
+  }
+
+  // Follower-side: processes an incoming AppendEntries request.
+  AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
+
+  // Leader-side: sends all log entries to every peer.
+  void ReplicateLog();
+
  private:
   void HeartbeatLoop();
 
@@ -86,6 +100,7 @@ class RaftNode {
   uint32_t vote_count_ = 0;
   std::vector<RaftNode*> peers_;
 
+  RaftStorage* storage_ = nullptr;
   std::atomic<bool> shutdown_{false};
   util::fb2::Fiber heartbeat_fiber_;
   uint32_t heartbeat_interval_ms_ = 50;

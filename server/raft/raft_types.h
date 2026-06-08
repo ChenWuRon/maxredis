@@ -39,6 +39,10 @@ struct LogEntry {
   LogEntry(Term t, LogIndex i, std::string cmd)
       : term(t), index(i), command(std::move(cmd)) {
   }
+
+  bool operator==(const LogEntry& o) const {
+    return term == o.term && index == o.index && command == o.command;
+  }
 };
 
 struct ElectionResult {

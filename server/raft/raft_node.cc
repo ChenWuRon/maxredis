@@ -5,6 +5,7 @@
 #include "server/raft/raft_node.h"
 
 #include "base/logging.h"
+#include "server/raft/raft_storage.h"
 
 namespace dfly {
 
@@ -142,6 +143,65 @@ void RaftNode::HeartbeatLoop() {
   while (!shutdown_.load(std::memory_order_acquire) && role_ == RaftRole::Leader) {
     SendHeartbeatToPeers();
     util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
+  }
+}
+
+AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {
+  // Rule 1: Stale term — reject.
+  if (req.term < term_) {
+    LogIndex my_last = storage_ ? storage_->LastLogIndex() : 0;
+    return {term_, false, my_last};
+  }
+
+  // Rule 2: Valid heartbeat — become follower (resets election timer).
+  if (req.term >= term_) {
+    BecomeFollower(req.term);
+  }
+
+  // Rule 3: Check prev_log_index / prev_log_term match.
+  if (storage_) {
+    if (req.prev_log_index > storage_->LastLogIndex()) {
+      return {term_, false, storage_->LastLogIndex()};
+    }
+    if (req.prev_log_index > 0 &&
+        storage_->EntryAt(req.prev_log_index).term != req.prev_log_term) {
+      return {term_, false, req.prev_log_index - 1};
+    }
+
+    // Rule 4: Append entries with index matching.
+    for (const auto& entry : req.entries) {
+      if (entry.index <= storage_->LastLogIndex()) {
+        if (storage_->EntryAt(entry.index).term != entry.term) {
+          storage_->TruncateSuffix(entry.index - 1);
+          storage_->AppendLog(entry);
+        }
+      } else if (entry.index == storage_->LastLogIndex() + 1) {
+        storage_->AppendLog(entry);
+      }
+    }
+  }
+
+  LogIndex my_last = storage_ ? storage_->LastLogIndex() : 0;
+  return {term_, true, my_last};
+}
+
+void RaftNode::ReplicateLog() {
+  if (!storage_ || peers_.empty())
+    return;
+
+  AppendEntriesRequest req;
+  req.term = term_;
+  req.leader_id = node_id_;
+  req.leader_commit = 0;
+
+  // Send all entries from the beginning.
+  size_t log_size = storage_->LogSize();
+  if (log_size > 0) {
+    req.entries = storage_->ReadLog(1);
+  }
+
+  for (RaftNode* peer : peers_) {
+    peer->OnAppendEntries(req);
   }
 }
 
