@@ -316,4 +316,84 @@ TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
   EXPECT_EQ(RaftRole::Candidate, n1.role());
 }
 
+// --- OnHeartbeat tests ---
+
+TEST_F(RaftNodeTest, HeartbeatStaleTermRejected) {
+  RaftNode node("A");
+  node.BecomeFollower(10);
+
+  HeartbeatRequest req{5, "Leader"};  // stale term
+  HeartbeatResponse rsp = node.OnHeartbeat(req);
+
+  EXPECT_FALSE(rsp.success);
+  EXPECT_EQ(10u, rsp.term);
+  EXPECT_EQ(10u, node.term());
+  EXPECT_EQ(RaftRole::Follower, node.role());
+}
+
+TEST_F(RaftNodeTest, HeartbeatSameTermAccepted) {
+  RaftNode node("A");
+  node.BecomeFollower(5);
+
+  HeartbeatRequest req{5, "Leader"};
+  HeartbeatResponse rsp = node.OnHeartbeat(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(5u, rsp.term);
+  EXPECT_EQ(RaftRole::Follower, node.role());
+}
+
+TEST_F(RaftNodeTest, HeartbeatHigherTermAccepted) {
+  RaftNode node("A");
+  node.BecomeFollower(5);
+
+  HeartbeatRequest req{8, "NewLeader"};
+  HeartbeatResponse rsp = node.OnHeartbeat(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(8u, rsp.term);
+  EXPECT_EQ(8u, node.term());
+  EXPECT_EQ(RaftRole::Follower, node.role());
+}
+
+TEST_F(RaftNodeTest, HeartbeatFromCandidateStepsDown) {
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+
+  // n1 becomes Candidate
+  n1.BecomeCandidate();
+
+  // Another node sends heartbeat with same term — n1 should step down
+  HeartbeatRequest req{1, "N2"};
+  HeartbeatResponse rsp = n1.OnHeartbeat(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(RaftRole::Follower, n1.role());
+  EXPECT_TRUE(n1.voted_for().empty());
+}
+
+TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  n1.AddPeer(&n2);
+  n1.AddPeer(&n3);
+  n2.AddPeer(&n1);
+  n2.AddPeer(&n3);
+
+  // Elect n1 as leader
+  n1.StartElection();
+  ASSERT_EQ(RaftRole::Leader, n1.role());
+
+  // Send heartbeats from n1 to followers
+  HeartbeatRequest hb{n1.term(), n1.node_id()};
+  HeartbeatResponse rsp2 = n2.OnHeartbeat(hb);
+  HeartbeatResponse rsp3 = n3.OnHeartbeat(hb);
+
+  EXPECT_TRUE(rsp2.success);
+  EXPECT_TRUE(rsp3.success);
+  EXPECT_EQ(RaftRole::Follower, n2.role());
+  EXPECT_EQ(RaftRole::Follower, n3.role());
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
 }  // namespace dfly

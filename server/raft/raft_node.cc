@@ -103,4 +103,46 @@ bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
   return false;
 }
 
+HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
+  // Rule 1: Stale term — reject.
+  if (request.term < term_) {
+    return {term_, false};
+  }
+
+  // Rule 2: Valid heartbeat — update state and become follower.
+  if (request.term >= term_) {
+    BecomeFollower(request.term);
+  }
+
+  return {term_, true};
+}
+
+void RaftNode::SendHeartbeatToPeers() {
+  HeartbeatRequest req{term_, node_id_};
+  for (RaftNode* peer : peers_) {
+    peer->OnHeartbeat(req);
+  }
+}
+
+void RaftNode::StartHeartbeat(uint32_t interval_ms) {
+  heartbeat_interval_ms_ = interval_ms;
+  if (heartbeat_fiber_.IsJoinable())
+    return;
+  shutdown_.store(false, std::memory_order_release);
+  heartbeat_fiber_ = util::fb2::Fiber("heartbeat", [this] { HeartbeatLoop(); });
+}
+
+void RaftNode::StopHeartbeat() {
+  shutdown_.store(true, std::memory_order_release);
+  if (heartbeat_fiber_.IsJoinable())
+    heartbeat_fiber_.Join();
+}
+
+void RaftNode::HeartbeatLoop() {
+  while (!shutdown_.load(std::memory_order_acquire) && role_ == RaftRole::Leader) {
+    SendHeartbeatToPeers();
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
+  }
+}
+
 }  // namespace dfly
