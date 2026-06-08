@@ -60,10 +60,13 @@ class Service {
 
   base::VarzValue::Map GetVarzStats();
 
+  void ReplayAof();
+
   CommandRegistry registry_;
   EngineShardSet shard_set_;
   util::ProactorPool& pp_;
   PersistenceManager* persistence_manager_ = nullptr;
+  bool replay_mode_ = false;
 };
 
 }  // namespace dfly

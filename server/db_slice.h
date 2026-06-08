@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "server/common_types.h"
 #include "server/op_status.h"
 
@@ -55,6 +57,10 @@ class DbSlice {
 
   // Returns existing keys count in the db.
   size_t DbSize(DbIndex db_ind) const;
+
+  // Calls 'visitor' for each (key, value) pair in the given db.
+  // The entry may be expired; the caller should check expire_ms if needed.
+  void Traverse(DbIndex db_ind, std::function<void(std::string_view, const MainValue&)> visitor) const;
 
   ShardId shard_id() const { return shard_id_;}
 

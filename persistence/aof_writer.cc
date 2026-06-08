@@ -23,7 +23,7 @@ AofWriter::~AofWriter() {
 bool AofWriter::Open(std::string_view path) {
   DCHECK(!file_);
 
-  file_ = fopen(path.data(), "w");
+  file_ = fopen(path.data(), "a");
   if (!file_) {
     LOG(ERROR) << "Failed to open AOF file: " << path;
     return false;

@@ -25,6 +25,10 @@ class PersistenceManager {
   // Flushes buffered AOF data to disk.
   void Flush();
 
+  // Reads the full content of the AOF file into 'out'. Returns false if the file
+  // cannot be read (e.g. does not exist, empty, or I/O error).
+  bool Load(std::string* out);
+
  private:
   AofWriter aof_writer_;
 };

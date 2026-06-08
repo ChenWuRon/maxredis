@@ -21,6 +21,9 @@ extern "C" {
 #include "util/metrics/metrics.h"
 #include "util/varz.h"
 
+#include "io/io.h"
+#include "server/dragonfly_connection.h"
+
 ABSL_FLAG(uint32_t, port, 6380, "Redis port");
 ABSL_FLAG(uint32_t, memcache_port, 0, "Memcached port");
 
@@ -62,6 +65,8 @@ void Service::Init(util::AcceptServer* acceptor) {
   });
 
   persistence_manager_->Open("appendonly.aof");
+
+  ReplayAof();
 }
 
 void Service::Shutdown() {
@@ -71,6 +76,96 @@ void Service::Shutdown() {
   for (unsigned i = 0; i < shard_set_.size(); ++i) {
     shard_set_.pool()->at(i)->Await([&] { EngineShard::DestroyThreadLocal(); });
   }
+}
+
+namespace {
+
+vector<vector<string>> ParseRespCommands(string_view content) {
+  vector<vector<string>> commands;
+  size_t pos = 0;
+  while (pos < content.size()) {
+    if (content[pos] == '*') {
+      pos++;
+      size_t end = content.find("\r\n", pos);
+      if (end == string::npos) break;
+      int argc = stoi(string(content.substr(pos, end - pos)));
+      pos = end + 2;
+
+      vector<string> args;
+      for (int i = 0; i < argc; i++) {
+        if (pos >= content.size() || content[pos] != '$') break;
+        pos++;
+        end = content.find("\r\n", pos);
+        if (end == string::npos) break;
+        int len = stoi(string(content.substr(pos, end - pos)));
+        pos = end + 2;
+
+        if (pos + len > content.size()) break;
+        args.emplace_back(content.substr(pos, len));
+        pos += len;
+        if (pos + 2 > content.size()) break;
+        pos += 2;
+      }
+      if (!args.empty()) {
+        commands.push_back(std::move(args));
+      }
+    } else if (content[pos] == '\r' && pos + 1 < content.size() && content[pos + 1] == '\n') {
+      pos += 2;
+    } else if (content[pos] == '\n') {
+      pos++;
+    } else {
+      break;
+    }
+  }
+  return commands;
+}
+
+}  // namespace
+
+void Service::ReplayAof() {
+  string content;
+  if (!persistence_manager_->Load(&content)) {
+    return;
+  }
+
+  auto commands = ParseRespCommands(content);
+  if (commands.empty()) {
+    return;
+  }
+
+  LOG(INFO) << "Replaying " << commands.size() << " commands from AOF";
+
+  replay_mode_ = true;
+
+  io::NullSink null_sink;
+  Connection conn(Protocol::REDIS, this, nullptr);
+  ConnectionContext cntx(&null_sink, &conn);
+  cntx.shard_set = &shard_set_;
+
+  for (const auto& cmd_args : commands) {
+    unsigned argc = cmd_args.size();
+    sds* tokens = (sds*)malloc(argc * sizeof(sds));
+    for (unsigned i = 0; i < argc; i++) {
+      tokens[i] = sdsnewlen(cmd_args[i].data(), cmd_args[i].size());
+    }
+
+    ParsedCommand parsed_cmd;
+    parsed_cmd.tokens = tokens;
+    parsed_cmd.argc = argc;
+    parsed_cmd.parse_complete = 1;
+
+    cntx.to_execute = &parsed_cmd;
+
+    CmdArgList arg_list{reinterpret_cast<MutableStrSpan*>(tokens), argc};
+    DispatchCommand(arg_list, &cntx);
+
+    for (unsigned i = 0; i < argc; i++) {
+      sdsfree(tokens[i]);
+    }
+    free(tokens);
+  }
+
+  replay_mode_ = false;
 }
 
 void Service::DispatchCommand(CmdArgList deprecated, ConnectionContext* cntx) {
@@ -178,12 +273,14 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
 
   cntx->SendStored();
 
-  vector<string> cmd_args;
-  cmd_args.reserve(pcmd.argc);
-  for (unsigned i = 0; i < pcmd.argc; ++i) {
-    cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  if (!replay_mode_) {
+    vector<string> cmd_args;
+    cmd_args.reserve(pcmd.argc);
+    for (unsigned i = 0; i < pcmd.argc; ++i) {
+      cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+    }
+    persistence_manager_->RecordCommand(cmd_args);
   }
-  persistence_manager_->RecordCommand(cmd_args);
 }
 
 void Service::Get(CmdArgList args, ConnectionContext* cntx) {
@@ -237,12 +334,14 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
 
   cntx->SendLong(deleted ? 1 : 0);
 
-  vector<string> cmd_args;
-  cmd_args.reserve(pcmd.argc);
-  for (unsigned i = 0; i < pcmd.argc; ++i) {
-    cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  if (!replay_mode_) {
+    vector<string> cmd_args;
+    cmd_args.reserve(pcmd.argc);
+    for (unsigned i = 0; i < pcmd.argc; ++i) {
+      cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+    }
+    persistence_manager_->RecordCommand(cmd_args);
   }
-  persistence_manager_->RecordCommand(cmd_args);
 }
 
 void Service::Expire(CmdArgList args, ConnectionContext* cntx) {

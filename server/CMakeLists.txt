@@ -5,7 +5,8 @@ add_library(dragonfly_lib command_registry.cc command_serializer.cc common_types
             conn_context.cc db_slice.cc debugcmd.cc dragonfly_listener.cc
             dragonfly_connection.cc engine_shard_set.cc 
             main_service.cc memcache_parser.cc 
-            redis_parser.cc resp_expr.cc reply_builder.cc)
+            redis_parser.cc resp_expr.cc reply_builder.cc
+            state_serializer.cc)
 
 cxx_link(dragonfly_lib 
          fibers2 strings_lib http_server_lib tls_lib redis_dict)
@@ -16,3 +17,4 @@ cxx_link(dfly_test_lib dragonfly_lib gtest_main_ext)
 cxx_test(redis_parser_test dfly_test_lib LABELS DFLY)
 cxx_test(memcache_parser_test dfly_test_lib LABELS DFLY)
 cxx_test(command_serializer_test dragonfly_lib LABELS DFLY)
+cxx_test(state_serializer_test dragonfly_lib LABELS DFLY)

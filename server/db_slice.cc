@@ -144,6 +144,14 @@ bool DbSlice::AddIfNotExist(DbIndex db_ind, std::string_view key, MainValue obj,
   return true;
 }
 
+void DbSlice::Traverse(DbIndex db_ind, std::function<void(std::string_view, const MainValue&)> visitor) const {
+  DCHECK_LT(db_ind, db_arr_.size());
+  DCHECK(db_arr_[db_ind].main_table);
+  for (const auto& [key, val] : *db_arr_[db_ind].main_table) {
+    visitor(key, val);
+  }
+}
+
 size_t DbSlice::DbSize(DbIndex db_ind) const {
   DCHECK_LT(db_ind, db_array_size());
 
