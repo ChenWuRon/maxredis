@@ -32,6 +32,9 @@ class DbSlice {
   // Deletes a key. Returns true if the key existed.
   bool Del(DbIndex db_ind, std::string_view key);
 
+  // Sets expiry for an existing key. Returns OK or KEY_NOTFOUND.
+  OpStatus SetExpire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms);
+
   // Adds a new entry. Requires: key does not exist in this slice.
   void AddNew(DbIndex db_ind, std::string_view key, MainValue obj, uint64_t expire_at_ms);
 

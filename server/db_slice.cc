@@ -96,6 +96,18 @@ bool DbSlice::Del(DbIndex db_ind, std::string_view key) {
   return true;
 }
 
+OpStatus DbSlice::SetExpire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {
+  DCHECK_LT(db_ind, db_arr_.size());
+  DCHECK(db_arr_[db_ind].main_table);
+  auto& db = db_arr_[db_ind];
+  auto it = db.main_table->find(key);
+  if (it == db.main_table->end()) {
+    return OpStatus::KEY_NOTFOUND;
+  }
+  it->second.expire_ms = expire_at_ms;
+  return OpStatus::OK;
+}
+
 void DbSlice::AddNew(DbIndex db_ind, std::string_view key, MainValue obj, uint64_t expire_at_ms) {
   CHECK(AddIfNotExist(db_ind, key, std::move(obj), expire_at_ms));
 }
@@ -111,7 +123,7 @@ bool DbSlice::AddIfNotExist(DbIndex db_ind, std::string_view key, MainValue obj,
   db.stats.obj_memory_usage += (new_entry->first.capacity() + new_entry->second.value.capacity());
 
   if (expire_at_ms) {
-    // TODO
+    new_entry->second.expire_ms = expire_at_ms;
   }
 
   return true;

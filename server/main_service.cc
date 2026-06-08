@@ -5,6 +5,7 @@
 #include "server/main_service.h"
 
 #include <absl/strings/ascii.h>
+#include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <xxhash.h>
 
@@ -221,6 +222,27 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   cntx->SendLong(deleted ? 1 : 0);
 }
 
+void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
+  const ParsedCommand& pcmd = *cntx->to_execute;
+  string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
+  string_view val = string_view(pcmd.tokens[2], sdslen(pcmd.tokens[2]));
+  VLOG(2) << "Expire " << key << " " << val;
+
+  int64_t seconds;
+  if (!absl::SimpleAtoi(val, &seconds) || seconds < 0) {
+    return cntx->SendError("value is not an integer or out of range");
+  }
+
+  ShardId sid = Shard(key, shard_count());
+  bool found = shard_set_.Await(sid, [&] {
+    EngineShard* es = EngineShard::tlocal();
+    uint64_t expire_at_ms = NowMs() + seconds * 1000;
+    return es->db_slice.SetExpire(0, key, expire_at_ms) == OpStatus::OK;
+  });
+
+  cntx->SendLong(found ? 1 : 0);
+}
+
 void Service::Debug(CmdArgList args, ConnectionContext* cntx) {
   ToUpper(&args[1]);
 
@@ -308,6 +330,7 @@ void Service::RegisterCommands() {
             << CI{"SET", CO::WRITE | CO::DENYOOM, -3, 1, 1, 1}.HFUNC(Set)
             << CI{"GET", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Get)
             << CI{"DEL", CO::WRITE, -2, 1, 1, 1}.HFUNC(Del)
+            << CI{"EXPIRE", CO::WRITE, 3, 1, 1, 1}.HFUNC(Expire)
             << CI{"DEBUG", CO::RANDOM | CO::READONLY, -2, 0, 0, 0}.HFUNC(Debug)
             << CI{"INFO", CO::READONLY | CO::LOADING | CO::STALE, -1, 0, 0, 0}.HFUNC(Info);
 }

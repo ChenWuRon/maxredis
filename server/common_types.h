@@ -6,6 +6,7 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/strings/ascii.h>
+#include <absl/time/clock.h>
 #include <absl/types/span.h>
 #include <xxhash.h>
 
@@ -46,6 +47,10 @@ struct ConnectionState {
 template <typename View> inline ShardId Shard(const View& v, ShardId shard_num) {
   XXH64_hash_t hash = XXH64(v.data(), v.size(), 120577);
   return hash % shard_num;
+}
+
+inline uint64_t NowMs() {
+  return absl::GetCurrentTimeNanos() / 1000000;
 }
 
 struct PrimeValue {
