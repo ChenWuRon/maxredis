@@ -22,6 +22,10 @@ class RaftNode {
   void BecomeCandidate();
   void BecomeLeader();
 
+  // Called when the election timer fires.
+  // Transitions Follower → Candidate if still in Follower state.
+  void OnElectionTimeout();
+
  private:
   RaftRole role_ = RaftRole::Follower;
   Term term_ = 0;

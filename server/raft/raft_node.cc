@@ -14,6 +14,12 @@ void RaftNode::BecomeFollower(Term term) {
   role_ = RaftRole::Follower;
 }
 
+void RaftNode::OnElectionTimeout() {
+  if (role_ != RaftRole::Follower)
+    return;
+  BecomeCandidate();
+}
+
 void RaftNode::BecomeCandidate() {
   term_++;
   role_ = RaftRole::Candidate;
