@@ -15,6 +15,7 @@ namespace dfly {
 
 class CommandId;
 class EngineShard;
+struct LogEntry;
 
 enum class ApplyOp : uint8_t {
   OK = 0,
@@ -32,6 +33,10 @@ class IStateMachine {
   virtual ~IStateMachine() = default;
 
   virtual ApplyResult Apply(const CommandId* cid, CmdArgList args) = 0;
+
+  // Applies a committed Raft log entry. The command string is
+  // space-delimited: "SET key value" or "DEL key".
+  virtual ApplyResult ApplyLogEntry(const LogEntry& entry) = 0;
 
   virtual void Set(DbIndex db_ind, std::string_view key, std::string_view val) = 0;
   virtual bool Del(DbIndex db_ind, std::string_view key) = 0;

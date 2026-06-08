@@ -6,6 +6,7 @@
 
 #include <absl/time/clock.h>
 
+#include "server/raft/raft_types.h"
 #include "server/service/command_registry.h"
 #include "util/proactor_pool.h"
 
@@ -78,6 +79,29 @@ size_t KvStateMachine::DbSize(DbIndex db_ind) const {
     total += es->db_slice.DbSize(db_ind);
   });
   return total.load();
+}
+
+ApplyResult KvStateMachine::ApplyLogEntry(const LogEntry& entry) {
+  string_view cmd = entry.command;
+  auto space1 = cmd.find(' ');
+  if (space1 == string_view::npos)
+    return {ApplyOp::ERROR, 0};
+
+  string_view name = cmd.substr(0, space1);
+  if (name == "SET") {
+    auto space2 = cmd.find(' ', space1 + 1);
+    if (space2 == string_view::npos)
+      return {ApplyOp::ERROR, 0};
+    string_view key = cmd.substr(space1 + 1, space2 - space1 - 1);
+    string_view val = cmd.substr(space2 + 1);
+    Set(0, key, val);
+    return {ApplyOp::OK, 1};
+  }
+  if (name == "DEL") {
+    bool deleted = Del(0, cmd.substr(space1 + 1));
+    return {ApplyOp::OK, deleted ? 1u : 0u};
+  }
+  return {ApplyOp::ERROR, 0};
 }
 
 void KvStateMachine::Schedule(DbIndex db_ind, std::string_view key,

@@ -15,6 +15,7 @@
 
 namespace dfly {
 
+class IStateMachine;
 class RaftStorage;
 
 class RaftNode {
@@ -83,11 +84,30 @@ class RaftNode {
     storage_ = storage;
   }
 
+  // Associates a state machine for applying committed entries.
+  void SetStateMachine(IStateMachine* sm) {
+    state_machine_ = sm;
+  }
+
+  LogIndex commit_index() const {
+    return commit_index_;
+  }
+
+  LogIndex last_applied() const {
+    return last_applied_;
+  }
+
   // Follower-side: processes an incoming AppendEntries request.
   AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
 
   // Leader-side: sends all log entries to every peer.
   void ReplicateLog();
+
+  // Advances commit_index when a majority of peers have replicated an entry.
+  void AdvanceCommitIndex();
+
+  // Applies entries from last_applied+1 up to commit_index.
+  void ApplyCommittedLogs();
 
  private:
   void HeartbeatLoop();
@@ -101,6 +121,10 @@ class RaftNode {
   std::vector<RaftNode*> peers_;
 
   RaftStorage* storage_ = nullptr;
+  IStateMachine* state_machine_ = nullptr;
+  LogIndex commit_index_ = 0;
+  LogIndex last_applied_ = 0;
+  std::vector<LogIndex> peer_last_log_index_;
   std::atomic<bool> shutdown_{false};
   util::fb2::Fiber heartbeat_fiber_;
   uint32_t heartbeat_interval_ms_ = 50;

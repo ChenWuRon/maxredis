@@ -6,8 +6,12 @@
 
 #include <gmock/gmock.h>
 
+#include <string>
+#include <vector>
+
 #include "base/gtest.h"
 #include "server/raft/raft_storage.h"
+#include "server/state_machine/state_machine.h"
 
 namespace dfly {
 
@@ -501,6 +505,118 @@ TEST_F(RaftNodeTest, AppendEntriesStaleTermRejected) {
 
   EXPECT_FALSE(rsp.success);
   EXPECT_EQ(10u, rsp.term);
+}
+
+// --- Commit & Apply tests ---
+
+// Test-only state machine that records applied commands.
+class TestStateMachine : public IStateMachine {
+ public:
+  std::vector<LogEntry> applied;
+
+  ApplyResult Apply(const CommandId*, CmdArgList) override {
+    return {ApplyOp::OK, 0};
+  }
+  void Set(DbIndex, std::string_view, std::string_view) override {}
+  bool Del(DbIndex, std::string_view) override { return false; }
+  bool Expire(DbIndex, std::string_view, uint64_t) override { return false; }
+  OpResult<std::string> Get(DbIndex, std::string_view) override { return OpStatus::KEY_NOTFOUND; }
+  size_t DbSize(DbIndex) const override { return 0; }
+  void Schedule(DbIndex, std::string_view, std::function<void(EngineShard*)>) override {}
+
+  ApplyResult ApplyLogEntry(const LogEntry& entry) override {
+    applied.push_back(entry);
+    return {ApplyOp::OK, 1};
+  }
+};
+
+TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
+  RaftStorage leader_storage, f1_storage, f2_storage;
+  TestStateMachine sm;
+
+  RaftNode leader("L1"), follower1("F1"), follower2("F2");
+  leader.SetStorage(&leader_storage);
+  leader.SetStateMachine(&sm);
+  follower1.SetStorage(&f1_storage);
+  follower2.SetStorage(&f2_storage);
+  leader.AddPeer(&follower1);
+  leader.AddPeer(&follower2);
+
+  leader_storage.AppendLog(LogEntry{1, 0, "SET a 1"});
+  leader_storage.AppendLog(LogEntry{1, 0, "SET b 2"});
+
+  leader.ReplicateLog();
+
+  // 3 nodes: leader + 2 followers → majority = 2
+  // All 3 have both entries → commit_index = 2
+  EXPECT_EQ(2u, leader.commit_index());
+  EXPECT_EQ(2u, leader.last_applied());
+  ASSERT_EQ(2u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
+}
+
+TEST_F(RaftNodeTest, CommitStopsWithoutMajority) {
+  // 5 nodes: majority = 3. Only 2 peers receive the entry → commit doesn't advance.
+  RaftStorage leader_storage;
+  TestStateMachine sm;
+
+  RaftNode leader("L1");
+  leader.SetStorage(&leader_storage);
+  leader.SetStateMachine(&sm);
+
+  RaftNode p1("P1"), p2("P2"), p3("P3"), p4("P4");
+  RaftStorage s1, s2, s3, s4;
+  p1.SetStorage(&s1);
+  p2.SetStorage(&s2);
+  p3.SetStorage(&s3);
+  p4.SetStorage(&s4);
+  leader.AddPeer(&p1);
+  leader.AddPeer(&p2);
+  leader.AddPeer(&p3);
+  leader.AddPeer(&p4);
+
+  leader_storage.AppendLog(LogEntry{1, 0, "SET a 1"});
+
+  // Manually replicate to only 1 peer (total with leader = 2, majority = 3)
+  AppendEntriesRequest req;
+  req.term = 1;
+  req.leader_id = "L1";
+  req.entries = leader_storage.ReadLog(1);
+  p1.OnAppendEntries(req);
+
+  // Update peer tracking manually
+  leader.AdvanceCommitIndex();
+
+  // commit_index should still be 0 since only 2/5 have the entry
+  EXPECT_EQ(0u, leader.commit_index());
+  EXPECT_EQ(0u, leader.last_applied());
+}
+
+TEST_F(RaftNodeTest, FollowerAppliesViaLeaderCommit) {
+  RaftStorage storage;
+  TestStateMachine sm;
+  RaftNode follower("F1");
+  follower.SetStorage(&storage);
+  follower.SetStateMachine(&sm);
+
+  storage.AppendLog(LogEntry{1, 0, "SET a 1"});
+  storage.AppendLog(LogEntry{1, 0, "SET b 2"});
+
+  // Simulate leader sending AppendEntries with leader_commit=2
+  AppendEntriesRequest req;
+  req.term = 1;
+  req.leader_id = "L1";
+  req.leader_commit = 2;
+
+  AppendEntriesResponse rsp = follower.OnAppendEntries(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(2u, follower.commit_index());
+  EXPECT_EQ(2u, follower.last_applied());
+  ASSERT_EQ(2u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
 }
 
 }  // namespace dfly

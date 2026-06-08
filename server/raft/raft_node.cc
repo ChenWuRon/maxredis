@@ -4,8 +4,11 @@
 
 #include "server/raft/raft_node.h"
 
+#include <algorithm>
+
 #include "base/logging.h"
 #include "server/raft/raft_storage.h"
+#include "server/state_machine/state_machine.h"
 
 namespace dfly {
 
@@ -182,6 +185,13 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   }
 
   LogIndex my_last = storage_ ? storage_->LastLogIndex() : 0;
+
+  // Follower applies entries up to leader_commit.
+  if (req.leader_commit > commit_index_) {
+    commit_index_ = std::min(req.leader_commit, my_last);
+    ApplyCommittedLogs();
+  }
+
   return {term_, true, my_last};
 }
 
@@ -192,7 +202,7 @@ void RaftNode::ReplicateLog() {
   AppendEntriesRequest req;
   req.term = term_;
   req.leader_id = node_id_;
-  req.leader_commit = 0;
+  req.leader_commit = commit_index_;
 
   // Send all entries from the beginning.
   size_t log_size = storage_->LogSize();
@@ -200,8 +210,44 @@ void RaftNode::ReplicateLog() {
     req.entries = storage_->ReadLog(1);
   }
 
-  for (RaftNode* peer : peers_) {
-    peer->OnAppendEntries(req);
+  peer_last_log_index_.resize(peers_.size());
+  for (size_t i = 0; i < peers_.size(); i++) {
+    AppendEntriesResponse rsp = peers_[i]->OnAppendEntries(req);
+    peer_last_log_index_[i] = rsp.last_log_index;
+  }
+
+  AdvanceCommitIndex();
+  ApplyCommittedLogs();
+}
+
+void RaftNode::AdvanceCommitIndex() {
+  if (!storage_)
+    return;
+
+  std::vector<LogIndex> indexes;
+  indexes.push_back(storage_->LastLogIndex());
+  for (auto idx : peer_last_log_index_) {
+    indexes.push_back(idx);
+  }
+
+  std::sort(indexes.rbegin(), indexes.rend());
+  size_t total = peers_.size() + 1;
+  size_t majority = total / 2 + 1;
+  LogIndex candidate = indexes[majority - 1];
+
+  if (candidate > commit_index_) {
+    commit_index_ = candidate;
+  }
+}
+
+void RaftNode::ApplyCommittedLogs() {
+  if (!state_machine_ || !storage_)
+    return;
+
+  while (last_applied_ < commit_index_ && last_applied_ < storage_->LastLogIndex()) {
+    last_applied_++;
+    const LogEntry& entry = storage_->EntryAt(last_applied_);
+    state_machine_->ApplyLogEntry(entry);
   }
 }
 

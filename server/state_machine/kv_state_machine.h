@@ -19,6 +19,7 @@ class KvStateMachine : public IStateMachine {
   KvStateMachine(EngineShardSet* shard_set, util::ProactorPool* pp);
 
   ApplyResult Apply(const CommandId* cid, CmdArgList args) override;
+  ApplyResult ApplyLogEntry(const LogEntry& entry) override;
 
   void Set(DbIndex db_ind, std::string_view key, std::string_view val) override;
   bool Del(DbIndex db_ind, std::string_view key) override;
