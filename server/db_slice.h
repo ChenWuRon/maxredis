@@ -24,7 +24,7 @@ class DbSlice {
   // Activates `db_ind` database if it does not exist (see ActivateDb below).
   void Reserve(DbIndex db_ind, size_t key_size);
 
-  OpResult<MainIterator> Find(DbIndex db_index, std::string_view key) const;
+  OpResult<MainIterator> Find(DbIndex db_index, std::string_view key);
 
   // Return .second=true if insertion ocurred, false if we return the existing key.
   std::pair<MainIterator, bool> AddOrFind(DbIndex db_ind, std::string_view key);

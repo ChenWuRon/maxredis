@@ -40,7 +40,7 @@ void DbSlice::Reserve(DbIndex db_ind, size_t key_size) {
   db.main_table->reserve(key_size);
 }
 
-auto DbSlice::Find(DbIndex db_index, std::string_view key) const -> OpResult<MainIterator> {
+auto DbSlice::Find(DbIndex db_index, std::string_view key) -> OpResult<MainIterator> {
   DCHECK_LT(db_index, db_arr_.size());
   DCHECK(db_arr_[db_index].main_table);
 
@@ -48,6 +48,12 @@ auto DbSlice::Find(DbIndex db_index, std::string_view key) const -> OpResult<Mai
   MainIterator it = db.main_table->find(key);
 
   if (it == db.main_table->end()) {
+    return OpStatus::KEY_NOTFOUND;
+  }
+
+  if (it->second.expire_ms != 0 && it->second.expire_ms <= NowMs()) {
+    db.stats.obj_memory_usage -= (it->first.capacity() + it->second.value.capacity());
+    db.main_table->erase(it);
     return OpStatus::KEY_NOTFOUND;
   }
 
@@ -63,8 +69,17 @@ auto DbSlice::AddOrFind(DbIndex db_index, std::string_view key) -> pair<MainIter
   pair<MainIterator, bool> res = db.main_table->emplace(key, MainValue{});
   if (res.second) {  // new entry
     db.stats.obj_memory_usage += res.first->first.capacity();
-
     return make_pair(res.first, true);
+  }
+
+  // Key exists, check if expired.
+  if (res.first->second.expire_ms != 0 && res.first->second.expire_ms <= NowMs()) {
+    db.stats.obj_memory_usage -= (res.first->first.capacity() + res.first->second.value.capacity());
+    db.main_table->erase(res.first);
+    auto [new_it, inserted] = db.main_table->emplace(key, MainValue{});
+    CHECK(inserted);
+    db.stats.obj_memory_usage += new_it->first.capacity();
+    return {new_it, true};
   }
 
   return res;
