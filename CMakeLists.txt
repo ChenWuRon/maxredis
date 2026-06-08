@@ -78,3 +78,4 @@ set_target_properties(TRDP::mimalloc2 PROPERTIES IMPORTED_LOCATION ${MIMALLOC_RO
 add_subdirectory(helio)
 add_subdirectory(server)
 add_subdirectory(string_set)
+add_subdirectory(persistence)
