@@ -29,6 +29,9 @@ class DbSlice {
   // Return .second=true if insertion ocurred, false if we return the existing key.
   std::pair<MainIterator, bool> AddOrFind(DbIndex db_ind, std::string_view key);
 
+  // Deletes a key. Returns true if the key existed.
+  bool Del(DbIndex db_ind, std::string_view key);
+
   // Adds a new entry. Requires: key does not exist in this slice.
   void AddNew(DbIndex db_ind, std::string_view key, MainValue obj, uint64_t expire_at_ms);
 

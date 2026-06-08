@@ -207,6 +207,20 @@ void Service::Get(CmdArgList args, ConnectionContext* cntx) {
 #endif
 }
 
+void Service::Del(CmdArgList args, ConnectionContext* cntx) {
+  const ParsedCommand& pcmd = *cntx->to_execute;
+  string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
+  VLOG(2) << "Del " << key;
+
+  ShardId sid = Shard(key, shard_count());
+  bool deleted = shard_set_.Await(sid, [&] {
+    EngineShard* es = EngineShard::tlocal();
+    return es->db_slice.Del(0, key);
+  });
+
+  cntx->SendLong(deleted ? 1 : 0);
+}
+
 void Service::Debug(CmdArgList args, ConnectionContext* cntx) {
   ToUpper(&args[1]);
 
@@ -293,6 +307,7 @@ void Service::RegisterCommands() {
   registry_ << CI{"PING", CO::STALE | CO::FAST, -1, 0, 0, 0}.HFUNC(Ping)
             << CI{"SET", CO::WRITE | CO::DENYOOM, -3, 1, 1, 1}.HFUNC(Set)
             << CI{"GET", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Get)
+            << CI{"DEL", CO::WRITE, -2, 1, 1, 1}.HFUNC(Del)
             << CI{"DEBUG", CO::RANDOM | CO::READONLY, -2, 0, 0, 0}.HFUNC(Debug)
             << CI{"INFO", CO::READONLY | CO::LOADING | CO::STALE, -1, 0, 0, 0}.HFUNC(Info);
 }

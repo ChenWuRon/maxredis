@@ -49,6 +49,7 @@ class Service {
   void Ping(CmdArgList args, ConnectionContext* cntx);
   void Set(CmdArgList args, ConnectionContext* cntx);
   void Get(CmdArgList args, ConnectionContext* cntx);
+  void Del(CmdArgList args, ConnectionContext* cntx);
   void Debug(CmdArgList args, ConnectionContext* cntx);
   void Info(CmdArgList args, ConnectionContext* cntx);
 

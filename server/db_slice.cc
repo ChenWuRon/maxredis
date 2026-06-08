@@ -83,6 +83,19 @@ void DbSlice::CreateDbRedis(unsigned index) {
   }
 }
 
+bool DbSlice::Del(DbIndex db_ind, std::string_view key) {
+  DCHECK_LT(db_ind, db_arr_.size());
+  DCHECK(db_arr_[db_ind].main_table);
+  auto& db = db_arr_[db_ind];
+  auto it = db.main_table->find(key);
+  if (it == db.main_table->end()) {
+    return false;
+  }
+  db.stats.obj_memory_usage -= (it->first.capacity() + it->second.value.capacity());
+  db.main_table->erase(it);
+  return true;
+}
+
 void DbSlice::AddNew(DbIndex db_ind, std::string_view key, MainValue obj, uint64_t expire_at_ms) {
   CHECK(AddIfNotExist(db_ind, key, std::move(obj), expire_at_ms));
 }

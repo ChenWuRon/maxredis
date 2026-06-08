@@ -79,6 +79,19 @@ void RespSerializer::SendNull() {
   Send(v, ABSL_ARRAYSIZE(v));
 }
 
+void RespSerializer::SendLong(int64_t val) {
+  char tmp[absl::numbers_internal::kFastToBufferSize + 3];
+  tmp[0] = ':';
+  char* next = absl::numbers_internal::FastIntToBuffer(val, tmp + 1);
+  *next++ = '\r';
+  *next++ = '\n';
+
+  std::string_view pref{tmp, size_t(next - tmp)};
+
+  iovec v[] = {IoVec(pref)};
+  Send(v, ABSL_ARRAYSIZE(v));
+}
+
 void RespSerializer::SendSimpleString(std::string_view str) {
   iovec v[3] = {IoVec(kSimplePref), IoVec(str), IoVec(kCRLF)};
 

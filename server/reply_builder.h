@@ -50,6 +50,7 @@ class RespSerializer : public BaseSerializer {
   //! See https://redis.io/topics/protocol
   void SendSimpleString(std::string_view str);
   void SendNull();
+  void SendLong(int64_t val);
 
   /// aka "$6\r\nfoobar\r\n"
   void SendBulkString(std::string_view str);
@@ -72,6 +73,10 @@ class ReplyBuilder {
 
   void SendError(std::string_view str);
   void SendError(OpStatus status);
+
+  void SendLong(int64_t val) {
+    as_resp()->SendLong(val);
+  }
 
   void SendOk() {
     as_resp()->SendSimpleString("OK");

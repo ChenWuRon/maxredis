@@ -93,6 +93,10 @@ class ConnectionContext {
     reply_builder_.SendStored();
   }
 
+  void SendLong(int64_t val) {
+    reply_builder_.SendLong(val);
+  }
+
   void SendMCClientError(std::string_view str) {
     reply_builder_.SendMCClientError(str);
   }
