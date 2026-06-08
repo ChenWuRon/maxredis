@@ -33,7 +33,7 @@ void DoPopulateBatch(std::string_view prefix, size_t val_size, const PopulateBat
     }
     auto [it, res] = db_slice.AddOrFind(0, key);
     if (res) {
-      it->second = std::move(val);
+      it->second.value = std::move(val);
     }
   }
 }

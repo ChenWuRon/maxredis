@@ -163,7 +163,7 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   shard_set_.Await(sid, [&] {
     EngineShard* es = EngineShard::tlocal();
     auto [it, res] = es->db_slice.AddOrFind(0, key);
-    it->second = val;
+    it->second.value = val;
   });
 
   cntx->SendStored();
@@ -198,7 +198,7 @@ void Service::Get(CmdArgList args, ConnectionContext* cntx) {
     string_view key = string_view(cmd->tokens[1], sdslen(cmd->tokens[1]));
     OpResult<MainIterator> res = es->db_slice.Find(0, key);
     if (res) {
-      cntx->SendGetReply(key, 0, res.value()->second, cmd);
+      cntx->SendGetReply(key, 0, res.value()->second.value, cmd);
     } else if (res.status() == OpStatus::KEY_NOTFOUND) {
       cntx->SendGetNotFound(cmd);
     }

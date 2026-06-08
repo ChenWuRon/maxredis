@@ -95,7 +95,7 @@ bool DbSlice::AddIfNotExist(DbIndex db_ind, std::string_view key, MainValue obj,
   if (!success)
     return false;  // in this case obj won't be moved and will be destroyed during unwinding.
 
-  db.stats.obj_memory_usage += (new_entry->first.capacity() + new_entry->second.capacity());
+  db.stats.obj_memory_usage += (new_entry->first.capacity() + new_entry->second.value.capacity());
 
   if (expire_at_ms) {
     // TODO

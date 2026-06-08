@@ -48,7 +48,12 @@ template <typename View> inline ShardId Shard(const View& v, ShardId shard_num) 
   return hash % shard_num;
 }
 
-using MainValue = std::string;
+struct PrimeValue {
+  std::string value;
+  uint64_t expire_ms = 0;
+};
+
+using MainValue = PrimeValue;
 using MainTable = absl::flat_hash_map<std::string, MainValue>;
 using MainIterator = MainTable::iterator;
 
