@@ -6,7 +6,7 @@ add_library(dragonfly_lib command_registry.cc command_serializer.cc common_types
             dragonfly_connection.cc engine_shard_set.cc 
             main_service.cc memcache_parser.cc 
             redis_parser.cc resp_expr.cc reply_builder.cc
-            state_serializer.cc)
+            snapshot_fiber.cc state_serializer.cc)
 
 cxx_link(dragonfly_lib 
          fibers2 strings_lib http_server_lib tls_lib redis_dict)

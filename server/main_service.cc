@@ -22,10 +22,14 @@ extern "C" {
 #include "util/varz.h"
 
 #include "io/io.h"
+#include "persistence/snapshot_manager.h"
 #include "server/dragonfly_connection.h"
+#include "server/state_serializer.h"
 
 ABSL_FLAG(uint32_t, port, 6380, "Redis port");
 ABSL_FLAG(uint32_t, memcache_port, 0, "Memcached port");
+ABSL_FLAG(uint32_t, snapshot_time_sec, 0, "Snapshot interval in seconds (0 = disabled)");
+ABSL_FLAG(uint32_t, snapshot_cmd_count, 0, "Snapshot after N write commands (0 = disabled)");
 
 namespace dfly {
 
@@ -64,6 +68,21 @@ void Service::Init(util::AcceptServer* acceptor) {
     }
   });
 
+  LoadSnapshot();
+
+  {
+    using absl::GetFlag;
+    uint32_t time_sec = GetFlag(FLAGS_snapshot_time_sec);
+    uint32_t cmd_cnt = GetFlag(FLAGS_snapshot_cmd_count);
+    if (time_sec > 0 || cmd_cnt > 0) {
+      pp_.AwaitBrief([&](uint32_t index, ProactorBase*) {
+        if (index == 0) {
+          snapshot_fiber_.Start(time_sec, cmd_cnt);
+        }
+      });
+    }
+  }
+
   persistence_manager_->Open("appendonly.aof");
 
   ReplayAof();
@@ -71,6 +90,8 @@ void Service::Init(util::AcceptServer* acceptor) {
 
 void Service::Shutdown() {
   VLOG(1) << "Service::Shutdown";
+
+  snapshot_fiber_.Stop();
 
   engine_varz.reset();
   for (unsigned i = 0; i < shard_set_.size(); ++i) {
@@ -280,6 +301,7 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
       cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
     }
     persistence_manager_->RecordCommand(cmd_args);
+    snapshot_fiber_.NotifyWrite();
   }
 }
 
@@ -341,6 +363,7 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
       cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
     }
     persistence_manager_->RecordCommand(cmd_args);
+    snapshot_fiber_.NotifyWrite();
   }
 }
 
@@ -363,6 +386,65 @@ void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
   });
 
   cntx->SendLong(found ? 1 : 0);
+}
+
+bool Service::CreateSnapshot() {
+  vector<SnapshotData> shard_snapshots(shard_count());
+
+  shard_set_.RunBriefInParallel([&](EngineShard* es) {
+    ShardId sid = es->shard_id();
+    shard_snapshots[sid] = StateSerializer::Export(es->db_slice);
+  });
+
+  size_t total = 0;
+  for (const auto& ss : shard_snapshots)
+    total += ss.entries.size();
+
+  SnapshotData merged;
+  merged.entries.reserve(total);
+  for (auto& ss : shard_snapshots) {
+    for (auto& e : ss.entries) {
+      merged.entries.push_back(std::move(e));
+    }
+  }
+
+  SnapshotManager mgr;
+  return mgr.Save("snapshot.bin", merged);
+}
+
+void Service::LoadSnapshot() {
+  SnapshotManager mgr;
+  SnapshotData data;
+  if (!mgr.Load("snapshot.bin", &data)) {
+    return;
+  }
+
+  LOG(INFO) << "Loading snapshot with " << data.entries.size() << " keys";
+
+  vector<vector<SnapshotEntry>> shard_entries(shard_count());
+  for (auto& entry : data.entries) {
+    ShardId sid = Shard(entry.key, shard_count());
+    shard_entries[sid].push_back(std::move(entry));
+  }
+
+  for (ShardId sid = 0; sid < shard_count(); sid++) {
+    if (shard_entries[sid].empty())
+      continue;
+    shard_set_.Await(sid, [&] {
+      EngineShard* es = EngineShard::tlocal();
+      SnapshotData shard_data;
+      shard_data.entries = std::move(shard_entries[sid]);
+      StateSerializer::Import(&es->db_slice, shard_data);
+    });
+  }
+}
+
+void Service::Save(CmdArgList args, ConnectionContext* cntx) {
+  if (CreateSnapshot()) {
+    cntx->SendOk();
+  } else {
+    cntx->SendError("ERR Failed to create snapshot");
+  }
 }
 
 void Service::Debug(CmdArgList args, ConnectionContext* cntx) {
@@ -453,6 +535,7 @@ void Service::RegisterCommands() {
             << CI{"GET", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Get)
             << CI{"DEL", CO::WRITE, -2, 1, 1, 1}.HFUNC(Del)
             << CI{"EXPIRE", CO::WRITE, 3, 1, 1, 1}.HFUNC(Expire)
+            << CI{"SAVE", CO::WRITE | CO::STALE, 1, 0, 0, 0}.HFUNC(Save)
             << CI{"DEBUG", CO::RANDOM | CO::READONLY, -2, 0, 0, 0}.HFUNC(Debug)
             << CI{"INFO", CO::READONLY | CO::LOADING | CO::STALE, -1, 0, 0, 0}.HFUNC(Info);
 }

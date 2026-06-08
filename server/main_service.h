@@ -7,6 +7,7 @@
 #include "base/varz_value.h"
 #include "server/command_registry.h"
 #include "server/engine_shard_set.h"
+#include "server/snapshot_fiber.h"
 #include "util/http/http_handler.h"
 #include "server/memcache_parser.h"
 
@@ -19,6 +20,8 @@ namespace dfly {
 class PersistenceManager;
 
 class Service {
+  friend class SnapshotFiber;
+
  public:
   using error_code = std::error_code;
 
@@ -55,6 +58,10 @@ class Service {
   void Expire(CmdArgList args, ConnectionContext* cntx);
   void Debug(CmdArgList args, ConnectionContext* cntx);
   void Info(CmdArgList args, ConnectionContext* cntx);
+  void Save(CmdArgList args, ConnectionContext* cntx);
+
+  bool CreateSnapshot();
+  void LoadSnapshot();
 
   void RegisterCommands();
 
@@ -67,6 +74,7 @@ class Service {
   util::ProactorPool& pp_;
   PersistenceManager* persistence_manager_ = nullptr;
   bool replay_mode_ = false;
+  SnapshotFiber snapshot_fiber_{this};
 };
 
 }  // namespace dfly
