@@ -1,0 +1,91 @@
+// Copyright 2021, Roman Gershman.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/container/fixed_array.h>
+
+#include <deque>
+
+#include "base/io_buf.h"
+#include "server/common_types.h"
+#include "server/dfly_protocol.h"
+#include "server/resp_expr.h"
+#include "util/connection.h"
+#include "util/fibers/synchronization.h"
+#include "util/fiber_socket_base.h"
+
+typedef struct ssl_ctx_st SSL_CTX;
+
+namespace dfly {
+
+class ConnectionContext;
+class RedisParser;
+class Service;
+class MemcacheParser;
+
+class Connection : public util::Connection {
+ public:
+  Connection(Protocol protocol, Service* service, SSL_CTX* ctx);
+  ~Connection();
+
+  using error_code = std::error_code;
+
+  Protocol protocol() const {
+    return protocol_;
+  }
+
+  void Notify() {
+    evc_.notify();
+  }
+ protected:
+  void OnShutdown() override;
+
+ private:
+  enum ParserStatus { OK, NEED_MORE, ERROR };
+
+  void HandleRequests() final;
+
+  void InputLoop(util::FiberSocketBase* peer);
+
+  ParserStatus ParseRedis(base::IoBuf* buf);
+  ParserStatus ParseMemcache(base::IoBuf* buf);
+  ParserStatus ParseMultiBulk(base::IoBuf* buf);
+
+  // Returns true if socket might have more data to read.
+  bool DoRead(util::FiberSocketBase* peer, const util::FiberSocketBase::RecvNotification& rn, base::IoBuf* io_buf);
+
+  std::unique_ptr<RedisParser> redis_parser_;
+  std::unique_ptr<MemcacheParser> memcache_parser_;
+  Service* service_;
+  SSL_CTX* ctx_;
+  std::unique_ptr<ConnectionContext> cc_;
+
+  struct Request {
+    absl::FixedArray<MutableStrSpan> args;
+    absl::FixedArray<char> storage;
+
+    Request(size_t nargs, size_t capacity) : args(nargs), storage(capacity) {
+    }
+    Request(const Request&) = delete;
+  };
+
+  // static Request* FromArgs(RespVec args);
+
+  std::deque<Request*> dispatch_q_;  // coordinated via evc_.
+  util::fb2::EventCount evc_;
+  unsigned parser_error_ = 0;
+  Protocol protocol_;
+  unsigned multibulk_len_ = 0;
+  long bulk_len_ = -1;  // -1 means we need to read it.
+  std::error_code ec_;
+  std::string parse_stash_;
+  enum ParseState {
+    INIT,
+    PARSE_INLINE,
+    PARSE_MULTIBULK,
+  } state_ = INIT;
+};
+
+}  // namespace dfly

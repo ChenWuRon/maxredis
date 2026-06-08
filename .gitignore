@@ -1,0 +1,18 @@
+# 构建目录
+build*/
+build-opt/
+build-dbg/
+
+# 依赖管理目录
+_deps/
+third_party/
+
+# IDE 文件
+.vscode/
+.idea/
+
+# 编译产物
+*.o
+*.so
+*.a
+*.exe
