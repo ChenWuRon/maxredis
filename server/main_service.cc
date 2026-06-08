@@ -215,6 +215,22 @@ void Service::Debug(CmdArgList args, ConnectionContext* cntx) {
   return dbg_cmd.Run(args);
 }
 
+void Service::Info(CmdArgList args, ConnectionContext* cntx) {
+  string info;
+  absl::StrAppend(&info, "# Server\r\n");
+  absl::StrAppend(&info, "redis_version:7.0.0\r\n");
+  absl::StrAppend(&info, "os:Linux\r\n");
+  absl::StrAppend(&info, "tcp_port:6380\r\n");
+  absl::StrAppend(&info, "\r\n");
+
+  absl::StrAppend(&info, "# Keyspace\r\n");
+  atomic_ulong num_keys{0};
+  shard_set_.RunBriefInParallel([&](EngineShard* es) { num_keys += es->db_slice.DbSize(0); });
+  absl::StrAppend(&info, "db0:keys=", num_keys.load(), ",expires=0\r\n");
+
+  cntx->SendRespBlob(absl::StrCat("$", info.size(), "\r\n", info, "\r\n"));
+}
+
 VarzValue::Map Service::GetVarzStats() {
   VarzValue::Map res;
 
@@ -238,7 +254,8 @@ void Service::RegisterCommands() {
   registry_ << CI{"PING", CO::STALE | CO::FAST, -1, 0, 0, 0}.HFUNC(Ping)
             << CI{"SET", CO::WRITE | CO::DENYOOM, -3, 1, 1, 1}.HFUNC(Set)
             << CI{"GET", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Get)
-            << CI{"DEBUG", CO::RANDOM | CO::READONLY, -2, 0, 0, 0}.HFUNC(Debug);
+            << CI{"DEBUG", CO::RANDOM | CO::READONLY, -2, 0, 0, 0}.HFUNC(Debug)
+            << CI{"INFO", CO::READONLY | CO::LOADING | CO::STALE, -1, 0, 0, 0}.HFUNC(Info);
 }
 
 }  // namespace dfly
