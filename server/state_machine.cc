@@ -6,6 +6,7 @@
 
 #include <absl/time/clock.h>
 
+#include "server/command_registry.h"
 #include "util/proactor_pool.h"
 
 namespace dfly {
@@ -19,6 +20,19 @@ KvStateMachine::KvStateMachine(EngineShardSet* shard_set, ProactorPool* pp)
 
 ShardId KvStateMachine::Shard(string_view key) const {
   return dfly::Shard(key, shard_set_->size());
+}
+
+ApplyResult KvStateMachine::Apply(const CommandId* cid, CmdArgList args) {
+  string_view name = cid->name();
+  if (name == "SET") {
+    Set(0, ArgS(args, 1), ArgS(args, 2));
+    return {ApplyOp::OK, 1};
+  }
+  if (name == "DEL") {
+    bool deleted = Del(0, ArgS(args, 1));
+    return {ApplyOp::OK, deleted ? 1u : 0u};
+  }
+  return {ApplyOp::ERROR, 0};
 }
 
 void KvStateMachine::Set(DbIndex db_ind, std::string_view key, std::string_view val) {

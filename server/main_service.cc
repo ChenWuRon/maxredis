@@ -282,11 +282,14 @@ void Service::Ping(CmdArgList args, ConnectionContext* cntx) {
 
 void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   const ParsedCommand& pcmd = *cntx->to_execute;
-  string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
-  string_view val = string_view(pcmd.tokens[2], sdslen(pcmd.tokens[2]));
-  VLOG(2) << "Set " << key << " " << val;
+  VLOG(2) << "Set " << pcmd.tokens[1] << " " << pcmd.tokens[2];
 
-  engine_.Set(0, key, val);
+  CmdArgVec cmd_vec;
+  cmd_vec.reserve(pcmd.argc);
+  for (unsigned i = 0; i < pcmd.argc; ++i) {
+    cmd_vec.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  }
+  engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
 
   cntx->SendStored();
 
@@ -321,12 +324,16 @@ void Service::Get(CmdArgList args, ConnectionContext* cntx) {
 
 void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   const ParsedCommand& pcmd = *cntx->to_execute;
-  string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
-  VLOG(2) << "Del " << key;
+  VLOG(2) << "Del " << pcmd.tokens[1];
 
-  bool deleted = engine_.Del(0, key);
+  CmdArgVec cmd_vec;
+  cmd_vec.reserve(pcmd.argc);
+  for (unsigned i = 0; i < pcmd.argc; ++i) {
+    cmd_vec.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  }
+  ApplyResult result = engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
 
-  cntx->SendLong(deleted ? 1 : 0);
+  cntx->SendLong(result.affected_rows);
 
   if (!replay_mode_) {
     vector<string> cmd_args;

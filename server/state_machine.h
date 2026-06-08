@@ -18,9 +18,24 @@ class ProactorPool;
 
 namespace dfly {
 
+class CommandId;
+
+enum class ApplyOp : uint8_t {
+  OK = 0,
+  NOT_FOUND = 1,
+  ERROR = 2,
+};
+
+struct ApplyResult {
+  ApplyOp op = ApplyOp::OK;
+  uint64_t affected_rows = 0;
+};
+
 class IStateMachine {
  public:
   virtual ~IStateMachine() = default;
+
+  virtual ApplyResult Apply(const CommandId* cid, CmdArgList args) = 0;
 
   virtual void Set(DbIndex db_ind, std::string_view key, std::string_view val) = 0;
   virtual bool Del(DbIndex db_ind, std::string_view key) = 0;
@@ -34,6 +49,8 @@ class IStateMachine {
 class KvStateMachine : public IStateMachine {
  public:
   KvStateMachine(EngineShardSet* shard_set, util::ProactorPool* pp);
+
+  ApplyResult Apply(const CommandId* cid, CmdArgList args) override;
 
   void Set(DbIndex db_ind, std::string_view key, std::string_view val) override;
   bool Del(DbIndex db_ind, std::string_view key) override;

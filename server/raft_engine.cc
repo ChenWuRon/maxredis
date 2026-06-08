@@ -4,18 +4,16 @@
 
 #include "server/raft_engine.h"
 
+#include "server/command_registry.h"
+
 namespace dfly {
 
 RaftEngine::RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp)
     : kv_(shard_set, pp), group_(0) {
 }
 
-void RaftEngine::Set(DbIndex db_ind, std::string_view key, std::string_view val) {
-  kv_.Set(db_ind, key, val);
-}
-
-bool RaftEngine::Del(DbIndex db_ind, std::string_view key) {
-  return kv_.Del(db_ind, key);
+ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
+  return kv_.Apply(cid, args);
 }
 
 bool RaftEngine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {
@@ -31,7 +29,7 @@ size_t RaftEngine::DbSize(DbIndex db_ind) const {
 }
 
 void RaftEngine::Schedule(DbIndex db_ind, std::string_view key,
-                           std::function<void(EngineShard*)> cb) {
+                            std::function<void(EngineShard*)> cb) {
   kv_.Schedule(db_ind, key, std::move(cb));
 }
 

@@ -13,12 +13,14 @@
 
 namespace dfly {
 
+class CommandId;
+
 class RaftEngine {
  public:
   RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp);
 
-  void Set(DbIndex db_ind, std::string_view key, std::string_view val);
-  bool Del(DbIndex db_ind, std::string_view key);
+  ApplyResult SubmitCommand(const CommandId* cid, CmdArgList args);
+
   bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms);
   OpResult<std::string> Get(DbIndex db_ind, std::string_view key);
   size_t DbSize(DbIndex db_ind) const;
