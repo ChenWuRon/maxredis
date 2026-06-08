@@ -5,6 +5,13 @@ $1
 a
 $5
 hello
+*3
+$3
+SET
+$1
+b
+$5
+world
 *2
 $3
 DEL

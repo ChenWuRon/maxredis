@@ -43,13 +43,13 @@ optional<VarzFunction> engine_varz;
 
 }  // namespace
 
-Service::Service(ProactorPool* pp) : shard_set_(pp), pp_(*pp) {
+Service::Service(ProactorPool* pp)
+    : shard_set_(pp), pp_(*pp), engine_(&shard_set_, &pp_) {
   CHECK(pp);
   RegisterCommands();
   engine_varz.emplace("engine", [this] { return GetVarzStats(); });
 
   persistence_manager_ = new PersistenceManager;
-  state_machine_ = std::make_unique<KvStateMachine>(&shard_set_, &pp_);
 }
 
 Service::~Service() {
@@ -286,7 +286,7 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   string_view val = string_view(pcmd.tokens[2], sdslen(pcmd.tokens[2]));
   VLOG(2) << "Set " << key << " " << val;
 
-  state_machine_->Set(0, key, val);
+  engine_.Set(0, key, val);
 
   cntx->SendStored();
 
@@ -316,7 +316,7 @@ void Service::Get(CmdArgList args, ConnectionContext* cntx) {
       cntx->SendGetNotFound(cmd);
     }
   };
-  state_machine_->Schedule(0, key, std::move(cb));
+  engine_.Schedule(0, key, std::move(cb));
 }
 
 void Service::Del(CmdArgList args, ConnectionContext* cntx) {
@@ -324,7 +324,7 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
   VLOG(2) << "Del " << key;
 
-  bool deleted = state_machine_->Del(0, key);
+  bool deleted = engine_.Del(0, key);
 
   cntx->SendLong(deleted ? 1 : 0);
 
@@ -351,7 +351,7 @@ void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
   }
 
   uint64_t expire_at_ms = NowMs() + seconds * 1000;
-  bool found = state_machine_->Expire(0, key, expire_at_ms);
+  bool found = engine_.Expire(0, key, expire_at_ms);
 
   cntx->SendLong(found ? 1 : 0);
 }
@@ -471,7 +471,7 @@ void Service::Info(CmdArgList args, ConnectionContext* cntx) {
   absl::StrAppend(&info, "\r\n");
 
   absl::StrAppend(&info, "# Keyspace\r\n");
-  absl::StrAppend(&info, "db0:keys=", state_machine_->DbSize(0), ",expires=0,avg_ttl=0\r\n");
+  absl::StrAppend(&info, "db0:keys=", engine_.DbSize(0), ",expires=0,avg_ttl=0\r\n");
 
   cntx->SendRespBlob(absl::StrCat("$", info.size(), "\r\n", info, "\r\n"));
 }
@@ -479,7 +479,7 @@ void Service::Info(CmdArgList args, ConnectionContext* cntx) {
 VarzValue::Map Service::GetVarzStats() {
   VarzValue::Map res;
 
-  res.emplace_back("keys", VarzValue::FromInt(state_machine_->DbSize(0)));
+  res.emplace_back("keys", VarzValue::FromInt(engine_.DbSize(0)));
 
   return res;
 }

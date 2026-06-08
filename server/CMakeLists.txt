@@ -5,7 +5,7 @@ add_library(dragonfly_lib command_log.cc command_registry.cc command_serializer.
             conn_context.cc db_slice.cc debugcmd.cc dragonfly_listener.cc
             dragonfly_connection.cc engine_shard_set.cc 
             main_service.cc memcache_parser.cc 
-            raft_node.cc raft_storage.cc redis_parser.cc resp_expr.cc reply_builder.cc
+            raft_engine.cc raft_node.cc raft_storage.cc redis_parser.cc resp_expr.cc reply_builder.cc
             snapshot_fiber.cc state_machine.cc state_serializer.cc)
 
 cxx_link(dragonfly_lib 
