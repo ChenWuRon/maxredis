@@ -16,6 +16,8 @@ class AcceptServer;
 
 namespace dfly {
 
+class PersistenceManager;
+
 class Service {
  public:
   using error_code = std::error_code;
@@ -61,6 +63,7 @@ class Service {
   CommandRegistry registry_;
   EngineShardSet shard_set_;
   util::ProactorPool& pp_;
+  PersistenceManager* persistence_manager_ = nullptr;
 };
 
 }  // namespace dfly

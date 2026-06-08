@@ -17,6 +17,7 @@ extern "C" {
 }
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
+#include "persistence/persistence_manager.h"
 #include "util/metrics/metrics.h"
 #include "util/varz.h"
 
@@ -39,9 +40,15 @@ Service::Service(ProactorPool* pp) : shard_set_(pp), pp_(*pp) {
   CHECK(pp);
   RegisterCommands();
   engine_varz.emplace("engine", [this] { return GetVarzStats(); });
+
+  persistence_manager_ = new PersistenceManager;
 }
 
 Service::~Service() {
+  if (persistence_manager_) {
+    persistence_manager_->Flush();
+    delete persistence_manager_;
+  }
 }
 
 void Service::Init(util::AcceptServer* acceptor) {
@@ -53,6 +60,8 @@ void Service::Init(util::AcceptServer* acceptor) {
       shard_set_.InitThreadLocal(index);
     }
   });
+
+  persistence_manager_->Open("appendonly.aof");
 }
 
 void Service::Shutdown() {
@@ -168,6 +177,13 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   });
 
   cntx->SendStored();
+
+  vector<string> cmd_args;
+  cmd_args.reserve(pcmd.argc);
+  for (unsigned i = 0; i < pcmd.argc; ++i) {
+    cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  }
+  persistence_manager_->RecordCommand(cmd_args);
 }
 
 void Service::Get(CmdArgList args, ConnectionContext* cntx) {
@@ -220,6 +236,13 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   });
 
   cntx->SendLong(deleted ? 1 : 0);
+
+  vector<string> cmd_args;
+  cmd_args.reserve(pcmd.argc);
+  for (unsigned i = 0; i < pcmd.argc; ++i) {
+    cmd_args.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  }
+  persistence_manager_->RecordCommand(cmd_args);
 }
 
 void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
