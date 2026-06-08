@@ -1,7 +1,7 @@
 add_executable(midi-redis dfly_main.cc)
 cxx_link(midi-redis base dragonfly_lib persistence_lib TRDP::mimalloc2)
 
-add_library(dragonfly_lib command_registry.cc command_serializer.cc common_types.cc config_flags.cc 
+add_library(dragonfly_lib command_log.cc command_registry.cc command_serializer.cc common_types.cc config_flags.cc 
             conn_context.cc db_slice.cc debugcmd.cc dragonfly_listener.cc
             dragonfly_connection.cc engine_shard_set.cc 
             main_service.cc memcache_parser.cc 
@@ -17,6 +17,7 @@ cxx_link(dfly_test_lib dragonfly_lib gtest_main_ext)
 cxx_test(redis_parser_test dfly_test_lib LABELS DFLY)
 cxx_test(memcache_parser_test dfly_test_lib LABELS DFLY)
 cxx_test(command_serializer_test dragonfly_lib LABELS DFLY)
+cxx_test(command_log_test dragonfly_lib LABELS DFLY)
 cxx_test(raft_group_test dragonfly_lib LABELS DFLY)
 cxx_test(raft_node_test dragonfly_lib LABELS DFLY)
 cxx_test(raft_storage_test dragonfly_lib LABELS DFLY)
