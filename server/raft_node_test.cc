@@ -116,4 +116,68 @@ TEST_F(RaftNodeTest, TermNeverDecreases) {
   EXPECT_EQ(RaftRole::Follower, node.role());
 }
 
+// --- OnRequestVote tests ---
+
+TEST_F(RaftNodeTest, RejectStaleTerm) {
+  RaftNode node("A");
+  node.BecomeFollower(10);  // current_term = 10
+
+  VoteRequest req{9, "B", 0, 0};  // request.term = 9 (stale)
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_FALSE(rsp.vote_granted);
+  EXPECT_EQ(10u, rsp.term);
+  EXPECT_EQ(10u, node.term());
+  EXPECT_TRUE(node.voted_for().empty());
+}
+
+TEST_F(RaftNodeTest, GrantVoteHigherTerm) {
+  RaftNode node("A");
+  node.BecomeFollower(10);  // current_term = 10
+
+  VoteRequest req{11, "B", 0, 0};  // request.term = 11 (higher)
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_TRUE(rsp.vote_granted);
+  EXPECT_EQ(11u, rsp.term);
+  EXPECT_EQ(11u, node.term());
+  EXPECT_EQ("B", node.voted_for());
+  EXPECT_EQ(RaftRole::Follower, node.role());
+}
+
+TEST_F(RaftNodeTest, RejectVoteForDifferentCandidate) {
+  RaftNode node("A");
+  node.BecomeFollower(20);
+
+  // First grant vote to Node2
+  VoteRequest req2{20, "Node2", 0, 0};
+  VoteResponse rsp1 = node.OnRequestVote(req2);
+  EXPECT_TRUE(rsp1.vote_granted);
+  EXPECT_EQ("Node2", node.voted_for());
+
+  // Now Node3 requests — should reject
+  VoteRequest req3{20, "Node3", 0, 0};
+  VoteResponse rsp2 = node.OnRequestVote(req3);
+
+  EXPECT_FALSE(rsp2.vote_granted);
+  EXPECT_EQ(20u, rsp2.term);
+  EXPECT_EQ("Node2", node.voted_for());  // unchanged
+}
+
+TEST_F(RaftNodeTest, GrantVoteToSameCandidateAgain) {
+  RaftNode node("A");
+  node.BecomeFollower(20);
+
+  VoteRequest req{20, "Node2", 0, 0};
+  VoteResponse rsp1 = node.OnRequestVote(req);
+  EXPECT_TRUE(rsp1.vote_granted);
+  EXPECT_EQ("Node2", node.voted_for());
+
+  // Same candidate again — should still grant
+  VoteResponse rsp2 = node.OnRequestVote(req);
+  EXPECT_TRUE(rsp2.vote_granted);
+  EXPECT_EQ(20u, rsp2.term);
+  EXPECT_EQ("Node2", node.voted_for());
+}
+
 }  // namespace dfly

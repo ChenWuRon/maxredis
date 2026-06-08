@@ -37,4 +37,27 @@ void RaftNode::BecomeLeader() {
   role_ = RaftRole::Leader;
 }
 
+VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
+  // Rule 1: Stale term — reject.
+  if (request.term < term_) {
+    return {term_, false};
+  }
+
+  // Rule 2: Higher term — update local state and become follower.
+  if (request.term > term_) {
+    BecomeFollower(request.term);
+  }
+
+  // After rule 2, term_ == request.term.
+
+  // Rule 3: Already voted for another candidate in this term.
+  if (!voted_for_.empty() && voted_for_ != request.candidate_id) {
+    return {term_, false};
+  }
+
+  // Rule 4: Grant vote.
+  voted_for_ = request.candidate_id;
+  return {term_, true};
+}
+
 }  // namespace dfly

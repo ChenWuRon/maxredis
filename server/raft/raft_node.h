@@ -5,6 +5,7 @@
 #pragma once
 
 #include "server/raft/raft_types.h"
+#include "server/raft/vote_rpc.h"
 
 namespace dfly {
 
@@ -39,6 +40,9 @@ class RaftNode {
   // Called when the election timer fires.
   // Transitions Follower → Candidate if still in Follower state.
   void OnElectionTimeout();
+
+  // Processes an incoming VoteRequest according to Raft rules.
+  VoteResponse OnRequestVote(const VoteRequest& request);
 
  private:
   NodeId node_id_;
