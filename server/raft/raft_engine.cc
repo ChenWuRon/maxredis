@@ -4,6 +4,7 @@
 
 #include "server/raft/raft_engine.h"
 
+#include "base/logging.h"
 #include "server/raft/command_encoder.h"
 #include "server/raft/raft_node.h"
 #include "server/service/command_registry.h"
@@ -24,8 +25,11 @@ ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
   }
 
   if (group_.node().role() != RaftRole::Leader) {
+    VLOG(1) << "SubmitCommand rejected: not leader (role=" << group_.node().role() << ")";
     return {ApplyOp::ERROR, 0};
   }
+
+  VLOG(1) << "SubmitCommand: " << cmd->Serialize();
 
   if (group_.node().peer_manager().PeerCount() == 0) {
     return FastCommitPath(*cmd);
@@ -40,6 +44,8 @@ ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
 ApplyResult RaftEngine::FastCommitPath(const ReplicatedCommand& cmd) {
   LogEntry entry(group_.node().term(), 0, cmd.Serialize());
   log_.Append(entry);
+  VLOG(1) << "FastCommitPath: appended " << cmd.Serialize()
+          << " log_size=" << log_.LogSize();
 
   group_.node().AdvanceCommitIndex();
   return group_.node().ApplyCommittedLogs();

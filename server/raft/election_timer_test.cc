@@ -217,6 +217,84 @@ TEST_F(ElectionTimerTest, StartAfterStopRestarts) {
   test_fiber.Join();
 }
 
+// Verifies that Reset() cancels the previous epoch's pending timeout.
+// After Reset(), the old timeout must NOT trigger the callback.
+TEST_F(ElectionTimerTest, ResetCancelsPreviousEpoch) {
+  std::atomic<int> fire_count{0};
+
+  util::fb2::Fiber f("timer_test", [&fire_count] {
+    ElectionTimer timer;
+
+    // Start with random timeout in [150, 300]ms.
+    timer.Start([&fire_count] { fire_count.fetch_add(1, std::memory_order_release); });
+
+    // Reset well before the minimum initial timeout.
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(100));
+    timer.Reset();
+    // Epoch bumped — the old timeout is now stale.
+
+    // Wait past the original max timeout (300ms from start).
+    // The fiber has woken and skipped the old epoch.
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(250));
+
+    // Old epoch must not have triggered the callback.
+    EXPECT_EQ(0, fire_count.load(std::memory_order_acquire));
+
+    // Wait for the new timeout to fire (max 300ms from reset).
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(600));
+    timer.Stop();
+  });
+  f.Join();
+
+  // The new epoch fires exactly once.
+  EXPECT_EQ(1, fire_count.load(std::memory_order_acquire));
+}
+
+// Verifies Stop() terminates the fiber and clears active state.
+TEST_F(ElectionTimerTest, StopTerminatesFiber) {
+  ElectionTimer timer;
+  timer.Start([] {});
+  EXPECT_TRUE(timer.IsRunning());
+  EXPECT_TRUE(timer.IsActive());
+
+  timer.Stop();
+
+  EXPECT_FALSE(timer.IsRunning());
+  EXPECT_FALSE(timer.IsActive());
+}
+
+// Verifies that the randomized timeout falls within [150, 300]ms.
+// Runs the timer multiple times and measures each firing delay.
+TEST_F(ElectionTimerTest, RandomizedTimeoutRange) {
+  constexpr int kSampleCount = 10;
+
+  util::fb2::Fiber f("range_test", [] {
+    for (int i = 0; i < kSampleCount; i++) {
+      std::atomic<bool> fired{false};
+      auto start = std::chrono::steady_clock::now();
+
+      ElectionTimer timer;
+      timer.Start([&fired] { fired.store(true, std::memory_order_release); });
+
+      // Busy-wait for the callback (spawned in a separate fiber).
+      while (!fired.load(std::memory_order_acquire)) {
+        util::ThisFiber::SleepFor(std::chrono::milliseconds(10));
+      }
+
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+
+      timer.Stop();
+
+      // Allow +50ms margin for scheduling/fiber overhead.
+      EXPECT_GE(elapsed.count(), 150);
+      EXPECT_LE(elapsed.count(), 350)
+          << "Iteration " << i << ": elapsed=" << elapsed.count() << "ms";
+    }
+  });
+  f.Join();
+}
+
 // --- RaftNode + ElectionTimer integration tests ---
 
 TEST_F(ElectionTimerTest, BecomeFollowerResetsTimer) {
