@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "server/raft/append_entries_rpc.h"
+#include "server/raft/apply_progress.h"
 #include "server/raft/election_timer.h"
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/log_storage.h"
@@ -149,10 +150,24 @@ class RaftNode {
   // Returns the ApplyResult of the last entry applied.
   ApplyResult ApplyCommittedLogs();
 
+  // Replays unapplied log entries after recovery.
+  // Sets commit_index_ = LastIndex() and applies everything after last_applied_.
+  // Safe to call even without log_storage_ or state_machine_ (no-op).
+  void ReplayUnappliedLogs();
+
+  ApplyProgress& apply_progress() {
+    return apply_progress_;
+  }
+
+  const ApplyProgress& apply_progress() const {
+    return apply_progress_;
+  }
+
  private:
   void HeartbeatLoop();
 
   RaftStorage storage_;
+  ApplyProgress apply_progress_;
   NodeId node_id_;
   RaftRole role_ = RaftRole::Follower;
   Term leader_term_ = 0;

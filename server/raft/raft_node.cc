@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "base/logging.h"
+#include "server/raft/apply_progress.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
@@ -15,8 +16,19 @@ RaftNode::RaftNode(NodeId node_id) : node_id_(std::move(node_id)) {
 }
 
 void RaftNode::SetStoragePath(std::string path) {
-  storage_ = RaftStorage(std::move(path));
+  // path is the directory for Raft metadata files (e.g. "data/raft").
+  // Ensure trailing slash for consistent path construction.
+  if (!path.empty() && path.back() != '/')
+    path += '/';
+
+  storage_ = RaftStorage(path + "meta.json");
   storage_.Load();
+
+  apply_progress_ = ApplyProgress(path + "apply.meta");
+  apply_progress_.Load();
+  last_applied_ = apply_progress_.LastApplied();
+
+  VLOG(1) << node_id_ << " SetStoragePath: last_applied=" << last_applied_;
 }
 
 RaftNode::~RaftNode() {
@@ -336,21 +348,41 @@ void RaftNode::AdvanceCommitIndex() {
   }
 }
 
+void RaftNode::ReplayUnappliedLogs() {
+  if (!log_storage_ || !state_machine_)
+    return;
+  LogIndex last = log_storage_->LastIndex();
+  if (last_applied_ >= last) {
+    VLOG(1) << node_id_ << " ReplayUnappliedLogs: nothing to replay (last_applied="
+            << last_applied_ << " last_index=" << last << ")";
+    return;
+  }
+  VLOG(1) << node_id_ << " ReplayUnappliedLogs: last_applied=" << last_applied_
+          << " last_index=" << last;
+  commit_index_ = last;
+  ApplyCommittedLogs();
+}
+
 ApplyResult RaftNode::ApplyCommittedLogs() {
   ApplyResult result;
   if (!state_machine_ || !log_storage_)
     return result;
 
+  LogIndex prev = last_applied_;
   while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
     last_applied_++;
     const LogEntry* entry = log_storage_->Get(last_applied_);
     if (!entry) {
       LOG(WARNING) << node_id_ << " apply[" << last_applied_ << "]: entry not found";
+      last_applied_--;
       break;
     }
     VLOG(1) << node_id_ << " apply[" << last_applied_ << "] term=" << entry->term
             << " cmd=" << entry->command;
     result = state_machine_->ApplyLogEntry(*entry);
+  }
+  if (last_applied_ > prev) {
+    apply_progress_.Update(last_applied_);
   }
   return result;
 }
