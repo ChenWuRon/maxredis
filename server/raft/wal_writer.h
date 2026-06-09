@@ -53,6 +53,12 @@ class WalWriter {
     return file_size_;
   }
 
+  // Returns the offset in the file where the next Append will write.
+  // Used to build an in-memory index for random access.
+  uint64_t next_write_offset() const {
+    return file_size_ + buf_.size();
+  }
+
   bool IsOpen() const {
     return file_ != nullptr;
   }
