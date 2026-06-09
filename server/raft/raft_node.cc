@@ -60,7 +60,20 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
     return {term_, false};
   }
 
-  // Rule 4: Grant vote.
+  // Rule 4: Election restriction (§5.4.1).
+  // Candidate's log must be at least as up-to-date as receiver's log.
+  // If no log storage is set, treat the local log as empty.
+  Term local_last_term = log_storage_ ? log_storage_->LastTerm() : 0;
+  LogIndex local_last_index = log_storage_ ? log_storage_->LastIndex() : 0;
+
+  if (request.last_log_term < local_last_term) {
+    return {term_, false};
+  }
+  if (request.last_log_term == local_last_term && request.last_log_index < local_last_index) {
+    return {term_, false};
+  }
+
+  // Rule 5: Grant vote.
   voted_for_ = request.candidate_id;
   return {term_, true};
 }
@@ -75,8 +88,8 @@ ElectionResult RaftNode::StartElection() {
   VoteRequest request;
   request.term = term_;
   request.candidate_id = node_id_;
-  request.last_log_index = 0;
-  request.last_log_term = 0;
+  request.last_log_index = log_storage_ ? log_storage_->LastIndex() : 0;
+  request.last_log_term = log_storage_ ? log_storage_->LastTerm() : 0;
 
   ElectionResult result;
   result.votes_received = vote_count_;  // self vote

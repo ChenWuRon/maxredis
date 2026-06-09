@@ -23,7 +23,8 @@ LogIndex CommandLog::LastIndex() const {
 }
 
 Term CommandLog::LastTerm() const {
-  DCHECK_GT(entries_.size(), 1u);
+  if (entries_.size() <= 1)
+    return 0;
   return entries_.back().term;
 }
 

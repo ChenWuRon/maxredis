@@ -138,7 +138,9 @@ TEST_F(RaftNodeTest, RejectStaleTerm) {
 }
 
 TEST_F(RaftNodeTest, GrantVoteHigherTerm) {
+  CommandLog storage;
   RaftNode node("A");
+  node.SetLogStorage(&storage);
   node.BecomeFollower(10);  // current_term = 10
 
   VoteRequest req{11, "B", 0, 0};  // request.term = 11 (higher)
@@ -152,7 +154,9 @@ TEST_F(RaftNodeTest, GrantVoteHigherTerm) {
 }
 
 TEST_F(RaftNodeTest, RejectVoteForDifferentCandidate) {
+  CommandLog storage;
   RaftNode node("A");
+  node.SetLogStorage(&storage);
   node.BecomeFollower(20);
 
   // First grant vote to Node2
@@ -171,7 +175,9 @@ TEST_F(RaftNodeTest, RejectVoteForDifferentCandidate) {
 }
 
 TEST_F(RaftNodeTest, GrantVoteToSameCandidateAgain) {
+  CommandLog storage;
   RaftNode node("A");
+  node.SetLogStorage(&storage);
   node.BecomeFollower(20);
 
   VoteRequest req{20, "Node2", 0, 0};
@@ -184,6 +190,144 @@ TEST_F(RaftNodeTest, GrantVoteToSameCandidateAgain) {
   EXPECT_TRUE(rsp2.vote_granted);
   EXPECT_EQ(20u, rsp2.term);
   EXPECT_EQ("Node2", node.voted_for());
+}
+
+// --- Election restriction tests (§5.4.1) ---
+
+TEST_F(RaftNodeTest, RejectVoteWhenCandidateLogTermLower) {
+  CommandLog storage;
+  storage.Append(LogEntry{3, 0, "x"});  // local last term = 3
+  storage.Append(LogEntry{4, 0, "y"});  // local last term = 4
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(10);
+
+  // Candidate has last_log_term = 1 < local_last_term = 4
+  VoteRequest req{10, "C", 1, 1};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_FALSE(rsp.vote_granted);
+  EXPECT_EQ(10u, rsp.term);
+  EXPECT_TRUE(node.voted_for().empty());
+}
+
+TEST_F(RaftNodeTest, RejectVoteWhenCandidateLogTermEqualButIndexLower) {
+  CommandLog storage;
+  storage.Append(LogEntry{2, 0, "a"});  // idx 1, term 2
+  storage.Append(LogEntry{2, 0, "b"});  // idx 2, term 2
+  storage.Append(LogEntry{2, 0, "c"});  // idx 3, term 2
+  storage.Append(LogEntry{2, 0, "d"});  // idx 4, term 2
+  storage.Append(LogEntry{2, 0, "e"});  // idx 5, term 2 — last term = 2, last index = 5
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(5);
+
+  // Candidate has same term (2) but lower index (3 < 5)
+  // VoteRequest(term, candidate, last_log_index, last_log_term)
+  VoteRequest req{5, "C", 3, 2};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_FALSE(rsp.vote_granted);
+  EXPECT_EQ(5u, rsp.term);
+  EXPECT_TRUE(node.voted_for().empty());
+}
+
+TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogTermHigher) {
+  CommandLog storage;
+  storage.Append(LogEntry{2, 0, "a"});  // last term = 2
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(5);
+
+  // Candidate's last_log_term = 3 > local_last_term = 2
+  VoteRequest req{5, "C", 3, 10};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_TRUE(rsp.vote_granted);
+  EXPECT_EQ(5u, rsp.term);
+  EXPECT_EQ("C", node.voted_for());
+}
+
+TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogTermEqualAndIndexHigher) {
+  CommandLog storage;
+  storage.Append(LogEntry{2, 0, "a"});
+  storage.Append(LogEntry{2, 0, "b"});  // last term = 2, last index = 2
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(5);
+
+  // Candidate has same term (2) but higher index (5 > 2)
+  VoteRequest req{5, "C", 2, 5};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_TRUE(rsp.vote_granted);
+  EXPECT_EQ(5u, rsp.term);
+  EXPECT_EQ("C", node.voted_for());
+}
+
+TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogExactlySame) {
+  CommandLog storage;
+  storage.Append(LogEntry{3, 0, "a"});
+  storage.Append(LogEntry{3, 0, "b"});
+  storage.Append(LogEntry{3, 0, "c"});  // last term = 3, last index = 3
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(10);
+
+  // Candidate has exactly the same log info
+  VoteRequest req{10, "C", 3, 3};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_TRUE(rsp.vote_granted);
+  EXPECT_EQ(10u, rsp.term);
+  EXPECT_EQ("C", node.voted_for());
+}
+
+TEST_F(RaftNodeTest, RejectVoteHigherTermButStaleLog) {
+  CommandLog storage;
+  storage.Append(LogEntry{5, 0, "a"});  // last term = 5
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(3);
+
+  // Candidate has higher term (5 > 3) but stale log (last_log_term=4 < local 5)
+  // VoteRequest(term, candidate, last_log_index, last_log_term)
+  VoteRequest req{5, "C", 10, 4};
+  VoteResponse rsp = node.OnRequestVote(req);
+
+  EXPECT_FALSE(rsp.vote_granted);
+  EXPECT_EQ(5u, rsp.term);
+  EXPECT_EQ(RaftRole::Follower, node.role());
+  EXPECT_TRUE(node.voted_for().empty());
+}
+
+TEST_F(RaftNodeTest, GrantVoteWithNonEmptyLogToSameCandidate) {
+  CommandLog storage;
+  storage.Append(LogEntry{5, 0, "a"});
+  storage.Append(LogEntry{6, 0, "b"});  // last term = 6, last index = 2
+
+  RaftNode node("A");
+  node.SetLogStorage(&storage);
+  node.BecomeFollower(10);
+
+  // First vote grant: candidate's log (term=6, idx=2) matches local
+  // VoteRequest(term, candidate, last_log_index, last_log_term)
+  VoteRequest req{10, "C", 2, 6};
+  VoteResponse rsp1 = node.OnRequestVote(req);
+  EXPECT_TRUE(rsp1.vote_granted);
+  EXPECT_EQ("C", node.voted_for());
+
+  // Same candidate requests again — still grants
+  VoteResponse rsp2 = node.OnRequestVote(req);
+  EXPECT_TRUE(rsp2.vote_granted);
+  EXPECT_EQ(10u, rsp2.term);
+  EXPECT_EQ("C", node.voted_for());
 }
 
 // --- StartElection tests ---
