@@ -59,6 +59,12 @@ void RaftNode::SetStoragePath(std::string path) {
         last_snapshot_index_ = loaded.meta.index;
         last_snapshot_term_ = loaded.meta.term;
         apply_progress_.Update(last_applied_);
+
+        // Restore the snapshot anchor so that GetTerm(last_snapshot_index_)
+        // returns the correct term for AppendEntries consistency checks.
+        if (log_storage_) {
+          log_storage_->SetSnapshotAnchor(last_snapshot_index_, last_snapshot_term_);
+        }
       }
     }
   }

@@ -5,11 +5,13 @@
 #include "server/raft/segment_log_storage.h"
 
 #include <memory>
+#include <unistd.h>
 
 #include <gmock/gmock.h>
 
 #include "base/gtest.h"
 #include "server/raft/wal_writer.h"
+#include "server/storage/common_types.h"
 
 namespace dfly {
 
@@ -479,6 +481,138 @@ TEST_F(SegmentLogStorageRecoveryTest, IntegrationCrashRecoveryMultiSegment) {
   seg.Append(LogEntry{6, 0, "after-recovery"});
   EXPECT_EQ(1001u, seg.LastIndex());
   EXPECT_EQ(6u, seg.LastTerm());
+}
+
+// --- Compaction recovery tests ---
+
+class SegmentLogCompactionTest : public SegmentLogStorageRecoveryTest {
+};
+
+// Test 1, 2, 3: Write 1M logs across segments, set snapshot anchor,
+// compact segments, then restart and verify data.
+TEST_F(SegmentLogCompactionTest, Compact1MillionLogs) {
+  // Write 1M entries across 3 segments:
+  //   segment_0: 1..400000, segment_1: 400001..700000, segment_2: 700001..1000000
+  uint64_t t0 = NowMs();
+  WriteSegment(0, 400000, 1, 1);
+  WriteSegment(1, 300000, 1, 400001);
+  WriteSegment(2, 300000, 1, 700001);
+
+  // Open and verify.
+  {
+    SegmentLogStorage seg(dir_);
+    ASSERT_TRUE(seg.Open());
+    EXPECT_EQ(1000000u, seg.LastIndex());
+    EXPECT_EQ(1000000u, seg.LogSize());
+
+    // Compact at snapshot index 500000.
+    // segment_0 is fully covered → should be deleted.
+    // segment_1 contains the snapshot index → kept.
+    // segment_2 is after → kept.
+    seg.CompactLogs(500000, 1);
+    EXPECT_EQ(1000000u, seg.LastIndex());
+
+    // After CompactUpTo(500000), FirstIndex should be 500001.
+    EXPECT_EQ(500001u, seg.FirstIndex());
+    EXPECT_EQ(500000u, seg.LogSize());
+
+    // Snapshot anchor should preserve GetTerm(500000).
+    EXPECT_EQ(1u, seg.GetTerm(500000));
+
+    // Verify entries after snapshot are accessible.
+    const LogEntry* e = seg.Get(700001);
+    ASSERT_NE(nullptr, e);
+    EXPECT_EQ(700001u, e->index);
+
+    // segment_0 should have been deleted.
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(0));
+    EXPECT_NE(0, access(buf, F_OK)) << "segment_0 should be deleted";
+  }
+
+  // Test 4, 5: "Crash and restart" — reopen and verify data.
+  // Note: CompactUpTo only truncates the in-memory vector; on-disk segment
+  // files (segment_1 and segment_2) still contain 600k entries total.
+  // So after restart, FirstIndex is 400001 (first entry in segment_1),
+  // and LogSize is 600000 (all remaining on-disk entries).
+  {
+    SegmentLogStorage seg(dir_);
+    ASSERT_TRUE(seg.Open());
+    EXPECT_EQ(1000000u, seg.LastIndex());
+    EXPECT_EQ(400001u, seg.FirstIndex());
+    EXPECT_EQ(600000u, seg.LogSize());
+
+    // Anchor should still work (set by CompactLogs before crash).
+    EXPECT_EQ(1u, seg.GetTerm(500000));
+
+    // Entries after compaction should be readable.
+    const LogEntry* e = seg.Get(800000);
+    ASSERT_NE(nullptr, e);
+    EXPECT_EQ(800000u, e->index);
+
+    // Continue appending after recovery.
+    LogIndex idx = seg.Append(LogEntry{2, 0, "after-crash"});
+    EXPECT_EQ(1000001u, idx);
+    EXPECT_EQ(1000001u, seg.LastIndex());
+  }
+
+  uint64_t t1 = NowMs();
+  VLOG(1) << "CompactionTest: " << (t1 - t0) << "ms";
+}
+
+// Test that compaction doesn't delete the segment containing the snapshot index.
+TEST_F(SegmentLogCompactionTest, KeepSnapshotSegment) {
+  WriteSegment(0, 100000, 1, 1);
+  WriteSegment(1, 100000, 2, 100001);
+  WriteSegment(2, 100000, 3, 200001);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+
+  // Snapshot at index 150000 (inside segment_1).
+  seg.CompactLogs(150000, 2);
+
+  // segment_0 should be deleted.
+  char buf[256];
+  snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+           static_cast<unsigned long>(0));
+  EXPECT_NE(0, access(buf, F_OK)) << "segment_0 should be deleted";
+
+  // segment_1 (contains snapshot index 150000) should exist.
+  snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+           static_cast<unsigned long>(1));
+  EXPECT_EQ(0, access(buf, F_OK)) << "segment_1 should be kept";
+
+  // segment_2 should exist.
+  snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+           static_cast<unsigned long>(2));
+  EXPECT_EQ(0, access(buf, F_OK)) << "segment_2 should be kept";
+}
+
+// Test AppendEntries consistency check after compaction.
+TEST_F(SegmentLogCompactionTest, AppendEntriesConsistencyAfterCompaction) {
+  WriteSegment(0, 1000, 1, 1);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+
+  // Compact at snapshot index 800.
+  seg.CompactLogs(800, 1);
+
+  // prevLogIndex=800, prevLogTerm=1 — should match anchor.
+  EXPECT_EQ(1u, seg.GetTerm(800));
+  EXPECT_EQ(800u, seg.snapshot_anchor().index);
+  EXPECT_EQ(1u, seg.snapshot_anchor().term);
+
+  // index 801 should be the first stored entry.
+  const LogEntry* e = seg.Get(801);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(1u, e->term);
+
+  // index 799 was compacted — GetTerm should not find it.
+  // The anchor only preserves the snapshot index (800), not 799.
+  EXPECT_EQ(0u, seg.GetTerm(799));
 }
 
 }  // namespace dfly

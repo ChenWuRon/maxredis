@@ -61,6 +61,9 @@ bool SnapshotManager::CreateSnapshot() {
     Term last_term = log_storage_->LastTerm();
     meta_storage_.SetMeta({last_index, last_term, NowMs()});
     VLOG(1) << "CreateSnapshot: OK index=" << last_index << " term=" << last_term;
+
+    // Auto-compact the log now that a snapshot is safely persisted.
+    log_storage_->CompactLogs(last_index, last_term);
   } else {
     LOG(WARNING) << "CreateSnapshot: SaveSnapshot failed";
   }

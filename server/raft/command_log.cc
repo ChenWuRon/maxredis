@@ -45,6 +45,18 @@ const LogEntry* CommandLog::Get(LogIndex index) const {
   return &entries_[index - base_index_];
 }
 
+Term CommandLog::GetTerm(LogIndex index) const {
+  if (index == anchor_.index && anchor_.index > 0)
+    return anchor_.term;
+  const LogEntry* e = Get(index);
+  return e ? e->term : 0;
+}
+
+void CommandLog::SetSnapshotAnchor(LogIndex index, Term term) {
+  anchor_.index = index;
+  anchor_.term = term;
+}
+
 LogIndex CommandLog::Append(LogEntry entry) {
   entry.index = LastIndex() + 1;
   entries_.push_back(std::move(entry));

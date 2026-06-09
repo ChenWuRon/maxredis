@@ -72,4 +72,12 @@ struct ElectionResult {
   uint32_t votes_rejected = 0;
 };
 
+// Snapshot anchor entry preserved after log compaction.
+// Allows AppendEntries consistency checks to reference
+// the last index/term covered by a snapshot.
+struct SnapshotAnchor {
+  LogIndex index = 0;
+  Term term = 0;
+};
+
 }  // namespace dfly

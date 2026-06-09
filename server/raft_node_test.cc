@@ -919,6 +919,8 @@ class MockLogStorage : public ILogStorage {
   MOCK_METHOD(LogIndex, LastIndex, (), (const, override));
   MOCK_METHOD(Term, LastTerm, (), (const, override));
   MOCK_METHOD(const LogEntry*, Get, (LogIndex), (const, override));
+  MOCK_METHOD(Term, GetTerm, (LogIndex), (const, override));
+  MOCK_METHOD(void, SetSnapshotAnchor, (LogIndex, Term), (override));
   MOCK_METHOD(LogIndex, Append, (LogEntry), (override));
   MOCK_METHOD(std::vector<LogEntry>, GetRange, (LogIndex, size_t), (const, override));
   MOCK_METHOD(void, TruncateFrom, (LogIndex), (override));

@@ -48,6 +48,8 @@ class FileLogStorage : public ILogStorage {
   LogIndex LastIndex() const final;
   Term LastTerm() const final;
   const LogEntry* Get(LogIndex index) const final;
+  Term GetTerm(LogIndex index) const final;
+  void SetSnapshotAnchor(LogIndex index, Term term) final;
   LogIndex Append(LogEntry entry) final;
   std::vector<LogEntry> GetRange(LogIndex start, size_t limit = 0) const final;
   void TruncateFrom(LogIndex new_last) final;

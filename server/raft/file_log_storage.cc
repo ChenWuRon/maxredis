@@ -105,6 +105,18 @@ Term FileLogStorage::LastTerm() const {
   return last_term_;
 }
 
+Term FileLogStorage::GetTerm(LogIndex index) const {
+  if (index == anchor_.index && anchor_.index > 0)
+    return anchor_.term;
+  const LogEntry* e = Get(index);
+  return e ? e->term : 0;
+}
+
+void FileLogStorage::SetSnapshotAnchor(LogIndex index, Term term) {
+  anchor_.index = index;
+  anchor_.term = term;
+}
+
 const LogEntry* FileLogStorage::Get(LogIndex index) const {
   if (index < base_index_ || index > last_index_)
     return nullptr;

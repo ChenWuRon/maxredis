@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <dirent.h>
+#include <unistd.h>
 
 #include "base/logging.h"
 #include "server/raft/crc32.h"
@@ -37,6 +38,13 @@ bool SegmentLogStorage::Open() {
     return false;
 
   LoadSegments();
+
+  // If the first recovered entry has a higher index (e.g. after segment
+  // deletion), update base_index_ to maintain the invariant that
+  // entries_[i] logically corresponds to index base_index_ + i.
+  if (entries_.size() > 1 && base_index_ == 0 && entries_[1].index > 1) {
+    base_index_ = entries_[1].index - 1;
+  }
   return true;
 }
 
@@ -180,6 +188,18 @@ Term SegmentLogStorage::LastTerm() const {
   return last_term_;
 }
 
+Term SegmentLogStorage::GetTerm(LogIndex index) const {
+  if (index == anchor_.index && anchor_.index > 0)
+    return anchor_.term;
+  const LogEntry* e = Get(index);
+  return e ? e->term : 0;
+}
+
+void SegmentLogStorage::SetSnapshotAnchor(LogIndex index, Term term) {
+  anchor_.index = index;
+  anchor_.term = term;
+}
+
 const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
   if (index < base_index_ || index > last_index_)
     return nullptr;
@@ -265,12 +285,51 @@ bool SegmentLogStorage::CompactUpTo(LogIndex index) {
   return true;
 }
 
+void SegmentLogStorage::CompactLogs(LogIndex snapshot_index, Term snapshot_term) {
+  SetSnapshotAnchor(snapshot_index, snapshot_term);
+  // Compact segments first while WalIndex is still valid.
+  CompactSegments(snapshot_index);
+  CompactUpTo(snapshot_index);
+}
+
 void SegmentLogStorage::Clear() {
   base_index_ = 0;
   index_.Clear();
   last_index_ = 0;
   last_term_ = 0;
   entries_.resize(1);
+}
+
+void SegmentLogStorage::CompactSegments(LogIndex snapshot_index) {
+  if (dir_.empty())
+    return;
+
+  // Find which segment contains the snapshot index.
+  const EntryLocation* loc = index_.Find(snapshot_index);
+  if (!loc) {
+    // Snapshot index not found in index — it may have been cleared.
+    // Fall back: scan segments to find the first one with entries > snapshot_index.
+    auto segments = DiscoverSegments();
+    for (uint32_t seg_id : segments) {
+      // Check if this segment has any entries by looking at the index.
+      // If index is cleared, we conservatively skip compaction.
+      VLOG(1) << "CompactSegments: snapshot_index " << snapshot_index
+              << " not in index, skipping";
+    }
+    return;
+  }
+
+  uint32_t keep_segment = loc->segment_id;
+
+  auto segments = DiscoverSegments();
+  for (uint32_t seg_id : segments) {
+    if (seg_id >= keep_segment)
+      break;
+    std::string seg_path = SegmentPath(seg_id);
+    if (unlink(seg_path.c_str()) == 0) {
+      VLOG(1) << "Deleted WAL segment: " << seg_path;
+    }
+  }
 }
 
 }  // namespace dfly
