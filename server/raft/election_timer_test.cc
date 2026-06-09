@@ -178,11 +178,13 @@ TEST_F(ElectionTimerTest, ResetDefersTheTimeout) {
     timer.Start([&fire_count] { fire_count.fetch_add(1, std::memory_order_release); });
 
     // Wait a bit, reset, wait, reset, then wait for final timeout.
+    // Use generous margin: worst case is 300ms + 300ms = 600ms total sleep,
+    // so 500ms from last reset (200ms into the test) = 700ms total gives 100ms slack.
     util::ThisFiber::SleepFor(std::chrono::milliseconds(100));
     timer.Reset();
     util::ThisFiber::SleepFor(std::chrono::milliseconds(100));
     timer.Reset();
-    util::ThisFiber::SleepFor(std::chrono::milliseconds(400));
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(500));
 
     timer.Stop();
   });

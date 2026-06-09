@@ -14,41 +14,64 @@ namespace dfly {
 RaftNode::RaftNode(NodeId node_id) : node_id_(std::move(node_id)) {
 }
 
+RaftNode::~RaftNode() {
+  StopHeartbeat();
+}
+
+void RaftNode::SetRole(RaftRole new_role) {
+  RaftRole old_role = role_;
+  role_ = new_role;
+
+  VLOG(1) << "RaftNode " << node_id_ << ": " << old_role << " -> " << new_role;
+
+  switch (new_role) {
+    case RaftRole::Follower:
+      leader_term_ = 0;
+      voted_for_.clear();
+      vote_count_ = 0;
+      // Lazy-start the election timer on first use, then reset.
+      if (!election_started_) {
+        election_started_ = true;
+        election_timer_.Start([this] { StartElection(); });
+      }
+      election_timer_.Reset();
+      StopHeartbeat();
+      break;
+    case RaftRole::Candidate:
+      term_++;
+      voted_for_ = node_id_;
+      vote_count_ = 1;
+      election_timer_.Deactivate();
+      StopHeartbeat();
+      break;
+    case RaftRole::Leader:
+      leader_term_ = term_;
+      election_timer_.Deactivate();
+      StopHeartbeat();
+      StartHeartbeat(heartbeat_interval_ms_);
+      break;
+  }
+}
+
 void RaftNode::BecomeFollower(Term term) {
   DCHECK_GE(term, term_);
   term_ = term;
-  role_ = RaftRole::Follower;
-  leader_term_ = 0;
-  voted_for_.clear();
-  vote_count_ = 0;
+  SetRole(RaftRole::Follower);
+}
 
-  // Lazy-start the election timer on first use, then reset on every follower transition.
-  if (!election_started_) {
-    election_started_ = true;
-    election_timer_.Start([this] { StartElection(); });
-  }
-  election_timer_.Reset();
+void RaftNode::BecomeCandidate() {
+  SetRole(RaftRole::Candidate);
+}
+
+void RaftNode::BecomeLeader() {
+  DCHECK_EQ(role_, RaftRole::Candidate);
+  SetRole(RaftRole::Leader);
 }
 
 void RaftNode::OnElectionTimeout() {
   if (role_ != RaftRole::Follower)
     return;
   BecomeCandidate();
-}
-
-void RaftNode::BecomeCandidate() {
-  term_++;
-  role_ = RaftRole::Candidate;
-  voted_for_ = node_id_;
-  vote_count_ = 1;
-  election_timer_.Deactivate();
-}
-
-void RaftNode::BecomeLeader() {
-  DCHECK_EQ(role_, RaftRole::Candidate);
-  role_ = RaftRole::Leader;
-  leader_term_ = term_;
-  election_timer_.Deactivate();
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {

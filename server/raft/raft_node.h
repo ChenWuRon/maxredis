@@ -22,6 +22,7 @@ class IStateMachine;
 class RaftNode {
  public:
   explicit RaftNode(NodeId node_id = "");
+  ~RaftNode();
 
   const NodeId& node_id() const {
     return node_id_;
@@ -42,6 +43,10 @@ class RaftNode {
   uint32_t vote_count() const {
     return vote_count_;
   }
+
+  // Unified role transition — all role changes must go through this.
+  // Handles logging, timer management, and heartbeat lifecycle.
+  void SetRole(RaftRole new_role);
 
   void AddPeer(RaftNode* peer);
 
