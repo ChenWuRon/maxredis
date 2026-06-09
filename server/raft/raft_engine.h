@@ -9,6 +9,7 @@
 
 #include "server/raft/command_log.h"
 #include "server/raft/raft_group.h"
+#include "server/raft/replicated_command.h"
 #include "server/state_machine/kv_state_machine.h"
 
 namespace dfly {
@@ -44,6 +45,9 @@ class RaftEngine {
   }
 
  private:
+  // Fast path for single-node: append log, advance commit index, apply.
+  ApplyResult FastCommitPath(const ReplicatedCommand& cmd);
+
   KvStateMachine kv_;
   RaftGroup group_;
   CommandLog log_;

@@ -27,10 +27,22 @@ ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
     return {ApplyOp::ERROR, 0};
   }
 
+  if (group_.node().peer_manager().PeerCount() == 0) {
+    return FastCommitPath(*cmd);
+  }
+
   LogEntry entry(group_.node().term(), 0, cmd->Serialize());
   log_.Append(entry);
 
   return group_.node().ReplicateLog();
+}
+
+ApplyResult RaftEngine::FastCommitPath(const ReplicatedCommand& cmd) {
+  LogEntry entry(group_.node().term(), 0, cmd.Serialize());
+  log_.Append(entry);
+
+  group_.node().AdvanceCommitIndex();
+  return group_.node().ApplyCommittedLogs();
 }
 
 bool RaftEngine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {
