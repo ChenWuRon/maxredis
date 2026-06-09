@@ -31,6 +31,11 @@ using Term = uint64_t;
 using LogIndex = uint64_t;
 using NodeId = std::string;
 
+enum class LogEntryType : uint8_t {
+  kCommand = 0,
+  kConfig = 1,
+};
+
 struct LogEntry {
   Term term = 0;
   LogIndex index = 0;

@@ -10,6 +10,8 @@
 #include <sstream>
 
 #include "base/gtest.h"
+#include "server/raft/command_log.h"
+#include "server/raft/replicated_command.h"
 
 namespace dfly {
 
@@ -106,6 +108,55 @@ TEST_F(RaftTypesTest, LogEntryVector) {
   EXPECT_EQ("PING", entries[0].command);
   EXPECT_EQ(2u, entries[2].term);
   EXPECT_EQ("SET b 2", entries[2].command);
+}
+
+TEST_F(RaftTypesTest, LogEntryTypeValues) {
+  EXPECT_EQ(0, static_cast<int>(LogEntryType::kCommand));
+  EXPECT_EQ(1, static_cast<int>(LogEntryType::kConfig));
+  EXPECT_EQ(1, sizeof(LogEntryType));
+}
+
+TEST_F(RaftTypesTest, ConfigChangeCommandRoundTrip) {
+  ClusterConfig config;
+  config.version = 3;
+  config.voters = {"N1", "N2", "N3"};
+  config.learners = {"L1"};
+
+  ConfigChangeCommand original{config};
+  std::string serialized = original.Serialize();
+
+  ConfigChangeCommand restored = ConfigChangeCommand::Deserialize(serialized);
+
+  EXPECT_EQ(original.target.version, restored.target.version);
+  EXPECT_EQ(original.target.voters, restored.target.voters);
+  EXPECT_EQ(original.target.learners, restored.target.learners);
+}
+
+TEST_F(RaftTypesTest, AppendConfigChangeToLog) {
+  ClusterConfig config;
+  config.version = 5;
+  config.voters = {"A", "B", "C"};
+  config.learners = {};
+
+  ConfigChangeCommand cmd{config};
+  std::string serialized = cmd.Serialize();
+
+  CommandLog log;
+  LogEntry entry(1, 0, serialized);
+  log.Append(entry);
+
+  EXPECT_EQ(1u, log.LogSize());
+  const LogEntry* stored = log.Get(1);
+  ASSERT_NE(nullptr, stored);
+  EXPECT_THAT(stored->command, StartsWith("CONFIG_CHANGE"));
+
+  ConfigChangeCommand decoded = ConfigChangeCommand::Deserialize(stored->command);
+  EXPECT_EQ(5u, decoded.target.version);
+  EXPECT_EQ(3u, decoded.target.voters.size());
+  EXPECT_EQ(1u, decoded.target.voters.count("A"));
+  EXPECT_EQ(1u, decoded.target.voters.count("B"));
+  EXPECT_EQ(1u, decoded.target.voters.count("C"));
+  EXPECT_TRUE(decoded.target.learners.empty());
 }
 
 }  // namespace dfly
