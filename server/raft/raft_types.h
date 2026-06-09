@@ -12,6 +12,8 @@
 
 namespace dfly {
 
+using GroupId = uint32_t;
+
 enum class RaftRole : uint8_t {
   Follower = 0,
   Candidate = 1,

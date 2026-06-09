@@ -143,7 +143,7 @@ TEST_F(RaftNodeTest, RejectStaleTerm) {
   RaftNode node("A");
   node.BecomeFollower(10);  // current_term = 10
 
-  VoteRequest req{9, "B", 0, 0};  // request.term = 9 (stale)
+  VoteRequest req{0, 9, "B", 0, 0};  // request.term = 9 (stale)
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_FALSE(rsp.vote_granted);
@@ -158,7 +158,7 @@ TEST_F(RaftNodeTest, GrantVoteHigherTerm) {
   node.SetLogStorage(&storage);
   node.BecomeFollower(10);  // current_term = 10
 
-  VoteRequest req{11, "B", 0, 0};  // request.term = 11 (higher)
+  VoteRequest req{0, 11, "B", 0, 0};  // request.term = 11 (higher)
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_TRUE(rsp.vote_granted);
@@ -175,13 +175,13 @@ TEST_F(RaftNodeTest, RejectVoteForDifferentCandidate) {
   node.BecomeFollower(20);
 
   // First grant vote to Node2
-  VoteRequest req2{20, "Node2", 0, 0};
+  VoteRequest req2{0, 20, "Node2", 0, 0};
   VoteResponse rsp1 = node.OnRequestVote(req2);
   EXPECT_TRUE(rsp1.vote_granted);
   EXPECT_EQ("Node2", node.voted_for());
 
   // Now Node3 requests — should reject
-  VoteRequest req3{20, "Node3", 0, 0};
+  VoteRequest req3{0, 20, "Node3", 0, 0};
   VoteResponse rsp2 = node.OnRequestVote(req3);
 
   EXPECT_FALSE(rsp2.vote_granted);
@@ -195,7 +195,7 @@ TEST_F(RaftNodeTest, GrantVoteToSameCandidateAgain) {
   node.SetLogStorage(&storage);
   node.BecomeFollower(20);
 
-  VoteRequest req{20, "Node2", 0, 0};
+  VoteRequest req{0, 20, "Node2", 0, 0};
   VoteResponse rsp1 = node.OnRequestVote(req);
   EXPECT_TRUE(rsp1.vote_granted);
   EXPECT_EQ("Node2", node.voted_for());
@@ -219,7 +219,7 @@ TEST_F(RaftNodeTest, RejectVoteWhenCandidateLogTermLower) {
   node.BecomeFollower(10);
 
   // Candidate has last_log_term = 1 < local_last_term = 4
-  VoteRequest req{10, "C", 1, 1};
+  VoteRequest req{0, 10, "C", 1, 1};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_FALSE(rsp.vote_granted);
@@ -241,7 +241,7 @@ TEST_F(RaftNodeTest, RejectVoteWhenCandidateLogTermEqualButIndexLower) {
 
   // Candidate has same term (2) but lower index (3 < 5)
   // VoteRequest(term, candidate, last_log_index, last_log_term)
-  VoteRequest req{5, "C", 3, 2};
+  VoteRequest req{0, 5, "C", 3, 2};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_FALSE(rsp.vote_granted);
@@ -258,7 +258,7 @@ TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogTermHigher) {
   node.BecomeFollower(5);
 
   // Candidate's last_log_term = 3 > local_last_term = 2
-  VoteRequest req{5, "C", 3, 10};
+  VoteRequest req{0, 5, "C", 3, 10};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_TRUE(rsp.vote_granted);
@@ -276,7 +276,7 @@ TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogTermEqualAndIndexHigher) {
   node.BecomeFollower(5);
 
   // Candidate has same term (2) but higher index (5 > 2)
-  VoteRequest req{5, "C", 2, 5};
+  VoteRequest req{0, 5, "C", 2, 5};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_TRUE(rsp.vote_granted);
@@ -295,7 +295,7 @@ TEST_F(RaftNodeTest, GrantVoteWhenCandidateLogExactlySame) {
   node.BecomeFollower(10);
 
   // Candidate has exactly the same log info
-  VoteRequest req{10, "C", 3, 3};
+  VoteRequest req{0, 10, "C", 3, 3};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_TRUE(rsp.vote_granted);
@@ -313,7 +313,7 @@ TEST_F(RaftNodeTest, RejectVoteHigherTermButStaleLog) {
 
   // Candidate has higher term (5 > 3) but stale log (last_log_term=4 < local 5)
   // VoteRequest(term, candidate, last_log_index, last_log_term)
-  VoteRequest req{5, "C", 10, 4};
+  VoteRequest req{0, 5, "C", 10, 4};
   VoteResponse rsp = node.OnRequestVote(req);
 
   EXPECT_FALSE(rsp.vote_granted);
@@ -333,7 +333,7 @@ TEST_F(RaftNodeTest, GrantVoteWithNonEmptyLogToSameCandidate) {
 
   // First vote grant: candidate's log (term=6, idx=2) matches local
   // VoteRequest(term, candidate, last_log_index, last_log_term)
-  VoteRequest req{10, "C", 2, 6};
+  VoteRequest req{0, 10, "C", 2, 6};
   VoteResponse rsp1 = node.OnRequestVote(req);
   EXPECT_TRUE(rsp1.vote_granted);
   EXPECT_EQ("C", node.voted_for());
@@ -353,9 +353,9 @@ TEST_F(RaftNodeTest, ThreeNodesAllGrant) {
   RaftNode n2("Node2");
   RaftNode n3("Node3");
 
-  transport.RegisterNode("Node1", &n1);
-  transport.RegisterNode("Node2", &n2);
-  transport.RegisterNode("Node3", &n3);
+  transport.RegisterNode(0, "Node1", &n1);
+  transport.RegisterNode(0, "Node2", &n2);
+  transport.RegisterNode(0, "Node3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("Node2");
   n1.AddPeer("Node3");
@@ -377,11 +377,11 @@ TEST_F(RaftNodeTest, OnePeerRejects) {
 
   // n2 already voted for someone else in this term
   n2.BecomeFollower(1);
-  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n2.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
 
-  transport.RegisterNode("Node1", &n1);
-  transport.RegisterNode("Node2", &n2);
-  transport.RegisterNode("Node3", &n3);
+  transport.RegisterNode(0, "Node1", &n1);
+  transport.RegisterNode(0, "Node2", &n2);
+  transport.RegisterNode(0, "Node3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("Node2");
   n1.AddPeer("Node3");
@@ -400,8 +400,8 @@ TEST_F(RaftNodeTest, StaleTermPeerRejects) {
   // n2 has a higher term
   n2.BecomeFollower(5);
 
-  transport.RegisterNode("Node1", &n1);
-  transport.RegisterNode("Node2", &n2);
+  transport.RegisterNode(0, "Node1", &n1);
+  transport.RegisterNode(0, "Node2", &n2);
   n1.SetTransport(&transport);
   n1.AddPeer("Node2");
 
@@ -422,9 +422,9 @@ TEST_F(RaftNodeTest, ThreeNodesThreeVotesBecomesLeader) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -439,11 +439,11 @@ TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
   RaftNode n1("N1"), n2("N2"), n3("N3");
   // n2 already voted for other in this term
   n2.BecomeFollower(1);
-  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n2.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -458,13 +458,13 @@ TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
   RaftNode n1("N1"), n2("N2"), n3("N3");
   // both peers already voted for other
   n2.BecomeFollower(1);
-  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n2.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
   n3.BecomeFollower(1);
-  n3.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n3.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -478,11 +478,11 @@ TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
-  transport.RegisterNode("N4", &n4);
-  transport.RegisterNode("N5", &n5);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
+  transport.RegisterNode(0, "N4", &n4);
+  transport.RegisterNode(0, "N5", &n5);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -499,17 +499,17 @@ TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
   // three peers already voted for other
   n2.BecomeFollower(1);
-  n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n2.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
   n3.BecomeFollower(1);
-  n3.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n3.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
   n4.BecomeFollower(1);
-  n4.OnRequestVote(VoteRequest{1, "Other", 0, 0});
+  n4.OnRequestVote(VoteRequest{0, 1, "Other", 0, 0});
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
-  transport.RegisterNode("N4", &n4);
-  transport.RegisterNode("N5", &n5);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
+  transport.RegisterNode(0, "N4", &n4);
+  transport.RegisterNode(0, "N5", &n5);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -527,7 +527,7 @@ TEST_F(RaftNodeTest, HeartbeatStaleTermRejected) {
   RaftNode node("A");
   node.BecomeFollower(10);
 
-  HeartbeatRequest req{5, "Leader"};  // stale term
+  HeartbeatRequest req{0, 5, "Leader"};  // stale term
   HeartbeatResponse rsp = node.OnHeartbeat(req);
 
   EXPECT_FALSE(rsp.success);
@@ -540,7 +540,7 @@ TEST_F(RaftNodeTest, HeartbeatSameTermAccepted) {
   RaftNode node("A");
   node.BecomeFollower(5);
 
-  HeartbeatRequest req{5, "Leader"};
+  HeartbeatRequest req{0, 5, "Leader"};
   HeartbeatResponse rsp = node.OnHeartbeat(req);
 
   EXPECT_TRUE(rsp.success);
@@ -552,7 +552,7 @@ TEST_F(RaftNodeTest, HeartbeatHigherTermAccepted) {
   RaftNode node("A");
   node.BecomeFollower(5);
 
-  HeartbeatRequest req{8, "NewLeader"};
+  HeartbeatRequest req{0, 8, "NewLeader"};
   HeartbeatResponse rsp = node.OnHeartbeat(req);
 
   EXPECT_TRUE(rsp.success);
@@ -570,7 +570,7 @@ TEST_F(RaftNodeTest, HeartbeatFromCandidateStepsDown) {
   n1.BecomeCandidate();
 
   // Another node sends heartbeat with same term — n1 should step down
-  HeartbeatRequest req{1, "N2"};
+  HeartbeatRequest req{0, 1, "N2"};
   HeartbeatResponse rsp = n1.OnHeartbeat(req);
 
   EXPECT_TRUE(rsp.success);
@@ -582,9 +582,9 @@ TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n2.SetTransport(&transport);
   n1.AddPeer("N2");
@@ -597,7 +597,7 @@ TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
   ASSERT_EQ(RaftRole::Leader, n1.role());
 
   // Send heartbeats from n1 to followers
-  HeartbeatRequest hb{n1.term(), n1.node_id()};
+  HeartbeatRequest hb{0, n1.term(), n1.node_id()};
   HeartbeatResponse rsp2 = n2.OnHeartbeat(hb);
   HeartbeatResponse rsp3 = n3.OnHeartbeat(hb);
 
@@ -617,8 +617,8 @@ TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
   leader.SetLogStorage(&leader_storage);
   follower.SetLogStorage(&follower_storage);
 
-  transport.RegisterNode("L1", &leader);
-  transport.RegisterNode("F1", &follower);
+  transport.RegisterNode(0, "L1", &leader);
+  transport.RegisterNode(0, "F1", &follower);
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
 
@@ -644,8 +644,8 @@ TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
   leader.SetLogStorage(&leader_storage);
   follower.SetLogStorage(&follower_storage);
 
-  transport.RegisterNode("L1", &leader);
-  transport.RegisterNode("F1", &follower);
+  transport.RegisterNode(0, "L1", &leader);
+  transport.RegisterNode(0, "F1", &follower);
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
 
@@ -826,9 +826,9 @@ TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
   follower1.SetLogStorage(&f1_storage);
   follower2.SetLogStorage(&f2_storage);
 
-  transport.RegisterNode("L1", &leader);
-  transport.RegisterNode("F1", &follower1);
-  transport.RegisterNode("F2", &follower2);
+  transport.RegisterNode(0, "L1", &leader);
+  transport.RegisterNode(0, "F1", &follower1);
+  transport.RegisterNode(0, "F2", &follower2);
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
   leader.AddPeer("F2");
@@ -944,9 +944,9 @@ TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
   f1.SetLogStorage(&f1_storage);
   f2.SetLogStorage(&f2_storage);
 
-  transport.RegisterNode("N1", &node);
-  transport.RegisterNode("F1", &f1);
-  transport.RegisterNode("F2", &f2);
+  transport.RegisterNode(0, "N1", &node);
+  transport.RegisterNode(0, "F1", &f1);
+  transport.RegisterNode(0, "F2", &f2);
   node.SetTransport(&transport);
   node.AddPeer("F1");
   node.AddPeer("F2");
@@ -1315,7 +1315,7 @@ TEST_F(RaftNodeTest, LeaderStepDown) {
   EXPECT_EQ(1u, node.leader_term());
 
   // Receive a heartbeat from a leader with higher term.
-  HeartbeatRequest req{5, "n2"};
+  HeartbeatRequest req{0, 5, "n2"};
   HeartbeatResponse rsp = node.OnHeartbeat(req);
 
   EXPECT_TRUE(rsp.success);
@@ -1338,9 +1338,9 @@ TEST_F(RaftNodeTest, ThreeNodeClusterElectionAndHeartbeat) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n2.SetTransport(&transport);
   n3.SetTransport(&transport);
@@ -1369,7 +1369,7 @@ TEST_F(RaftNodeTest, ThreeNodeClusterElectionAndHeartbeat) {
   EXPECT_EQ(1u, n3.term());
 
   // Heartbeats from N1 keep followers stable
-  HeartbeatRequest hb{n1.term(), n1.node_id()};
+  HeartbeatRequest hb{0, n1.term(), n1.node_id()};
   HeartbeatResponse rsp2 = n2.OnHeartbeat(hb);
   HeartbeatResponse rsp3 = n3.OnHeartbeat(hb);
 
@@ -1397,9 +1397,9 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLogReplication) {
   follower1.SetLogStorage(&f1_storage);
   follower2.SetLogStorage(&f2_storage);
 
-  transport.RegisterNode("L1", &leader);
-  transport.RegisterNode("F1", &follower1);
-  transport.RegisterNode("F2", &follower2);
+  transport.RegisterNode(0, "L1", &leader);
+  transport.RegisterNode(0, "F1", &follower1);
+  transport.RegisterNode(0, "F2", &follower2);
   leader.SetTransport(&transport);
   follower1.SetTransport(&transport);
   follower2.SetTransport(&transport);
@@ -1456,9 +1456,9 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
   n3.SetLogStorage(&l3_storage);
   n3.SetStateMachine(&sm3);
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n2.SetTransport(&transport);
   n3.SetTransport(&transport);
@@ -1478,7 +1478,7 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
   EXPECT_EQ(1u, n3.term());
 
   // Step 2: N1 steps down on higher term heartbeat (term 5)
-  n1.OnHeartbeat(HeartbeatRequest{5, "N2"});
+  n1.OnHeartbeat(HeartbeatRequest{0, 5, "N2"});
   EXPECT_EQ(RaftRole::Follower, n1.role());
   EXPECT_EQ(5u, n1.term());
 
@@ -1535,10 +1535,10 @@ TEST_F(RaftNodeTest, JointConsensusFullTransition) {
   n3.SetLogStorage(&log_c);
   n4.SetLogStorage(&log_d);
 
-  transport.RegisterNode("A", &n1);
-  transport.RegisterNode("B", &n2);
-  transport.RegisterNode("C", &n3);
-  transport.RegisterNode("D", &n4);
+  transport.RegisterNode(0, "A", &n1);
+  transport.RegisterNode(0, "B", &n2);
+  transport.RegisterNode(0, "C", &n3);
+  transport.RegisterNode(0, "D", &n4);
   n1.SetTransport(&transport);
   n1.AddPeer("B");
   n1.AddPeer("C");
@@ -1608,10 +1608,10 @@ TEST_F(RaftNodeTest, JointConsensusPeerManagerUpdated) {
   n3.SetLogStorage(&log_c);
   n4.SetLogStorage(&log_d);
 
-  transport.RegisterNode("A", &n1);
-  transport.RegisterNode("B", &n2);
-  transport.RegisterNode("C", &n3);
-  transport.RegisterNode("D", &n4);
+  transport.RegisterNode(0, "A", &n1);
+  transport.RegisterNode(0, "B", &n2);
+  transport.RegisterNode(0, "C", &n3);
+  transport.RegisterNode(0, "D", &n4);
   n1.SetTransport(&transport);
   n1.AddPeer("B");
   n1.AddPeer("C");
@@ -1687,47 +1687,47 @@ class PartitionedTransport : public Transport {
   explicit PartitionedTransport(LocalTransport& inner) : inner_(inner) {}
 
   bool HasNode(const NodeId& id) const {
-    return inner_.HasNode(id);
+    return inner_.HasNode(0, id);
   }
 
   VoteResponse SendVoteRequest(const NodeId& peer_id,
                                 const VoteRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false};
     return inner_.SendVoteRequest(peer_id, request);
   }
 
   HeartbeatResponse SendHeartbeat(const NodeId& peer_id,
                                    const HeartbeatRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false};
     return inner_.SendHeartbeat(peer_id, request);
   }
 
   AppendEntriesResponse SendAppendEntries(const NodeId& peer_id,
                                            const AppendEntriesRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false, 0};
     return inner_.SendAppendEntries(peer_id, request);
   }
 
   InstallSnapshotResponse SendInstallSnapshot(const NodeId& peer_id,
                                                const InstallSnapshotRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false};
     return inner_.SendInstallSnapshot(peer_id, request);
   }
 
   ReadIndexResponse SendReadIndex(const NodeId& peer_id,
                                    const ReadIndexRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false, 0};
     return inner_.SendReadIndex(peer_id, request);
   }
 
   TimeoutNowResponse SendTimeoutNow(const NodeId& peer_id,
                                      const TimeoutNowRequest& request) override {
-    if (!inner_.HasNode(peer_id))
+    if (!inner_.HasNode(0, peer_id))
       return {0, false};
     return inner_.SendTimeoutNow(peer_id, request);
   }
@@ -1758,10 +1758,10 @@ TEST_F(RaftNodeTest, IntegrationScaleUp3To4) {
   c.SetLogStorage(&log_c);
   d.SetLogStorage(&log_d);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
-  transport.RegisterNode("D", &d);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
+  transport.RegisterNode(0, "D", &d);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -1817,10 +1817,10 @@ TEST_F(RaftNodeTest, IntegrationScaleDown4To3) {
   c.SetLogStorage(&log_c);
   d.SetLogStorage(&log_d);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
-  transport.RegisterNode("D", &d);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
+  transport.RegisterNode(0, "D", &d);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -1871,10 +1871,10 @@ TEST_F(RaftNodeTest, IntegrationLeaderUnchanged) {
   c.SetLogStorage(&log_c);
   d.SetLogStorage(&log_d);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
-  transport.RegisterNode("D", &d);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
+  transport.RegisterNode(0, "D", &d);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -1971,10 +1971,10 @@ TEST_F(RaftNodeTest, IntegrationLeaderStepsDownDuringJoint) {
   c.SetLogStorage(&log_c);
   c.SetStateMachine(&sm_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
-  transport.RegisterNode("D", &d);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
+  transport.RegisterNode(0, "D", &d);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2002,7 +2002,7 @@ TEST_F(RaftNodeTest, IntegrationLeaderStepsDownDuringJoint) {
 
   // Now all 3 nodes are in Joint. A is leader.
   // A steps down: receive heartbeat with higher term
-  a.OnHeartbeat(HeartbeatRequest{a.term() + 1, "X"});
+  a.OnHeartbeat(HeartbeatRequest{0, a.term() + 1, "X"});
   ASSERT_EQ(RaftRole::Follower, a.role());
 
   // B starts election — must win both old and new majorities
@@ -2046,11 +2046,11 @@ TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
   d.SetLogStorage(&log_d);
   e.SetLogStorage(&log_e);
 
-  transport_all.RegisterNode("A", &a);
-  transport_all.RegisterNode("B", &b);
-  transport_all.RegisterNode("C", &c);
-  transport_all.RegisterNode("D", &d);
-  transport_all.RegisterNode("E", &e);
+  transport_all.RegisterNode(0, "A", &a);
+  transport_all.RegisterNode(0, "B", &b);
+  transport_all.RegisterNode(0, "C", &c);
+  transport_all.RegisterNode(0, "D", &d);
+  transport_all.RegisterNode(0, "E", &e);
   a.SetTransport(&transport_all);
   b.SetTransport(&transport_all);
   c.SetTransport(&transport_all);
@@ -2086,11 +2086,11 @@ TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
   // Group 1: {A, B} — has old majority 2/3 but NOT new majority 2/4
   // Group 2: {C, D, E} — has new majority 3/4 but NOT old majority 1/3
   LocalTransport transport_ab, transport_cde;
-  transport_ab.RegisterNode("A", &a);
-  transport_ab.RegisterNode("B", &b);
-  transport_cde.RegisterNode("C", &c);
-  transport_cde.RegisterNode("D", &d);
-  transport_cde.RegisterNode("E", &e);
+  transport_ab.RegisterNode(0, "A", &a);
+  transport_ab.RegisterNode(0, "B", &b);
+  transport_cde.RegisterNode(0, "C", &c);
+  transport_cde.RegisterNode(0, "D", &d);
+  transport_cde.RegisterNode(0, "E", &e);
   PartitionedTransport pab(transport_ab), pcde(transport_cde);
   a.SetTransport(&pab);
   b.SetTransport(&pab);
@@ -2099,7 +2099,7 @@ TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
   e.SetTransport(&pcde);
 
   // A steps down (simulate leader loss)
-  a.OnHeartbeat(HeartbeatRequest{a.term() + 1, "X"});
+  a.OnHeartbeat(HeartbeatRequest{0, a.term() + 1, "X"});
 
   // Group 1 tries election (A or B). Neither has new majority.
   a.StartElection();
@@ -2121,7 +2121,7 @@ TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
   e.SetTransport(&transport_all);
 
   // Give everyone a higher term so new election proceeds
-  a.OnHeartbeat(HeartbeatRequest{c.term() + 1, "Z"});
+  a.OnHeartbeat(HeartbeatRequest{0, c.term() + 1, "Z"});
 
   // Original leader A can now win with both majorities
   a.StartElection();
@@ -2191,9 +2191,9 @@ TEST_F(RaftNodeTest, ReadIndexWithQuorum) {
 
   // Expect ReadIndex RPCs to N2 and N3, both success.
   EXPECT_CALL(transport, SendReadIndex("N2", _))
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}));
   EXPECT_CALL(transport, SendReadIndex("N3", _))
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}));
 
   LogIndex ri = node.ReadIndex();
   EXPECT_EQ(0u, ri);
@@ -2218,9 +2218,9 @@ TEST_F(RaftNodeTest, ReadIndexQuorumFails) {
 
   // Only one peer acks – need 2/3 = N1 + 1 = 2 minimum.
   EXPECT_CALL(transport, SendReadIndex("N2", _))
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}));
   EXPECT_CALL(transport, SendReadIndex("N3", _))
-      .WillOnce(Return(ReadIndexResponse{1, false, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, false, 0}));
 
   LogIndex ri = node.ReadIndex();
   EXPECT_EQ(0u, ri) << "ReadIndex must fail without majority";
@@ -2247,8 +2247,8 @@ TEST_F(RaftNodeTest, ReadIndexHigherTermStepsDown) {
   // .Times(2) and check that at least one response has a higher term.
   EXPECT_CALL(transport, SendReadIndex(_, _))
       .Times(2)
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}))
-      .WillOnce(Return(ReadIndexResponse{5, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}))
+      .WillOnce(Return(ReadIndexResponse{0, 5, true, 0}));
 
   LogIndex ri = node.ReadIndex();
   EXPECT_EQ(0u, ri);
@@ -2267,9 +2267,9 @@ TEST_F(RaftNodeTest, ReadIndexThreeNodeCluster) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2370,9 +2370,9 @@ TEST_F(RaftNodeTest, ReadIndexLeaderLeaseReusesQuorum) {
 
   // First ReadIndex: must go through quorum (lease is not yet valid).
   EXPECT_CALL(transport, SendReadIndex("N2", _))
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}));
   EXPECT_CALL(transport, SendReadIndex("N3", _))
-      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+      .WillOnce(Return(ReadIndexResponse{0, 1, true, 0}));
   LogIndex ri = node.ReadIndex();
   EXPECT_EQ(0u, ri);
 
@@ -2396,9 +2396,9 @@ TEST_F(RaftNodeTest, TransferLeaderAtoB) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2443,9 +2443,9 @@ TEST_F(RaftNodeTest, TransferRejectedWhenBehind) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2495,9 +2495,9 @@ TEST_F(RaftNodeTest, TransferCrashDuringTransfer) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2516,7 +2516,7 @@ TEST_F(RaftNodeTest, TransferCrashDuringTransfer) {
   ASSERT_TRUE(a.StartTransfer("B"));
 
   // Simulate A stepping down (crash).
-  a.OnHeartbeat(HeartbeatRequest{10, "Z"});
+  a.OnHeartbeat(HeartbeatRequest{0, 10, "Z"});
   EXPECT_EQ(RaftRole::Follower, a.role());
 
   // After TimeoutNow, B started its election and likely won before A stepped
@@ -2544,9 +2544,9 @@ TEST_F(RaftNodeTest, TransferTimeout) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);
@@ -2583,9 +2583,9 @@ TEST_F(RaftNodeTest, TransferSequentialABC) {
   b.SetLogStorage(&log_b);
   c.SetLogStorage(&log_c);
 
-  transport.RegisterNode("A", &a);
-  transport.RegisterNode("B", &b);
-  transport.RegisterNode("C", &c);
+  transport.RegisterNode(0, "A", &a);
+  transport.RegisterNode(0, "B", &b);
+  transport.RegisterNode(0, "C", &c);
   a.SetTransport(&transport);
   b.SetTransport(&transport);
   c.SetTransport(&transport);

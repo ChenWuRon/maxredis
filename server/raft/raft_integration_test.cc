@@ -63,7 +63,7 @@ class InMemoryKV : public IStateMachine {
     return false;
   }
 
-  OpResult<string> Get(DbIndex, string_view key) override {
+  OpResult<string> Get(DbIndex, string_view key, ReadConsistency) override {
     auto it = store_.find(string(key));
     if (it != store_.end())
       return it->second;
@@ -117,12 +117,12 @@ TEST_F(RaftIntegrationTest, SetCommandApply) {
   EXPECT_EQ(1u, node.commit_index());
   EXPECT_EQ(1u, node.last_applied());
 
-  auto result = kv.Get(0, "a");
+  auto result = kv.Get(0, "a", ReadConsistency::kLocal);
   ASSERT_TRUE(result);
   EXPECT_EQ("1", result.value());
 
   // Unset key returns NOTFOUND
-  auto missing = kv.Get(0, "nonexistent");
+  auto missing = kv.Get(0, "nonexistent", ReadConsistency::kLocal);
   EXPECT_EQ(OpStatus::KEY_NOTFOUND, missing.status());
 }
 
@@ -160,15 +160,15 @@ TEST_F(RaftIntegrationTest, MultipleCommandsApply) {
   EXPECT_EQ(3u, node.last_applied());
 
   // Verify all keys
-  auto va = kv.Get(0, "a");
+  auto va = kv.Get(0, "a", ReadConsistency::kLocal);
   ASSERT_TRUE(va);
   EXPECT_EQ("1", va.value());
 
-  auto vb = kv.Get(0, "b");
+  auto vb = kv.Get(0, "b", ReadConsistency::kLocal);
   ASSERT_TRUE(vb);
   EXPECT_EQ("2", vb.value());
 
-  auto vc = kv.Get(0, "c");
+  auto vc = kv.Get(0, "c", ReadConsistency::kLocal);
   ASSERT_TRUE(vc);
   EXPECT_EQ("3", vc.value());
 

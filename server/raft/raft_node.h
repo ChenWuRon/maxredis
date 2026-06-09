@@ -48,6 +48,14 @@ class RaftNode {
   explicit RaftNode(NodeId node_id = "");
   ~RaftNode();
 
+  GroupId group_id() const {
+    return group_id_;
+  }
+
+  void set_group_id(GroupId gid) {
+    group_id_ = gid;
+  }
+
   // Set the persistence path for Raft metadata.
   // This also loads existing state from disk if available.
   void SetStoragePath(std::string path);
@@ -312,6 +320,7 @@ class RaftNode {
   void CheckTransferTimeout();
   void SendTimeoutNowToTarget();
 
+  GroupId group_id_ = 0;
   JointConfig joint_config_;
   ClusterConfig cluster_config_;
   ConfigState config_state_ = ConfigState::kStable;

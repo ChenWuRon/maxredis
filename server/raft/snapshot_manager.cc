@@ -10,7 +10,7 @@
 
 namespace dfly {
 
-SnapshotManager::SnapshotManager(std::string dir, IStateMachine* sm,
+RaftSnapshotManager::RaftSnapshotManager(std::string dir, IStateMachine* sm,
                                  ILogStorage* log)
     : dir_(std::move(dir)), state_machine_(sm), log_storage_(log) {
   // Ensure trailing slash.
@@ -21,24 +21,24 @@ SnapshotManager::SnapshotManager(std::string dir, IStateMachine* sm,
   meta_storage_.Load();
 }
 
-SnapshotManager::~SnapshotManager() {
+RaftSnapshotManager::~RaftSnapshotManager() {
   Stop();
 }
 
-void SnapshotManager::Start() {
+void RaftSnapshotManager::Start() {
   if (snapshot_fiber_.IsJoinable())
     return;
   shutdown_.store(false, std::memory_order_release);
   snapshot_fiber_ = util::fb2::Fiber("snapshot_mgr", [this] { SnapshotLoop(); });
 }
 
-void SnapshotManager::Stop() {
+void RaftSnapshotManager::Stop() {
   shutdown_.store(true, std::memory_order_release);
   if (snapshot_fiber_.IsJoinable())
     snapshot_fiber_.Join();
 }
 
-bool SnapshotManager::CreateSnapshot() {
+bool RaftSnapshotManager::CreateSnapshot() {
   if (!state_machine_ || !log_storage_)
     return false;
 
@@ -73,7 +73,7 @@ bool SnapshotManager::CreateSnapshot() {
   return ok;
 }
 
-bool SnapshotManager::ScheduleCreateIfNeeded() {
+bool RaftSnapshotManager::ScheduleCreateIfNeeded() {
   if (!log_storage_ || !state_machine_)
     return false;
 
@@ -88,7 +88,7 @@ bool SnapshotManager::ScheduleCreateIfNeeded() {
   return CreateSnapshot();
 }
 
-void SnapshotManager::SnapshotLoop() {
+void RaftSnapshotManager::SnapshotLoop() {
   VLOG(1) << "SnapshotLoop started";
   while (!shutdown_.load(std::memory_order_acquire)) {
     ScheduleCreateIfNeeded();

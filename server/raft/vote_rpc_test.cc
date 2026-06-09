@@ -37,7 +37,7 @@ TEST_F(VoteRpcTest, VoteRequestFields) {
 }
 
 TEST_F(VoteRpcTest, VoteRequestAggregateInit) {
-  VoteRequest req{10, "node2", 200, 8};
+  VoteRequest req{0, 10, "node2", 200, 8};
   EXPECT_EQ(10u, req.term);
   EXPECT_EQ("node2", req.candidate_id);
   EXPECT_EQ(200u, req.last_log_index);
@@ -51,25 +51,25 @@ TEST_F(VoteRpcTest, VoteResponseDefault) {
 }
 
 TEST_F(VoteRpcTest, VoteResponseFields) {
-  VoteResponse rsp{5, true};
+  VoteResponse rsp{0, 5, true};
   EXPECT_EQ(5u, rsp.term);
   EXPECT_TRUE(rsp.vote_granted);
 }
 
 TEST_F(VoteRpcTest, VoteResponseAggregateInit) {
-  VoteResponse rsp{7, false};
+  VoteResponse rsp{0, 7, false};
   EXPECT_EQ(7u, rsp.term);
   EXPECT_FALSE(rsp.vote_granted);
 }
 
 TEST_F(VoteRpcTest, VoteRequestCopy) {
-  VoteRequest a{3, "node_a", 50, 2};
+  VoteRequest a{0, 3, "node_a", 50, 2};
   VoteRequest b = a;
   EXPECT_EQ(a, b);
 }
 
 TEST_F(VoteRpcTest, VoteRequestMove) {
-  VoteRequest a{4, "node_b", 60, 3};
+  VoteRequest a{0, 4, "node_b", 60, 3};
   VoteRequest b = std::move(a);
   EXPECT_EQ(4u, b.term);
   EXPECT_EQ("node_b", b.candidate_id);
@@ -78,22 +78,22 @@ TEST_F(VoteRpcTest, VoteRequestMove) {
 }
 
 TEST_F(VoteRpcTest, VoteResponseCopy) {
-  VoteResponse a{8, true};
+  VoteResponse a{0, 8, true};
   VoteResponse b = a;
   EXPECT_EQ(a, b);
 }
 
 TEST_F(VoteRpcTest, VoteResponseMove) {
-  VoteResponse a{9, false};
+  VoteResponse a{0, 9, false};
   VoteResponse b = std::move(a);
   EXPECT_EQ(9u, b.term);
   EXPECT_FALSE(b.vote_granted);
 }
 
 TEST_F(VoteRpcTest, VoteRequestEquality) {
-  VoteRequest a{2, "x", 10, 1};
-  VoteRequest b{2, "x", 10, 1};
-  VoteRequest c{3, "x", 10, 1};
+  VoteRequest a{0, 2, "x", 10, 1};
+  VoteRequest b{0, 2, "x", 10, 1};
+  VoteRequest c{0, 3, "x", 10, 1};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
 }

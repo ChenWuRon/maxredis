@@ -192,7 +192,7 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   if (request.term < cur_term) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": stale term " << request.term << " < " << cur_term;
-    return {cur_term, false};
+    return {group_id_, cur_term, false};
   }
 
   if (request.term > cur_term) {
@@ -204,7 +204,7 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   if (!voted.empty() && voted != request.candidate_id) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": already voted for " << voted;
-    return {storage_.current_term(), false};
+    return {group_id_, storage_.current_term(), false};
   }
 
   Term local_last_term = log_storage_ ? log_storage_->LastTerm() : 0;
@@ -213,24 +213,25 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   if (request.last_log_term < local_last_term) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": log term " << request.last_log_term << " < " << local_last_term;
-    return {storage_.current_term(), false};
+    return {group_id_, storage_.current_term(), false};
   }
   if (request.last_log_term == local_last_term && request.last_log_index < local_last_index) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": log index " << request.last_log_index << " < " << local_last_index;
-    return {storage_.current_term(), false};
+    return {group_id_, storage_.current_term(), false};
   }
 
   storage_.set_voted_for(request.candidate_id);
   VLOG(1) << node_id_ << " grants VoteRequest to " << request.candidate_id
           << " term=" << storage_.current_term();
-  return {storage_.current_term(), true};
+  return {group_id_, storage_.current_term(), true};
 }
 
 ElectionResult RaftNode::StartElection() {
   BecomeCandidate();
 
   VoteRequest request;
+  request.group_id = group_id_;
   request.term = storage_.current_term();
   request.candidate_id = node_id_;
   request.last_log_index = log_storage_ ? log_storage_->LastIndex() : 0;
@@ -313,7 +314,7 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
   if (request.term < cur_term) {
     VLOG(2) << node_id_ << " rejects Heartbeat from " << request.leader_id
             << ": stale term " << request.term << " < " << cur_term;
-    return {cur_term, false};
+    return {group_id_, cur_term, false};
   }
 
   if (request.term >= cur_term) {
@@ -324,7 +325,7 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 
   election_timer_.Reset();
 
-  return {storage_.current_term(), true};
+  return {group_id_, storage_.current_term(), true};
 }
 
 ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
@@ -359,7 +360,10 @@ TimeoutNowResponse RaftNode::OnTimeoutNow(const TimeoutNowRequest& request) {
 }
 
 void RaftNode::SendHeartbeatToPeers() {
-  HeartbeatRequest req{storage_.current_term(), node_id_};
+  HeartbeatRequest req;
+  req.group_id = group_id_;
+  req.term = storage_.current_term();
+  req.leader_id = node_id_;
   for (const auto& peer_id : GetPeerIds()) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     transport_->SendHeartbeat(peer_id, req);
@@ -423,6 +427,7 @@ LogIndex RaftNode::ReadIndex() {
   Term current_term = storage_.current_term();
 
   ReadIndexRequest req;
+  req.group_id = group_id_;
   req.term = current_term;
   req.leader_id = node_id_;
   req.request_id = ++next_read_index_request_id_;
@@ -568,6 +573,7 @@ void RaftNode::SendTimeoutNowToTarget() {
     return;
 
   TimeoutNowRequest req;
+  req.group_id = group_id_;
   req.term = storage_.current_term();
   req.leader_id = node_id_;
 
@@ -586,7 +592,7 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
     VLOG(2) << node_id_ << " rejects AppendEntries from " << req.leader_id
             << ": stale term " << req.term << " < " << cur_term;
     LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
-    return {cur_term, false, my_last};
+    return {group_id_, cur_term, false, my_last};
   }
 
   if (req.term >= cur_term) {
@@ -598,13 +604,13 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   if (log_storage_) {
     if (req.prev_log_index > log_storage_->LastIndex()) {
       VLOG(2) << node_id_ << " rejects AppendEntries: gap at prev_log=" << req.prev_log_index;
-      return {storage_.current_term(), false, log_storage_->LastIndex()};
+      return {group_id_, storage_.current_term(), false, log_storage_->LastIndex()};
     }
     if (req.prev_log_index > 0) {
       const LogEntry* prev = log_storage_->Get(req.prev_log_index);
       if (!prev || prev->term != req.prev_log_term) {
         VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
-        return {storage_.current_term(), false, req.prev_log_index - 1};
+        return {group_id_, storage_.current_term(), false, req.prev_log_index - 1};
       }
     }
 
@@ -631,7 +637,7 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
     ApplyCommittedLogs();
   }
 
-  return {storage_.current_term(), true, my_last};
+  return {group_id_, storage_.current_term(), true, my_last};
 }
 
 InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest& req) {
@@ -639,7 +645,7 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
   if (req.term < cur_term) {
     VLOG(2) << node_id_ << " rejects InstallSnapshot from " << req.leader_id
             << ": stale term " << req.term << " < " << cur_term;
-    return {cur_term, false};
+    return {group_id_, cur_term, false};
   }
 
   if (req.term >= cur_term) {
@@ -650,7 +656,7 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
 
   if (!snapshot_receiver_) {
     LOG(WARNING) << node_id_ << " no SnapshotReceiver installed";
-    return {storage_.current_term(), false};
+    return {group_id_, storage_.current_term(), false};
   }
 
   InstallSnapshotResponse rsp = snapshot_receiver_->HandleChunk(req);
@@ -722,7 +728,7 @@ ApplyResult RaftNode::ReplicateLog() {
                 << " snapshot_index=" << last_snapshot_index_;
         std::string snapshot_path = snapshot_dir_ + "snapshot.bin";
         SnapshotSender sender(snapshot_path, transport_);
-        bool ok = sender.SendSnapshot(peer_ids[i], current_term, node_id_,
+        bool ok = sender.SendSnapshot(peer_ids[i], group_id_, current_term, node_id_,
                                        last_snapshot_index_, last_snapshot_term_);
         if (ok) {
           peer_last_log_index_[i] = last_snapshot_index_;
@@ -734,6 +740,7 @@ ApplyResult RaftNode::ReplicateLog() {
 
   // Send AppendEntries to all peers.
   AppendEntriesRequest req;
+  req.group_id = group_id_;
   req.term = current_term;
   req.leader_id = node_id_;
   req.leader_commit = commit_index_;

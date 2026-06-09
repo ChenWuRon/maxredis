@@ -103,11 +103,11 @@ TEST_F(RaftRoleTest, ElectionTimeoutCreatesCandidateWithPeerRejection) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
-  transport.RegisterNode("N4", &n4);
-  transport.RegisterNode("N5", &n5);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
+  transport.RegisterNode(0, "N4", &n4);
+  transport.RegisterNode(0, "N5", &n5);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -146,9 +146,9 @@ TEST_F(RaftRoleTest, CandidateWinsElectionBecomesLeader) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
 
-  transport.RegisterNode("N1", &n1);
-  transport.RegisterNode("N2", &n2);
-  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode(0, "N1", &n1);
+  transport.RegisterNode(0, "N2", &n2);
+  transport.RegisterNode(0, "N3", &n3);
   n1.SetTransport(&transport);
   n1.AddPeer("N2");
   n1.AddPeer("N3");
@@ -199,7 +199,7 @@ TEST_F(RaftRoleTest, CandidateStepsDownOnHigherTerm) {
   EXPECT_EQ(RaftRole::Candidate, node.role());
 
   // Receiving a heartbeat from a leader with higher term.
-  HeartbeatRequest hb{5, "LeaderY"};
+  HeartbeatRequest hb{0, 5, "LeaderY"};
   HeartbeatResponse rsp = node.OnHeartbeat(hb);
 
   EXPECT_TRUE(rsp.success);
@@ -242,7 +242,7 @@ TEST_F(RaftRoleTest, LeaderStepsDownOnHigherTermHeartbeat) {
   EXPECT_EQ(1u, node.term());
 
   // Discover a leader with higher term.
-  HeartbeatRequest hb{4, "LeaderX"};
+  HeartbeatRequest hb{0, 4, "LeaderX"};
   HeartbeatResponse rsp = node.OnHeartbeat(hb);
 
   EXPECT_TRUE(rsp.success);
@@ -329,13 +329,13 @@ TEST_F(RaftRoleTest, MockTransportConfiguredVoteRouting) {
       "N2",
       AllOf(Field(&VoteRequest::term, 1),
             Field(&VoteRequest::candidate_id, "N1"))))
-      .WillOnce(Return(VoteResponse{1, true}));
+      .WillOnce(Return(VoteResponse{0, 1, true}));
 
   EXPECT_CALL(transport, SendVoteRequest(
       "N3",
       AllOf(Field(&VoteRequest::term, 1),
             Field(&VoteRequest::candidate_id, "N1"))))
-      .WillOnce(Return(VoteResponse{1, false}));
+      .WillOnce(Return(VoteResponse{0, 1, false}));
 
   // Simulate the election by manually routing through the transport mock
   // (which represents how a real transport layer would work).

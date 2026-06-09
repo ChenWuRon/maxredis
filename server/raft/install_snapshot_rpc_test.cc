@@ -66,21 +66,21 @@ TEST_F(InstallSnapshotRpcTest, ResponseDefault) {
 }
 
 TEST_F(InstallSnapshotRpcTest, ResponseFields) {
-  InstallSnapshotResponse rsp{5, true};
+  InstallSnapshotResponse rsp{0, 5, true};
   EXPECT_EQ(5u, rsp.term);
   EXPECT_TRUE(rsp.success);
 }
 
 TEST_F(InstallSnapshotRpcTest, RequestEquality) {
-  InstallSnapshotRequest a{3, "L1", 100, 2, 0, false, "data"};
-  InstallSnapshotRequest b{3, "L1", 100, 2, 0, false, "data"};
-  InstallSnapshotRequest c{3, "L1", 100, 2, 0, false, "other"};
+  InstallSnapshotRequest a{0, 3, "L1", 100, 2, 0, false, "data"};
+  InstallSnapshotRequest b{0, 3, "L1", 100, 2, 0, false, "data"};
+  InstallSnapshotRequest c{0, 3, "L1", 100, 2, 0, false, "other"};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
 }
 
 TEST_F(InstallSnapshotRpcTest, ResponseEquality) {
-  InstallSnapshotResponse a{4, true}, b{4, true}, c{4, false};
+  InstallSnapshotResponse a{0, 4, true}, b{0, 4, true}, c{0, 4, false};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
 }

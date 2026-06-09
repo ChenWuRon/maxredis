@@ -22,13 +22,13 @@ namespace dfly {
 // is created on a background fiber. During snapshot creation, the
 // SnapshotBarrier ensures a consistent point-in-time view by blocking
 // concurrent writes.
-class SnapshotManager {
+class RaftSnapshotManager {
  public:
   // |dir| is the snapshot directory (e.g. "data/raft/snapshot/").
   // Creates the directory if it doesn't exist.
-  SnapshotManager(std::string dir, IStateMachine* sm, ILogStorage* log);
+  RaftSnapshotManager(std::string dir, IStateMachine* sm, ILogStorage* log);
 
-  ~SnapshotManager();
+  ~RaftSnapshotManager();
 
   // Starts the background snapshot fiber. Fiber is joinable until Stop().
   void Start();

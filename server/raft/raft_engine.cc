@@ -14,7 +14,7 @@ namespace dfly {
 
 RaftEngine::RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp)
     : kv_(shard_set, pp), group_(0) {
-  group_.node().SetLogStorage(&log_);
+  group_.node().set_group_id(0);
   group_.node().SetStateMachine(&kv_);
 }
 
@@ -37,16 +37,16 @@ ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
   }
 
   LogEntry entry(group_.node().term(), 0, cmd->Serialize());
-  log_.Append(entry);
+  group_.log_storage()->Append(entry);
 
   return group_.node().ReplicateLog();
 }
 
 ApplyResult RaftEngine::FastCommitPath(const ReplicatedCommand& cmd) {
   LogEntry entry(group_.node().term(), 0, cmd.Serialize());
-  log_.Append(entry);
+  group_.log_storage()->Append(entry);
   VLOG(1) << "FastCommitPath: appended " << cmd.Serialize()
-          << " log_size=" << log_.LogSize();
+          << " log_size=" << group_.log_storage()->LogSize();
 
   group_.node().AdvanceCommitIndex();
   return group_.node().ApplyCommittedLogs();

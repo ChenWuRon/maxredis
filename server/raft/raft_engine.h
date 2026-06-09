@@ -24,7 +24,7 @@ class RaftEngine {
 
   bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms);
   OpResult<std::string> Get(DbIndex db_ind, std::string_view key,
-                            ReadConsistency consistency = ReadConsistency::kLocal);
+                             ReadConsistency consistency = ReadConsistency::kLocal);
   size_t DbSize(DbIndex db_ind) const;
   LogIndex ReadIndex();
   void Schedule(DbIndex db_ind, std::string_view key,
@@ -38,12 +38,31 @@ class RaftEngine {
     return group_;
   }
 
-  CommandLog& log() {
-    return log_;
+  // Delegates to RaftGroup's owned log storage.
+  ILogStorage* log_storage() {
+    return group_.log_storage();
   }
 
-  const CommandLog& log() const {
-    return log_;
+  const ILogStorage* log_storage() const {
+    return group_.log_storage();
+  }
+
+  // For backward compatibility with tests that use engine.log().
+  // Returns the underlying CommandLog if available, or null.
+  CommandLog* log() {
+    return static_cast<CommandLog*>(group_.log_storage());
+  }
+
+  const CommandLog* log() const {
+    return static_cast<const CommandLog*>(group_.log_storage());
+  }
+
+  KvStateMachine& kv() {
+    return kv_;
+  }
+
+  const KvStateMachine& kv() const {
+    return kv_;
   }
 
  private:
@@ -52,7 +71,6 @@ class RaftEngine {
 
   KvStateMachine kv_;
   RaftGroup group_;
-  CommandLog log_;
 };
 
 }  // namespace dfly

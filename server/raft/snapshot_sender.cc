@@ -22,8 +22,8 @@ SnapshotSender::SnapshotSender(std::string snapshot_path, Transport* transport)
     : snapshot_path_(std::move(snapshot_path)), transport_(transport) {
 }
 
-bool SnapshotSender::SendSnapshot(const NodeId& follower, Term term,
-                                   const NodeId& leader_id,
+bool SnapshotSender::SendSnapshot(const NodeId& follower, GroupId group_id,
+                                   Term term, const NodeId& leader_id,
                                    LogIndex last_included_index,
                                    Term last_included_term) {
   FILE* fp = fopen(snapshot_path_.c_str(), "rb");
@@ -58,6 +58,7 @@ bool SnapshotSender::SendSnapshot(const NodeId& follower, Term term,
     }
 
     InstallSnapshotRequest req;
+    req.group_id = group_id;
     req.term = term;
     req.leader_id = leader_id;
     req.last_included_index = last_included_index;

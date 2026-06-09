@@ -11,6 +11,7 @@
 namespace dfly {
 
 struct AppendEntriesRequest {
+  GroupId group_id = 0;
   Term term = 0;
   NodeId leader_id;
   LogIndex prev_log_index = 0;
@@ -20,13 +21,15 @@ struct AppendEntriesRequest {
 };
 
 struct AppendEntriesResponse {
+  GroupId group_id = 0;
   Term term = 0;
   bool success = false;
   LogIndex last_log_index = 0;
 };
 
 inline bool operator==(const AppendEntriesRequest& a, const AppendEntriesRequest& b) {
-  return a.term == b.term && a.leader_id == b.leader_id &&
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.leader_id == b.leader_id &&
          a.prev_log_index == b.prev_log_index && a.prev_log_term == b.prev_log_term &&
          a.entries == b.entries && a.leader_commit == b.leader_commit;
 }
@@ -36,7 +39,8 @@ inline bool operator!=(const AppendEntriesRequest& a, const AppendEntriesRequest
 }
 
 inline bool operator==(const AppendEntriesResponse& a, const AppendEntriesResponse& b) {
-  return a.term == b.term && a.success == b.success && a.last_log_index == b.last_log_index;
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.success == b.success && a.last_log_index == b.last_log_index;
 }
 
 inline bool operator!=(const AppendEntriesResponse& a, const AppendEntriesResponse& b) {

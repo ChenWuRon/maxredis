@@ -48,22 +48,22 @@ TEST_F(AppendEntriesRpcTest, ResponseDefault) {
 }
 
 TEST_F(AppendEntriesRpcTest, ResponseFields) {
-  AppendEntriesResponse rsp{5, true, 10};
+  AppendEntriesResponse rsp{0, 5, true, 10};
   EXPECT_EQ(5u, rsp.term);
   EXPECT_TRUE(rsp.success);
   EXPECT_EQ(10u, rsp.last_log_index);
 }
 
 TEST_F(AppendEntriesRpcTest, RequestEquality) {
-  AppendEntriesRequest a{3, "L1", 5, 2, {LogEntry{3, 6, "x"}}, 0};
-  AppendEntriesRequest b{3, "L1", 5, 2, {LogEntry{3, 6, "x"}}, 0};
-  AppendEntriesRequest c{3, "L1", 5, 2, {LogEntry{3, 6, "y"}}, 0};
+  AppendEntriesRequest a{0, 3, "L1", 5, 2, {LogEntry{3, 6, "x"}}, 0};
+  AppendEntriesRequest b{0, 3, "L1", 5, 2, {LogEntry{3, 6, "x"}}, 0};
+  AppendEntriesRequest c{0, 3, "L1", 5, 2, {LogEntry{3, 6, "y"}}, 0};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
 }
 
 TEST_F(AppendEntriesRpcTest, ResponseEquality) {
-  AppendEntriesResponse a{4, true, 10}, b{4, true, 10}, c{4, false, 10};
+  AppendEntriesResponse a{0, 4, true, 10}, b{0, 4, true, 10}, c{0, 4, false, 10};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
 }

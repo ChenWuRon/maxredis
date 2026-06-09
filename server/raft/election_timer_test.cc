@@ -362,7 +362,7 @@ TEST_F(ElectionTimerTest, HeartbeatsResetElectionTimer) {
 
     // Send heartbeats repeatedly to reset the timer.
     for (int i = 0; i < 5; i++) {
-      HeartbeatRequest req{5, "Leader"};
+      HeartbeatRequest req{0, 5, "Leader"};
       node.OnHeartbeat(req);
       util::ThisFiber::SleepFor(std::chrono::milliseconds(50));
     }

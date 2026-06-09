@@ -14,6 +14,8 @@
 
 #include "base/gtest.h"
 #include "server/raft/install_snapshot_rpc.h"
+#include "server/raft/read_index_rpc.h"
+#include "server/raft/timeout_now_rpc.h"
 #include "server/raft/transport.h"
 
 namespace dfly {
@@ -24,7 +26,7 @@ using namespace testing;
 class TestSnapshotTransport : public Transport {
  public:
   // Return values for the next SendInstallSnapshot call.
-  InstallSnapshotResponse next_response{1, true};
+  InstallSnapshotResponse next_response{0, 1, true};
 
   InstallSnapshotResponse SendInstallSnapshot(const NodeId& peer_id,
                                                const InstallSnapshotRequest& request) override {
@@ -40,6 +42,14 @@ class TestSnapshotTransport : public Transport {
     return {};
   }
   AppendEntriesResponse SendAppendEntries(const NodeId&, const AppendEntriesRequest&) override {
+    return {};
+  }
+
+  ReadIndexResponse SendReadIndex(const NodeId&, const ReadIndexRequest&) override {
+    return {};
+  }
+
+  TimeoutNowResponse SendTimeoutNow(const NodeId&, const TimeoutNowRequest&) override {
     return {};
   }
 
@@ -71,7 +81,7 @@ TEST_F(SnapshotSenderTest, SingleChunkSmallSnapshot) {
   CreateSnapshot("small_snapshot_data");
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F1", 1, "L1", 100, 2);
+  bool ok = sender.SendSnapshot("F1", 0, 1, "L1", 100, 2);
   EXPECT_TRUE(ok);
 
   ASSERT_EQ(1u, transport_.requests.size());
@@ -91,7 +101,7 @@ TEST_F(SnapshotSenderTest, MultipleChunks) {
   CreateSnapshot(data);
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F2", 2, "L1", 200, 3);
+  bool ok = sender.SendSnapshot("F2", 0, 2, "L1", 200, 3);
   EXPECT_TRUE(ok);
 
   // Should send 2 chunks.
@@ -116,7 +126,7 @@ TEST_F(SnapshotSenderTest, ExactlyOneChunk) {
   CreateSnapshot(data);
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F3", 3, "L1", 300, 4);
+  bool ok = sender.SendSnapshot("F3", 0, 3, "L1", 300, 4);
   EXPECT_TRUE(ok);
 
   ASSERT_EQ(1u, transport_.requests.size());
@@ -129,7 +139,7 @@ TEST_F(SnapshotSenderTest, EmptySnapshot) {
   CreateSnapshot("");
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F4", 4, "L1", 400, 5);
+  bool ok = sender.SendSnapshot("F4", 0, 4, "L1", 400, 5);
   EXPECT_TRUE(ok);
 
   // No chunks should be sent.
@@ -140,10 +150,10 @@ TEST_F(SnapshotSenderTest, StopsOnRejectedChunk) {
   std::string data(SnapshotSender::kChunkSize * 2 + 50, 'z');
   CreateSnapshot(data);
 
-  transport_.next_response = {1, false};  // reject first chunk
+  transport_.next_response = {0, 1, false};  // reject first chunk
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F5", 1, "L1", 500, 6);
+  bool ok = sender.SendSnapshot("F5", 0, 1, "L1", 500, 6);
   EXPECT_FALSE(ok);
 
   // Only first chunk should have been sent.
@@ -155,10 +165,10 @@ TEST_F(SnapshotSenderTest, StopsOnHigherTerm) {
   std::string data(SnapshotSender::kChunkSize + 1, 'w');
   CreateSnapshot(data);
 
-  transport_.next_response = {5, true};  // follower has higher term 5 > term 1
+  transport_.next_response = {0, 5, true};  // follower has higher term 5 > term 1
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F6", 1, "L1", 600, 7);
+  bool ok = sender.SendSnapshot("F6", 0, 1, "L1", 600, 7);
   EXPECT_FALSE(ok);
 
   // Only first chunk should have been sent.
@@ -173,7 +183,7 @@ TEST_F(SnapshotSenderTest, LargeSnapshot16Chunks) {
   CreateSnapshot(data);
 
   SnapshotSender sender(path_, &transport_);
-  bool ok = sender.SendSnapshot("F7", 1, "L1", 700, 8);
+  bool ok = sender.SendSnapshot("F7", 0, 1, "L1", 700, 8);
   EXPECT_TRUE(ok);
 
   ASSERT_EQ(kNumChunks, transport_.requests.size());
@@ -190,7 +200,7 @@ TEST_F(SnapshotSenderTest, LargeSnapshot16Chunks) {
 
 TEST_F(SnapshotSenderTest, FileNotFound) {
   SnapshotSender sender("/nonexistent/path.bin", &transport_);
-  bool ok = sender.SendSnapshot("F8", 1, "L1", 0, 0);
+  bool ok = sender.SendSnapshot("F8", 0, 1, "L1", 0, 0);
   EXPECT_FALSE(ok);
   EXPECT_EQ(0u, transport_.requests.size());
 }

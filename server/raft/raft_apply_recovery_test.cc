@@ -77,7 +77,7 @@ class InMemoryKV : public IStateMachine {
     return false;
   }
 
-  OpResult<std::string> Get(DbIndex, std::string_view key) override {
+  OpResult<std::string> Get(DbIndex, std::string_view key, ReadConsistency) override {
     auto it = store_.find(std::string(key));
     if (it != store_.end())
       return it->second;
@@ -340,7 +340,7 @@ class RaftApplyRecoveryTest : public Test {
     EXPECT_EQ(expected, kv.applied.size());
     EXPECT_EQ(expected, kv.DbSize(0));
     for (LogIndex i = start; i <= end; i++) {
-      auto result = kv.Get(0, "k" + std::to_string(i));
+      auto result = kv.Get(0, "k" + std::to_string(i), ReadConsistency::kLocal);
       ASSERT_TRUE(result) << "key k" << i << " not found";
       EXPECT_EQ("v" + std::to_string(i), result.value())
           << "value mismatch for k" << i;
@@ -527,8 +527,8 @@ TEST_F(RaftApplyRecoveryTest, BootstrapWithSnapshot) {
   EXPECT_EQ(17u, node.last_snapshot_term());
   EXPECT_EQ(500000u, node.last_applied());
   EXPECT_EQ(2u, kv.DbSize(0));
-  EXPECT_EQ("v1", kv.Get(0, "k1").value());
-  EXPECT_EQ("v2", kv.Get(0, "k2").value());
+  EXPECT_EQ("v1", kv.Get(0, "k1", ReadConsistency::kLocal).value());
+  EXPECT_EQ("v2", kv.Get(0, "k2", ReadConsistency::kLocal).value());
 }
 
 TEST_F(RaftApplyRecoveryTest, SnapshotIndexDominatesApplyMeta) {
@@ -579,7 +579,7 @@ TEST_F(RaftApplyRecoveryTest, SnapshotRecoveryWithWALReplay) {
   // WAL has entries 1..10, all below last_applied → nothing to replay.
   node.ReplayUnappliedLogs();
   EXPECT_EQ(500000u, node.last_applied());
-  EXPECT_EQ("v_snap", kv.Get(0, "k_snap").value());
+  EXPECT_EQ("v_snap", kv.Get(0, "k_snap", ReadConsistency::kLocal).value());
   // WAL entries were not replayed since they're before the snapshot.
   EXPECT_EQ(0u, kv.applied.size());
 }
@@ -618,7 +618,7 @@ TEST_F(RaftApplyRecoveryTest, DeltaReplayAfterSnapshot) {
   node.ReplayUnappliedLogs();
 
   // Verify snapshot data is present.
-  EXPECT_EQ("v_snap", kv.Get(0, "k_snap").value());
+  EXPECT_EQ("v_snap", kv.Get(0, "k_snap", ReadConsistency::kLocal).value());
 
   // Only entries 1001..2000 should have been replayed (1000 entries).
   // After replay, last_applied advances to 2000.
@@ -626,11 +626,11 @@ TEST_F(RaftApplyRecoveryTest, DeltaReplayAfterSnapshot) {
   EXPECT_EQ(1000u, kv.applied.size());
 
   // Verify first and last replayed entries.
-  EXPECT_EQ("v1001", kv.Get(0, "k1001").value());
-  EXPECT_EQ("v2000", kv.Get(0, "k2000").value());
+  EXPECT_EQ("v1001", kv.Get(0, "k1001", ReadConsistency::kLocal).value());
+  EXPECT_EQ("v2000", kv.Get(0, "k2000", ReadConsistency::kLocal).value());
 
   // Entries before the snapshot should NOT be present.
-  EXPECT_FALSE(kv.Get(0, "k999").ok());
+  EXPECT_FALSE(kv.Get(0, "k999", ReadConsistency::kLocal).ok());
 }
 
 TEST_F(RaftApplyRecoveryTest, DeltaReplayOnlyUnappliedPortion) {
@@ -656,7 +656,7 @@ TEST_F(RaftApplyRecoveryTest, DeltaReplayOnlyUnappliedPortion) {
   node.ReplayUnappliedLogs();
   EXPECT_EQ(1500u, node.last_applied());
   EXPECT_EQ(1000u, kv.applied.size());  // 501..1500
-  EXPECT_EQ("v1500", kv.Get(0, "k1500").value());
+  EXPECT_EQ("v1500", kv.Get(0, "k1500", ReadConsistency::kLocal).value());
 }
 
 TEST_F(RaftApplyRecoveryTest, DeltaReplayNothingToReplay) {
@@ -698,7 +698,7 @@ TEST_F(RaftApplyRecoveryTest, DeltaReplayFullWalAfterSnapshot) {
   // All log entries are before the snapshot → nothing replayed.
   EXPECT_EQ(3000u, node.last_applied());
   EXPECT_EQ(0u, kv.applied.size());
-  EXPECT_EQ("v_old", kv.Get(0, "k_old").value());
+  EXPECT_EQ("v_old", kv.Get(0, "k_old", ReadConsistency::kLocal).value());
 }
 
 // --- End-to-end snapshot recovery ---
@@ -753,19 +753,19 @@ TEST_F(RaftApplyRecoveryTest, EndToEndSnapshotRecovery) {
 
   // Snapshot keys present.
   for (LogIndex i = 10; i <= kSnapshotIndex; i += 10) {
-    auto res = kv.Get(0, "snap_key_" + std::to_string(i));
+    auto res = kv.Get(0, "snap_key_" + std::to_string(i), ReadConsistency::kLocal);
     ASSERT_TRUE(res.ok()) << "missing snap key " << i;
     EXPECT_EQ("snap_val_" + std::to_string(i), res.value());
   }
 
   // Pre-snapshot keys NOT present (they were not included in the snapshot).
   // Key 5 was not in the snapshot's every-10th selection.
-  auto pre_snap = kv.Get(0, "key_5");
+  auto pre_snap = kv.Get(0, "key_5", ReadConsistency::kLocal);
   EXPECT_FALSE(pre_snap.ok()) << "pre-snapshot key 5 should not exist";
 
   // Delta keys (post-snapshot WAL) all present.
   for (LogIndex i = kSnapshotIndex + 1; i <= kTotalEntries; i++) {
-    auto res = kv.Get(0, "key_" + std::to_string(i));
+    auto res = kv.Get(0, "key_" + std::to_string(i), ReadConsistency::kLocal);
     ASSERT_TRUE(res.ok()) << "missing delta key " << i;
     EXPECT_EQ("val_" + std::to_string(i), res.value());
   }

@@ -11,6 +11,7 @@
 namespace dfly {
 
 struct InstallSnapshotRequest {
+  GroupId group_id = 0;
   Term term = 0;
   NodeId leader_id;
   LogIndex last_included_index = 0;
@@ -21,12 +22,14 @@ struct InstallSnapshotRequest {
 };
 
 struct InstallSnapshotResponse {
+  GroupId group_id = 0;
   Term term = 0;
   bool success = false;
 };
 
 inline bool operator==(const InstallSnapshotRequest& a, const InstallSnapshotRequest& b) {
-  return a.term == b.term && a.leader_id == b.leader_id &&
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.leader_id == b.leader_id &&
          a.last_included_index == b.last_included_index &&
          a.last_included_term == b.last_included_term && a.offset == b.offset &&
          a.done == b.done && a.data == b.data;
@@ -37,7 +40,8 @@ inline bool operator!=(const InstallSnapshotRequest& a, const InstallSnapshotReq
 }
 
 inline bool operator==(const InstallSnapshotResponse& a, const InstallSnapshotResponse& b) {
-  return a.term == b.term && a.success == b.success;
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.success == b.success;
 }
 
 inline bool operator!=(const InstallSnapshotResponse& a, const InstallSnapshotResponse& b) {

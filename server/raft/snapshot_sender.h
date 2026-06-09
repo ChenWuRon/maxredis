@@ -22,9 +22,10 @@ class SnapshotSender {
   SnapshotSender(std::string snapshot_path, Transport* transport);
 
   // Sends the entire snapshot to |follower| in kChunkSize chunks.
-  // Each chunk carries the given term/leader_id/last_included_index/last_included_term.
+  // Each chunk carries the given group_id/term/leader_id/last_included_index/last_included_term.
   // Returns true if all chunks were sent successfully.
-  bool SendSnapshot(const NodeId& follower, Term term, const NodeId& leader_id,
+  bool SendSnapshot(const NodeId& follower, GroupId group_id, Term term,
+                    const NodeId& leader_id,
                     LogIndex last_included_index, Term last_included_term);
 
  private:

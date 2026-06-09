@@ -26,7 +26,7 @@ class TestFastCommitSM : public IStateMachine {
   void Set(DbIndex, std::string_view, std::string_view) override {}
   bool Del(DbIndex, std::string_view) override { return false; }
   bool Expire(DbIndex, std::string_view, uint64_t) override { return false; }
-  OpResult<std::string> Get(DbIndex, std::string_view) override {
+  OpResult<std::string> Get(DbIndex, std::string_view, ReadConsistency) override {
     return OpStatus::KEY_NOTFOUND;
   }
   size_t DbSize(DbIndex) const override { return 0; }
@@ -56,7 +56,7 @@ TEST(RaftEngineTest, FastCommitPathSingleNode) {
   engine.group().node().BecomeLeader();
 
   EXPECT_EQ(RaftRole::Leader, engine.group().node().role());
-  EXPECT_EQ(0u, engine.log().LogSize());
+  EXPECT_EQ(0u, engine.log_storage()->LogSize());
   EXPECT_EQ(0u, engine.group().node().commit_index());
   EXPECT_EQ(0u, engine.group().node().last_applied());
 
@@ -67,9 +67,9 @@ TEST(RaftEngineTest, FastCommitPathSingleNode) {
   ApplyResult result = engine.SubmitCommand(&set_cmd, args);
 
   // Log entry appended
-  EXPECT_EQ(1u, engine.log().LogSize());
-  ASSERT_NE(nullptr, engine.log().Get(1));
-  EXPECT_EQ("SET a 1", engine.log().Get(1)->command);
+  EXPECT_EQ(1u, engine.log_storage()->LogSize());
+  ASSERT_NE(nullptr, engine.log_storage()->Get(1));
+  EXPECT_EQ("SET a 1", engine.log_storage()->Get(1)->command);
 
   // Commit index advanced to last log index
   EXPECT_EQ(1u, engine.group().node().commit_index());

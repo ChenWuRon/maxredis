@@ -82,7 +82,7 @@ class TestLogStorage : public ILogStorage {
   void Clear() override {}
 };
 
-class SnapshotManagerTest : public Test {
+class RaftSnapshotManagerTest : public Test {
  protected:
   void SetUp() override {
     dir_ = "/tmp/snapshot_mgr_test_" + std::to_string(getpid());
@@ -155,15 +155,15 @@ TEST(SnapshotBarrierTest, WriteBlocksUntilReadsComplete) {
   writer_fiber.Join();
 }
 
-// --- SnapshotManager tests ---
+// --- RaftSnapshotManager tests ---
 
-TEST_F(SnapshotManagerTest, CreateSnapshotNoData) {
+TEST_F(RaftSnapshotManagerTest, CreateSnapshotNoData) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 0;
   log.last_term = 0;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   ASSERT_TRUE(mgr.CreateSnapshot());
 
   // Verify snapshot file exists.
@@ -176,13 +176,13 @@ TEST_F(SnapshotManagerTest, CreateSnapshotNoData) {
   EXPECT_EQ(0u, mgr.meta().term);
 }
 
-TEST_F(SnapshotManagerTest, CreateSnapshotWithData) {
+TEST_F(RaftSnapshotManagerTest, CreateSnapshotWithData) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 1000;
   log.last_term = 8;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   ASSERT_TRUE(mgr.CreateSnapshot());
 
   // Verify metadata.
@@ -191,13 +191,13 @@ TEST_F(SnapshotManagerTest, CreateSnapshotWithData) {
   EXPECT_GT(mgr.meta().timestamp_ms, 0u);
 }
 
-TEST_F(SnapshotManagerTest, ScheduleCreateIfNeededBelowThreshold) {
+TEST_F(RaftSnapshotManagerTest, ScheduleCreateIfNeededBelowThreshold) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 50000;
   log.last_term = 1;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   mgr.set_log_gap(100000);
 
   // 50000 < 100000, should not trigger.
@@ -205,13 +205,13 @@ TEST_F(SnapshotManagerTest, ScheduleCreateIfNeededBelowThreshold) {
   EXPECT_EQ(0, sm.snapshot_call_count);
 }
 
-TEST_F(SnapshotManagerTest, ScheduleCreateIfNeededAboveThreshold) {
+TEST_F(RaftSnapshotManagerTest, ScheduleCreateIfNeededAboveThreshold) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 150000;
   log.last_term = 1;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   mgr.set_log_gap(100000);
 
   // 150000 - 0 >= 100000, should trigger.
@@ -220,13 +220,13 @@ TEST_F(SnapshotManagerTest, ScheduleCreateIfNeededAboveThreshold) {
   EXPECT_EQ(150000u, mgr.meta().index);
 }
 
-TEST_F(SnapshotManagerTest, ScheduleDoesNotTriggerAfterSnapshot) {
+TEST_F(RaftSnapshotManagerTest, ScheduleDoesNotTriggerAfterSnapshot) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 150000;
   log.last_term = 1;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   mgr.set_log_gap(100000);
 
   // Trigger snapshot at index 150000.
@@ -245,12 +245,12 @@ TEST_F(SnapshotManagerTest, ScheduleDoesNotTriggerAfterSnapshot) {
   EXPECT_EQ(260000u, mgr.meta().index);
 }
 
-TEST_F(SnapshotManagerTest, ConfigurableLogGap) {
+TEST_F(RaftSnapshotManagerTest, ConfigurableLogGap) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 50;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   mgr.set_log_gap(25);
 
   // 50 - 0 >= 25, trigger.
@@ -258,49 +258,49 @@ TEST_F(SnapshotManagerTest, ConfigurableLogGap) {
   EXPECT_EQ(1, sm.snapshot_call_count);
 }
 
-TEST_F(SnapshotManagerTest, MetadataSurvivesRestart) {
+TEST_F(RaftSnapshotManagerTest, MetadataSurvivesRestart) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 500;
   log.last_term = 3;
 
   {
-    SnapshotManager mgr(dir_, &sm, &log);
+    RaftSnapshotManager mgr(dir_, &sm, &log);
     ASSERT_TRUE(mgr.CreateSnapshot());
     EXPECT_EQ(500u, mgr.meta().index);
     EXPECT_EQ(3u, mgr.meta().term);
   }
 
   // New manager loads existing metadata.
-  SnapshotManager mgr2(dir_, &sm, &log);
+  RaftSnapshotManager mgr2(dir_, &sm, &log);
   EXPECT_EQ(500u, mgr2.meta().index);
   EXPECT_EQ(3u, mgr2.meta().term);
 }
 
-TEST_F(SnapshotManagerTest, NoStateMachineNoCrash) {
+TEST_F(RaftSnapshotManagerTest, NoStateMachineNoCrash) {
   TestLogStorage log;
   log.last_index = 100;
 
-  SnapshotManager mgr(dir_, nullptr, &log);
+  RaftSnapshotManager mgr(dir_, nullptr, &log);
   EXPECT_FALSE(mgr.CreateSnapshot());
   EXPECT_FALSE(mgr.ScheduleCreateIfNeeded());
 }
 
-TEST_F(SnapshotManagerTest, NoLogStorageNoCrash) {
+TEST_F(RaftSnapshotManagerTest, NoLogStorageNoCrash) {
   MockSnapshotSM sm;
-  SnapshotManager mgr(dir_, &sm, nullptr);
+  RaftSnapshotManager mgr(dir_, &sm, nullptr);
   EXPECT_FALSE(mgr.CreateSnapshot());
   EXPECT_FALSE(mgr.ScheduleCreateIfNeeded());
 }
 
-// Barrier integration: SnapshotManager uses barrier during CreateSnapshot.
-TEST_F(SnapshotManagerTest, CreateSnapshotUsesBarrier) {
+// Barrier integration: RaftSnapshotManager uses barrier during CreateSnapshot.
+TEST_F(RaftSnapshotManagerTest, CreateSnapshotUsesBarrier) {
   MockSnapshotSM sm;
   TestLogStorage log;
   log.last_index = 1000;
   log.last_term = 5;
 
-  SnapshotManager mgr(dir_, &sm, &log);
+  RaftSnapshotManager mgr(dir_, &sm, &log);
   mgr.barrier().BeginRead();  // Simulate an in-flight write.
 
   // Schedule CreateSnapshot on a separate fiber (would block on BeginWrite).

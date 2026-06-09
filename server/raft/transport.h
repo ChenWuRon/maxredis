@@ -10,6 +10,9 @@
 
 namespace dfly {
 
+// Transport is the abstraction for Raft RPC communication between nodes.
+// All methods carry GroupId inside the request/response structs to support
+// multi-raft routing.
 class Transport {
  public:
   virtual ~Transport() = default;

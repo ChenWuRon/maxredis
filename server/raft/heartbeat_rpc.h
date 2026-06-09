@@ -9,17 +9,20 @@
 namespace dfly {
 
 struct HeartbeatRequest {
+  GroupId group_id = 0;
   Term term = 0;
   NodeId leader_id;
 };
 
 struct HeartbeatResponse {
+  GroupId group_id = 0;
   Term term = 0;
   bool success = false;
 };
 
 inline bool operator==(const HeartbeatRequest& a, const HeartbeatRequest& b) {
-  return a.term == b.term && a.leader_id == b.leader_id;
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.leader_id == b.leader_id;
 }
 
 inline bool operator!=(const HeartbeatRequest& a, const HeartbeatRequest& b) {
@@ -27,7 +30,8 @@ inline bool operator!=(const HeartbeatRequest& a, const HeartbeatRequest& b) {
 }
 
 inline bool operator==(const HeartbeatResponse& a, const HeartbeatResponse& b) {
-  return a.term == b.term && a.success == b.success;
+  return a.group_id == b.group_id && a.term == b.term &&
+         a.success == b.success;
 }
 
 inline bool operator!=(const HeartbeatResponse& a, const HeartbeatResponse& b) {
