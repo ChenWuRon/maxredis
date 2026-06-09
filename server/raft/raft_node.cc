@@ -16,6 +16,7 @@ RaftNode::RaftNode(NodeId node_id) : node_id_(std::move(node_id)) {
 
 RaftNode::~RaftNode() {
   StopHeartbeat();
+  election_timer_.Stop();
 }
 
 void RaftNode::SetRole(RaftRole new_role) {
@@ -29,7 +30,6 @@ void RaftNode::SetRole(RaftRole new_role) {
       leader_term_ = 0;
       voted_for_.clear();
       vote_count_ = 0;
-      // Lazy-start the election timer on first use, then reset.
       if (!election_started_) {
         election_started_ = true;
         election_timer_.Start([this] { StartElection(); });
@@ -75,26 +75,18 @@ void RaftNode::OnElectionTimeout() {
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
-  // Rule 1: Stale term — reject.
   if (request.term < term_) {
     return {term_, false};
   }
 
-  // Rule 2: Higher term — update local state and become follower.
   if (request.term > term_) {
     BecomeFollower(request.term);
   }
 
-  // After rule 2, term_ == request.term.
-
-  // Rule 3: Already voted for another candidate in this term.
   if (!voted_for_.empty() && voted_for_ != request.candidate_id) {
     return {term_, false};
   }
 
-  // Rule 4: Election restriction (§5.4.1).
-  // Candidate's log must be at least as up-to-date as receiver's log.
-  // If no log storage is set, treat the local log as empty.
   Term local_last_term = log_storage_ ? log_storage_->LastTerm() : 0;
   LogIndex local_last_index = log_storage_ ? log_storage_->LastIndex() : 0;
 
@@ -105,13 +97,8 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
     return {term_, false};
   }
 
-  // Rule 5: Grant vote.
   voted_for_ = request.candidate_id;
   return {term_, true};
-}
-
-void RaftNode::AddPeer(RaftNode* peer) {
-  peers_.push_back(peer);
 }
 
 ElectionResult RaftNode::StartElection() {
@@ -124,10 +111,11 @@ ElectionResult RaftNode::StartElection() {
   request.last_log_term = log_storage_ ? log_storage_->LastTerm() : 0;
 
   ElectionResult result;
-  result.votes_received = vote_count_;  // self vote
+  result.votes_received = vote_count_;
 
-  for (RaftNode* peer : peers_) {
-    VoteResponse rsp = peer->OnRequestVote(request);
+  for (const auto& peer_id : peer_manager_.GetPeerIds()) {
+    DCHECK(transport_) << "Transport not set for multi-node operation";
+    VoteResponse rsp = transport_->SendVoteRequest(peer_id, request);
     if (rsp.vote_granted) {
       result.votes_received++;
     } else {
@@ -141,7 +129,7 @@ ElectionResult RaftNode::StartElection() {
 }
 
 bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
-  size_t total_nodes = peers_.size() + 1;  // self + peers
+  size_t total_nodes = peer_manager_.ClusterSize();
   size_t majority = total_nodes / 2 + 1;
 
   if (result.votes_received >= majority) {
@@ -152,17 +140,14 @@ bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
 }
 
 HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
-  // Rule 1: Stale term — reject.
   if (request.term < term_) {
     return {term_, false};
   }
 
-  // Rule 2: Valid heartbeat — update state and become follower.
   if (request.term >= term_) {
     BecomeFollower(request.term);
   }
 
-  // Reset the election timer: we've heard from the leader.
   election_timer_.Reset();
 
   return {term_, true};
@@ -170,8 +155,9 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 
 void RaftNode::SendHeartbeatToPeers() {
   HeartbeatRequest req{term_, node_id_};
-  for (RaftNode* peer : peers_) {
-    peer->OnHeartbeat(req);
+  for (const auto& peer_id : peer_manager_.GetPeerIds()) {
+    DCHECK(transport_) << "Transport not set for multi-node operation";
+    transport_->SendHeartbeat(peer_id, req);
   }
 }
 
@@ -197,18 +183,15 @@ void RaftNode::HeartbeatLoop() {
 }
 
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {
-  // Rule 1: Stale term — reject.
   if (req.term < term_) {
     LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
     return {term_, false, my_last};
   }
 
-  // Rule 2: Valid heartbeat — become follower (resets election timer).
   if (req.term >= term_) {
     BecomeFollower(req.term);
   }
 
-  // Rule 3: Check prev_log_index / prev_log_term match.
   if (log_storage_) {
     if (req.prev_log_index > log_storage_->LastIndex()) {
       return {term_, false, log_storage_->LastIndex()};
@@ -218,7 +201,6 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
       return {term_, false, req.prev_log_index - 1};
     }
 
-    // Rule 4: Append entries with index matching.
     for (const auto& entry : req.entries) {
       if (entry.index <= log_storage_->LastIndex()) {
         if (log_storage_->Get(entry.index).term != entry.term) {
@@ -233,7 +215,6 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
 
   LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
 
-  // Follower applies entries up to leader_commit.
   if (req.leader_commit > commit_index_) {
     commit_index_ = std::min(req.leader_commit, my_last);
     ApplyCommittedLogs();
@@ -246,7 +227,7 @@ ApplyResult RaftNode::ReplicateLog() {
   if (!log_storage_)
     return {};
 
-  if (peers_.empty()) {
+  if (peer_manager_.PeerCount() == 0) {
     if (commit_index_ < log_storage_->LastIndex()) {
       commit_index_ = log_storage_->LastIndex();
     }
@@ -263,9 +244,11 @@ ApplyResult RaftNode::ReplicateLog() {
     req.entries = log_storage_->GetRange(1);
   }
 
-  peer_last_log_index_.resize(peers_.size());
-  for (size_t i = 0; i < peers_.size(); i++) {
-    AppendEntriesResponse rsp = peers_[i]->OnAppendEntries(req);
+  auto ids = peer_manager_.GetPeerIds();
+  peer_last_log_index_.resize(ids.size());
+  for (size_t i = 0; i < ids.size(); i++) {
+    DCHECK(transport_) << "Transport not set for multi-node operation";
+    AppendEntriesResponse rsp = transport_->SendAppendEntries(ids[i], req);
     peer_last_log_index_[i] = rsp.last_log_index;
   }
 
@@ -287,7 +270,7 @@ void RaftNode::AdvanceCommitIndex() {
     return;
 
   std::sort(indexes.rbegin(), indexes.rend());
-  size_t total = peers_.size() + 1;
+  size_t total = peer_manager_.ClusterSize();
   size_t majority = total / 2 + 1;
 
   if (majority - 1 >= indexes.size())

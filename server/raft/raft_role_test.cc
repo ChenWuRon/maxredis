@@ -12,7 +12,9 @@
 
 #include "base/gtest.h"
 #include "server/raft/command_log.h"
+#include "server/raft/local_transport.h"
 #include "server/raft/log_storage.h"
+#include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/raft/heartbeat_rpc.h"
 
@@ -39,14 +41,14 @@ struct FakeClock {
 // MockTransport: gmock-based interceptor for Raft RPC messages.
 // Tests set expectations on which messages are sent and with what content,
 // then verify them after the tested operation completes.
-class MockTransport {
+class MockTransport : public Transport {
  public:
-  MOCK_METHOD(VoteResponse, SendRequestVote,
-              (const VoteRequest& request, const std::string& peer_id));
+  MOCK_METHOD(VoteResponse, SendVoteRequest,
+              (const NodeId& peer_id, const VoteRequest& request), (override));
   MOCK_METHOD(HeartbeatResponse, SendHeartbeat,
-              (const HeartbeatRequest& request, const std::string& peer_id));
+              (const NodeId& peer_id, const HeartbeatRequest& request), (override));
   MOCK_METHOD(AppendEntriesResponse, SendAppendEntries,
-              (const AppendEntriesRequest& request, const std::string& peer_id));
+              (const NodeId& peer_id, const AppendEntriesRequest& request), (override));
 };
 
 class RaftRoleTest : public Test {
@@ -86,11 +88,19 @@ TEST_F(RaftRoleTest, ElectionTimeoutCreatesCandidateWithPeerRejection) {
   FakeClock clock;
 
   // 5-node cluster: n1 candidate, n2-n5 peers.
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
-  n1.AddPeer(&n4);
-  n1.AddPeer(&n5);
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode("N4", &n4);
+  transport.RegisterNode("N5", &n5);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+  n1.AddPeer("N4");
+  n1.AddPeer("N5");
 
   // Pre-vote n2, n3, n4 so they reject in this term.
   VoteRequest pre_req;
@@ -121,11 +131,15 @@ TEST_F(RaftRoleTest, ElectionTimeoutCreatesCandidateWithPeerRejection) {
 // TryBecomeLeader calls BecomeLeader() → SetRole(Leader).
 // ---------------------------------------------------------------------------
 TEST_F(RaftRoleTest, CandidateWinsElectionBecomesLeader) {
-  MockTransport transport;
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
   // Start election — n1 becomes Candidate (term 1) and sends VoteRequests.
   // n2 and n3 are at term 0, so they BecomeFollower(1) and grant.
@@ -140,8 +154,8 @@ TEST_F(RaftRoleTest, CandidateWinsElectionBecomesLeader) {
 
 // Verifies that TryBecomeLeader correctly rejects when votes < majority.
 TEST_F(RaftRoleTest, TryBecomeLeaderDirectCall) {
-  RaftNode node("n1"), peer("p1");
-  node.AddPeer(&peer);
+  RaftNode node("n1");
+  node.AddPeer("p1");
 
   node.BecomeCandidate();  // term = 1, vote_count = 1
 
@@ -299,42 +313,28 @@ TEST_F(RaftRoleTest, MockTransportConfiguredVoteRouting) {
   MockTransport transport;
 
   // Configure what the mock expects and returns for each peer.
-  EXPECT_CALL(transport, SendRequestVote(
+  EXPECT_CALL(transport, SendVoteRequest(
+      "N2",
       AllOf(Field(&VoteRequest::term, 1),
-            Field(&VoteRequest::candidate_id, "N1")),
-      "N2"))
+            Field(&VoteRequest::candidate_id, "N1"))))
       .WillOnce(Return(VoteResponse{1, true}));
 
-  EXPECT_CALL(transport, SendRequestVote(
+  EXPECT_CALL(transport, SendVoteRequest(
+      "N3",
       AllOf(Field(&VoteRequest::term, 1),
-            Field(&VoteRequest::candidate_id, "N1")),
-      "N3"))
+            Field(&VoteRequest::candidate_id, "N1"))))
       .WillOnce(Return(VoteResponse{1, false}));
 
   // Simulate the election by manually routing through the transport mock
   // (which represents how a real transport layer would work).
-  RaftNode n1("N1"), n2("N2"), n3("N3");
+  RaftNode n1("N1");
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
-  n1.BecomeCandidate();
+  n1.StartElection();
 
-  VoteRequest req;
-  req.term = n1.term();
-  req.candidate_id = "N1";
-
-  // Route votes through the mock transport.
-  VoteResponse rsp2 = transport.SendRequestVote(req, "N2");
-  VoteResponse rsp3 = transport.SendRequestVote(req, "N3");
-
-  // Deliver responses to n1 as StartElection would.
-  // n1 already has self-vote (1), plus N2 grants (1) = 2, but N3 rejects.
-  ElectionResult result;
-  result.votes_received = 1;  // self
-  if (rsp2.vote_granted) result.votes_received++;
-  if (rsp3.vote_granted) result.votes_received++;
-
-  n1.TryBecomeLeader(result);
-
-  // 2 nodes of 3: majority = 2. 2 >= 2 → Leader.
+  // 2 votes (self + N2) >= majority(2) → Leader.
   EXPECT_EQ(RaftRole::Leader, n1.role());
 
   Mock::VerifyAndClearExpectations(&transport);

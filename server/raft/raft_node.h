@@ -11,7 +11,9 @@
 #include "server/raft/election_timer.h"
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/log_storage.h"
+#include "server/raft/peer_manager.h"
 #include "server/raft/raft_types.h"
+#include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/state_machine/state_machine.h"
 #include "util/fibers/fibers.h"
@@ -47,7 +49,21 @@ class RaftNode {
   // Handles logging, timer management, and heartbeat lifecycle.
   void SetRole(RaftRole new_role);
 
-  void AddPeer(RaftNode* peer);
+  void SetTransport(Transport* transport) {
+    transport_ = transport;
+  }
+
+  void AddPeer(const NodeId& id) {
+    peer_manager_.AddPeer(id);
+  }
+
+  bool RemovePeer(const NodeId& id) {
+    return peer_manager_.RemovePeer(id);
+  }
+
+  const PeerManager& peer_manager() const {
+    return peer_manager_;
+  }
 
   void BecomeFollower(Term term);
   void BecomeCandidate();
@@ -129,7 +145,9 @@ class RaftNode {
   Term leader_term_ = 0;
   NodeId voted_for_;
   uint32_t vote_count_ = 0;
-  std::vector<RaftNode*> peers_;
+
+  Transport* transport_ = nullptr;
+  PeerManager peer_manager_;
 
   ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;

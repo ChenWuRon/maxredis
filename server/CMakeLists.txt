@@ -6,7 +6,7 @@ cxx_link(midi-redis base dragonfly_lib persistence_lib TRDP::mimalloc2)
 add_library(dragonfly_lib 
             protocol/conn_context.cc protocol/redis_parser.cc protocol/memcache_parser.cc
             protocol/resp_expr.cc protocol/reply_builder.cc
-            raft/command_log.cc raft/command_encoder.cc raft/election_timer.cc raft/raft_engine.cc raft/raft_node.cc raft/raft_storage.cc
+            raft/command_log.cc raft/command_encoder.cc raft/election_timer.cc raft/local_transport.cc raft/peer_manager.cc raft/raft_engine.cc raft/raft_node.cc raft/raft_storage.cc
             service/command_registry.cc service/command_serializer.cc service/config_flags.cc
             service/debugcmd.cc service/dragonfly_connection.cc service/dragonfly_listener.cc
             service/main_service.cc service/snapshot_fiber.cc service/state_serializer.cc

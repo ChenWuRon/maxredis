@@ -13,8 +13,10 @@
 #include "base/gtest.h"
 #include "server/raft/command_log.h"
 #include "server/raft/command_encoder.h"
+#include "server/raft/local_transport.h"
 #include "server/raft/log_storage.h"
 #include "server/raft/replicated_command.h"
+#include "server/raft/transport.h"
 #include "server/service/command_registry.h"
 #include "server/state_machine/state_machine.h"
 
@@ -337,12 +339,17 @@ TEST_F(RaftNodeTest, GrantVoteWithNonEmptyLogToSameCandidate) {
 // --- StartElection tests ---
 
 TEST_F(RaftNodeTest, ThreeNodesAllGrant) {
+  LocalTransport transport;
   RaftNode n1("Node1");
   RaftNode n2("Node2");
   RaftNode n3("Node3");
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  transport.RegisterNode("Node1", &n1);
+  transport.RegisterNode("Node2", &n2);
+  transport.RegisterNode("Node3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("Node2");
+  n1.AddPeer("Node3");
 
   ElectionResult result = n1.StartElection();
 
@@ -354,6 +361,7 @@ TEST_F(RaftNodeTest, ThreeNodesAllGrant) {
 }
 
 TEST_F(RaftNodeTest, OnePeerRejects) {
+  LocalTransport transport;
   RaftNode n1("Node1");
   RaftNode n2("Node2");
   RaftNode n3("Node3");
@@ -362,8 +370,12 @@ TEST_F(RaftNodeTest, OnePeerRejects) {
   n2.BecomeFollower(1);
   n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  transport.RegisterNode("Node1", &n1);
+  transport.RegisterNode("Node2", &n2);
+  transport.RegisterNode("Node3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("Node2");
+  n1.AddPeer("Node3");
 
   ElectionResult result = n1.StartElection();
 
@@ -372,13 +384,17 @@ TEST_F(RaftNodeTest, OnePeerRejects) {
 }
 
 TEST_F(RaftNodeTest, StaleTermPeerRejects) {
+  LocalTransport transport;
   RaftNode n1("Node1");
   RaftNode n2("Node2");
 
   // n2 has a higher term
   n2.BecomeFollower(5);
 
-  n1.AddPeer(&n2);
+  transport.RegisterNode("Node1", &n1);
+  transport.RegisterNode("Node2", &n2);
+  n1.SetTransport(&transport);
+  n1.AddPeer("Node2");
 
   ElectionResult result = n1.StartElection();
 
@@ -394,9 +410,15 @@ TEST_F(RaftNodeTest, StaleTermPeerRejects) {
 // --- TryBecomeLeader tests ---
 
 TEST_F(RaftNodeTest, ThreeNodesThreeVotesBecomesLeader) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(3u, r.votes_received);
@@ -404,13 +426,18 @@ TEST_F(RaftNodeTest, ThreeNodesThreeVotesBecomesLeader) {
 }
 
 TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
   // n2 already voted for other in this term
   n2.BecomeFollower(1);
   n2.OnRequestVote(VoteRequest{1, "Other", 0, 0});
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(2u, r.votes_received);
@@ -418,6 +445,7 @@ TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
 }
 
 TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
   // both peers already voted for other
   n2.BecomeFollower(1);
@@ -425,8 +453,12 @@ TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
   n3.BecomeFollower(1);
   n3.OnRequestVote(VoteRequest{1, "Other", 0, 0});
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(1u, r.votes_received);  // only self
@@ -434,11 +466,19 @@ TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
 }
 
 TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
-  n1.AddPeer(&n4);
-  n1.AddPeer(&n5);
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode("N4", &n4);
+  transport.RegisterNode("N5", &n5);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+  n1.AddPeer("N4");
+  n1.AddPeer("N5");
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(5u, r.votes_received);
@@ -446,6 +486,7 @@ TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
 }
 
 TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
   // three peers already voted for other
   n2.BecomeFollower(1);
@@ -455,10 +496,16 @@ TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
   n4.BecomeFollower(1);
   n4.OnRequestVote(VoteRequest{1, "Other", 0, 0});
 
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
-  n1.AddPeer(&n4);
-  n1.AddPeer(&n5);
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  transport.RegisterNode("N4", &n4);
+  transport.RegisterNode("N5", &n5);
+  n1.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+  n1.AddPeer("N4");
+  n1.AddPeer("N5");
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(2u, r.votes_received);  // self + n5
@@ -507,8 +554,8 @@ TEST_F(RaftNodeTest, HeartbeatHigherTermAccepted) {
 
 TEST_F(RaftNodeTest, HeartbeatFromCandidateStepsDown) {
   RaftNode n1("N1"), n2("N2"), n3("N3");
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
 
   // n1 becomes Candidate
   n1.BecomeCandidate();
@@ -523,11 +570,18 @@ TEST_F(RaftNodeTest, HeartbeatFromCandidateStepsDown) {
 }
 
 TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
+  LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
-  n1.AddPeer(&n2);
-  n1.AddPeer(&n3);
-  n2.AddPeer(&n1);
-  n2.AddPeer(&n3);
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n2.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+  n2.AddPeer("N1");
+  n2.AddPeer("N3");
 
   // Elect n1 as leader
   n1.StartElection();
@@ -548,11 +602,16 @@ TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
 // --- AppendEntries tests ---
 
 TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
+  LocalTransport transport;
   CommandLog leader_storage, follower_storage;
   RaftNode leader("L1"), follower("F1");
   leader.SetLogStorage(&leader_storage);
   follower.SetLogStorage(&follower_storage);
-  leader.AddPeer(&follower);
+
+  transport.RegisterNode("L1", &leader);
+  transport.RegisterNode("F1", &follower);
+  leader.SetTransport(&transport);
+  leader.AddPeer("F1");
 
   leader_storage.Append(LogEntry{1, 0, "cmd1"});
   leader_storage.Append(LogEntry{1, 0, "cmd2"});
@@ -567,11 +626,16 @@ TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
 }
 
 TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
+  LocalTransport transport;
   CommandLog leader_storage, follower_storage;
   RaftNode leader("L1"), follower("F1");
   leader.SetLogStorage(&leader_storage);
   follower.SetLogStorage(&follower_storage);
-  leader.AddPeer(&follower);
+
+  transport.RegisterNode("L1", &leader);
+  transport.RegisterNode("F1", &follower);
+  leader.SetTransport(&transport);
+  leader.AddPeer("F1");
 
   leader_storage.Append(LogEntry{1, 0, "a"});
   leader_storage.Append(LogEntry{1, 0, "b"});
@@ -592,7 +656,7 @@ TEST_F(RaftNodeTest, AppendEntriesRejectsPrevLogMismatch) {
   RaftNode leader("L1"), follower("F1");
   leader.SetLogStorage(&leader_storage);
   follower.SetLogStorage(&follower_storage);
-  leader.AddPeer(&follower);
+  leader.AddPeer("F1");
 
   leader_storage.Append(LogEntry{2, 0, "x"});
 
@@ -675,6 +739,7 @@ class TestStateMachine : public IStateMachine {
 };
 
 TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
+  LocalTransport transport;
   CommandLog leader_storage, f1_storage, f2_storage;
   TestStateMachine sm;
 
@@ -683,8 +748,13 @@ TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
   leader.SetStateMachine(&sm);
   follower1.SetLogStorage(&f1_storage);
   follower2.SetLogStorage(&f2_storage);
-  leader.AddPeer(&follower1);
-  leader.AddPeer(&follower2);
+
+  transport.RegisterNode("L1", &leader);
+  transport.RegisterNode("F1", &follower1);
+  transport.RegisterNode("F2", &follower2);
+  leader.SetTransport(&transport);
+  leader.AddPeer("F1");
+  leader.AddPeer("F2");
 
   leader_storage.Append(LogEntry{1, 0, "SET a 1"});
   leader_storage.Append(LogEntry{1, 0, "SET b 2"});
@@ -715,10 +785,10 @@ TEST_F(RaftNodeTest, CommitStopsWithoutMajority) {
   p2.SetLogStorage(&s2);
   p3.SetLogStorage(&s3);
   p4.SetLogStorage(&s4);
-  leader.AddPeer(&p1);
-  leader.AddPeer(&p2);
-  leader.AddPeer(&p3);
-  leader.AddPeer(&p4);
+  leader.AddPeer("P1");
+  leader.AddPeer("P2");
+  leader.AddPeer("P3");
+  leader.AddPeer("P4");
 
   leader_storage.Append(LogEntry{1, 0, "SET a 1"});
 
@@ -784,6 +854,7 @@ class MockLogStorage : public ILogStorage {
 };
 
 TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
+  LocalTransport transport;
   MockLogStorage mock_storage;
   CommandLog f1_storage, f2_storage;
 
@@ -791,8 +862,13 @@ TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
   node.SetLogStorage(&mock_storage);
   f1.SetLogStorage(&f1_storage);
   f2.SetLogStorage(&f2_storage);
-  node.AddPeer(&f1);
-  node.AddPeer(&f2);
+
+  transport.RegisterNode("N1", &node);
+  transport.RegisterNode("F1", &f1);
+  transport.RegisterNode("F2", &f2);
+  node.SetTransport(&transport);
+  node.AddPeer("F1");
+  node.AddPeer("F2");
 
   EXPECT_CALL(mock_storage, LastIndex())
       .WillOnce(Return(5));
@@ -1009,6 +1085,189 @@ TEST_F(RaftNodeTest, ReplicatedCommandRoundTrip) {
   EXPECT_EQ(original.args[0], deserialized.args[0]);
   EXPECT_EQ(original.args[1], deserialized.args[1]);
   EXPECT_EQ(original.args[2], deserialized.args[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Cluster tests: 3-node cluster communicating through Transport abstraction.
+// ---------------------------------------------------------------------------
+
+// Verifies full election cycle through Transport:
+//   1. All 3 nodes start as Follower
+//   2. N1.StartElection() → N1 becomes Leader, N2/N3 become Followers
+//   3. Heartbeats maintain leadership stability
+TEST_F(RaftNodeTest, ThreeNodeClusterElectionAndHeartbeat) {
+  LocalTransport transport;
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n2.SetTransport(&transport);
+  n3.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+
+  // All start as Followers
+  EXPECT_EQ(RaftRole::Follower, n1.role());
+  EXPECT_EQ(RaftRole::Follower, n2.role());
+  EXPECT_EQ(RaftRole::Follower, n3.role());
+
+  // N1 starts election → sends VoteRequests to N2/N3 via Transport
+  ElectionResult result = n1.StartElection();
+
+  // 3 nodes: majority = 2. Self(1) + N2(1) + N3(1) = 3 ≥ 2.
+  EXPECT_EQ(3u, result.votes_received);
+  EXPECT_EQ(0u, result.votes_rejected);
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+  EXPECT_EQ(1u, n1.term());
+  EXPECT_EQ(1u, n1.leader_term());
+
+  // N2 and N3 should have BecomeFollower after receiving VoteRequest
+  EXPECT_EQ(RaftRole::Follower, n2.role());
+  EXPECT_EQ(1u, n2.term());
+  EXPECT_EQ(RaftRole::Follower, n3.role());
+  EXPECT_EQ(1u, n3.term());
+
+  // Heartbeats from N1 keep followers stable
+  HeartbeatRequest hb{n1.term(), n1.node_id()};
+  HeartbeatResponse rsp2 = n2.OnHeartbeat(hb);
+  HeartbeatResponse rsp3 = n3.OnHeartbeat(hb);
+
+  EXPECT_TRUE(rsp2.success);
+  EXPECT_TRUE(rsp3.success);
+  EXPECT_EQ(RaftRole::Follower, n2.role());
+  EXPECT_EQ(RaftRole::Follower, n3.role());
+  EXPECT_EQ(RaftRole::Leader, n1.role());
+}
+
+// Verifies log replication through Transport:
+//   1. Leader appends entries
+//   2. ReplicateLog sends AppendEntries via Transport to followers
+//   3. Followers receive and store entries
+//   4. CommitIndex advances on leader
+//   5. State machine applies committed entries
+TEST_F(RaftNodeTest, ThreeNodeClusterLogReplication) {
+  LocalTransport transport;
+  CommandLog leader_storage, f1_storage, f2_storage;
+  TestStateMachine sm;
+
+  RaftNode leader("L1"), follower1("F1"), follower2("F2");
+  leader.SetLogStorage(&leader_storage);
+  leader.SetStateMachine(&sm);
+  follower1.SetLogStorage(&f1_storage);
+  follower2.SetLogStorage(&f2_storage);
+
+  transport.RegisterNode("L1", &leader);
+  transport.RegisterNode("F1", &follower1);
+  transport.RegisterNode("F2", &follower2);
+  leader.SetTransport(&transport);
+  follower1.SetTransport(&transport);
+  follower2.SetTransport(&transport);
+  leader.AddPeer("F1");
+  leader.AddPeer("F2");
+
+  // Elect L1 as leader
+  ElectionResult election = leader.StartElection();
+  ASSERT_EQ(RaftRole::Leader, leader.role());
+  ASSERT_EQ(3u, election.votes_received);
+
+  // Append entries and replicate via Transport
+  leader_storage.Append(LogEntry{1, 1, "SET a 1"});
+  leader_storage.Append(LogEntry{1, 2, "SET b 2"});
+
+  leader.ReplicateLog();
+
+  // Followers received entries via Transport->SendAppendEntries
+  EXPECT_EQ(2u, f1_storage.LogSize());
+  EXPECT_EQ(2u, f2_storage.LogSize());
+  EXPECT_EQ("SET a 1", f1_storage.Get(1).command);
+  EXPECT_EQ("SET b 2", f1_storage.Get(2).command);
+  EXPECT_EQ("SET a 1", f2_storage.Get(1).command);
+  EXPECT_EQ("SET b 2", f2_storage.Get(2).command);
+
+  // CommitIndex advanced (majority = 2, all 3 nodes have entries)
+  EXPECT_EQ(2u, leader.commit_index());
+  EXPECT_EQ(2u, leader.last_applied());
+  ASSERT_EQ(2u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
+}
+
+// Verifies leader re-election via Transport after the original leader steps down:
+//   1. Elect N1 as leader (term 1)
+//   2. N1 steps down after receiving OnHeartbeat with higher term (5)
+//   3. N2 starts election (term 2), gets vote from N3 but rejection from N1 (term 5)
+//   4. N2 reaches majority (self + N3 = 2 ≥ 2) and becomes Leader(2)
+//   5. N2 replicates log entry — N3 accepts, N1 rejects (higher term)
+//   6. Majority (N2 + N3) reached → commit_index advances
+TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
+  LocalTransport transport;
+  CommandLog l1_storage, l2_storage, l3_storage;
+  TestStateMachine sm2, sm3;
+
+  RaftNode n1("N1"), n2("N2"), n3("N3");
+  n1.SetLogStorage(&l1_storage);
+  n2.SetLogStorage(&l2_storage);
+  n2.SetStateMachine(&sm2);
+  n3.SetLogStorage(&l3_storage);
+  n3.SetStateMachine(&sm3);
+
+  transport.RegisterNode("N1", &n1);
+  transport.RegisterNode("N2", &n2);
+  transport.RegisterNode("N3", &n3);
+  n1.SetTransport(&transport);
+  n2.SetTransport(&transport);
+  n3.SetTransport(&transport);
+  n1.AddPeer("N2");
+  n1.AddPeer("N3");
+  n2.AddPeer("N1");
+  n2.AddPeer("N3");
+  n3.AddPeer("N1");
+  n3.AddPeer("N2");
+
+  // Step 1: Elect N1 as leader
+  ElectionResult e1 = n1.StartElection();
+  ASSERT_EQ(RaftRole::Leader, n1.role());
+  EXPECT_EQ(3u, e1.votes_received);
+  EXPECT_EQ(1u, n1.term());
+  EXPECT_EQ(1u, n2.term());
+  EXPECT_EQ(1u, n3.term());
+
+  // Step 2: N1 steps down on higher term heartbeat (term 5)
+  n1.OnHeartbeat(HeartbeatRequest{5, "N2"});
+  EXPECT_EQ(RaftRole::Follower, n1.role());
+  EXPECT_EQ(5u, n1.term());
+
+  // Step 3: N2 starts election (term 2)
+  // N1 (term 5) rejects, N3 (term 1) grants
+  ElectionResult e2 = n2.StartElection();
+  EXPECT_EQ(RaftRole::Leader, n2.role());
+  EXPECT_EQ(2u, n2.term());  // N2's own term
+  EXPECT_EQ(5u, n1.term());  // N1 unchanged (higher term)
+  EXPECT_EQ(2u, n3.term());  // N3 updated by vote request
+  EXPECT_EQ(2u, e2.votes_received);  // self + N3
+  EXPECT_EQ(1u, e2.votes_rejected);  // N1
+
+  // N1 and N3 are followers
+  EXPECT_EQ(RaftRole::Follower, n1.role());
+  EXPECT_EQ(RaftRole::Follower, n3.role());
+
+  // Step 5: New leader replicates log entry
+  // N3 accepts, N1 rejects (higher term 5 > 2)
+  l2_storage.Append(LogEntry{2, 1, "SET x 1"});
+  n2.ReplicateLog();
+
+  // N3 received the entry via transport
+  EXPECT_EQ(1u, l3_storage.LogSize());
+  EXPECT_EQ("SET x 1", l3_storage.Get(1).command);
+
+  // N1 rejected (higher term)
+  EXPECT_EQ(0u, l1_storage.LogSize());
+
+  // Majority (N2 + N3 = 2/3) reached → commit_index advances
+  EXPECT_EQ(1u, n2.commit_index());
+  EXPECT_EQ(1u, n2.last_applied());
 }
 
 }  // namespace dfly
