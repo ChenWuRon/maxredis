@@ -92,6 +92,26 @@ class SegmentLogStorageRecoveryTest : public Test {
     fclose(fp);
   }
 
+  // Writes a segment with a specific set of indices (used to test validation).
+  // Each entry uses the same term=1 and command="payload".
+  void WriteSegmentWithIndices(uint32_t segment_id,
+                               const std::vector<LogIndex>& indices) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(segment_id));
+    WalWriter writer;
+    ASSERT_TRUE(writer.Open(buf));
+    for (LogIndex idx : indices) {
+      LogEntry entry;
+      entry.term = 1;
+      entry.index = idx;
+      entry.command = "x";
+      writer.Append(entry);
+    }
+    ASSERT_TRUE(writer.Flush());
+    writer.Close();
+  }
+
   std::string dir_;
 };
 
@@ -285,6 +305,105 @@ TEST_F(SegmentLogStorageRecoveryTest, DiscoverSegmentsOutOfOrder) {
   EXPECT_EQ(1u, seg.Get(1)->term);
   EXPECT_EQ(2u, seg.Get(51)->term);
   EXPECT_EQ(3u, seg.Get(81)->term);
+}
+
+// --- Index rebuild tests ---
+
+TEST_F(SegmentLogStorageRecoveryTest, RebuildIndexAccess) {
+  WriteSegment(1, 10000);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(10000u, seg.LogSize());
+  EXPECT_EQ(10000u, seg.LastIndex());
+
+  // Random access via rebuilt index.
+  const LogEntry* e = seg.Get(5000);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(5000u, e->index);
+  EXPECT_EQ("cmd5000", e->command);
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RebuildIndexRandomAccess) {
+  WriteSegment(1, 10000);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+
+  const LogEntry* e1 = seg.Get(1);
+  ASSERT_NE(nullptr, e1);
+  EXPECT_EQ("cmd1", e1->command);
+
+  const LogEntry* e500 = seg.Get(500);
+  ASSERT_NE(nullptr, e500);
+  EXPECT_EQ("cmd500", e500->command);
+
+  const LogEntry* e9999 = seg.Get(9999);
+  ASSERT_NE(nullptr, e9999);
+  EXPECT_EQ("cmd9999", e9999->command);
+
+  EXPECT_EQ(10000u, seg.LastIndex());
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, LastIndexFromRecoveredIndex) {
+  WriteSegment(1, 500);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  // LastIndex should come from rebuilt index, not WAL re-scan.
+  EXPECT_EQ(500u, seg.LastIndex());
+  EXPECT_EQ(500u, seg.LogSize());
+
+  // Verify get on last entry works.
+  ASSERT_NE(nullptr, seg.Get(500));
+  EXPECT_EQ("cmd500", seg.Get(500)->command);
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RejectDuplicateIndex) {
+  // Write valid entries then append one with duplicate index.
+  WriteSegmentWithIndices(1, {1, 2, 3, 3, 4});
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  // Should stop at index 3 (1, 2, 3), reject the duplicate 3.
+  EXPECT_EQ(3u, seg.LogSize());
+  ASSERT_NE(nullptr, seg.Get(3));
+  EXPECT_EQ(nullptr, seg.Get(4));
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RejectNonMonotonicIndex) {
+  // Write entries with decreasing index.
+  WriteSegmentWithIndices(1, {1, 2, 5, 3});
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  // Should accept 1, 2, 5 (monotonic), reject 3 (< 5).
+  EXPECT_EQ(3u, seg.LogSize());
+  EXPECT_EQ(5u, seg.LastIndex());
+  ASSERT_NE(nullptr, seg.Get(5));
+  EXPECT_EQ(nullptr, seg.Get(3));
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RebuildIndexCrossSegment) {
+  // Entries spanning multiple segments.
+  WriteSegment(1, 50, 1, 1);
+  WriteSegment(2, 50, 2, 51);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(100u, seg.LogSize());
+  EXPECT_EQ(100u, seg.LastIndex());
+
+  // Verify cross-segment reads.
+  const LogEntry* e50 = seg.Get(50);
+  ASSERT_NE(nullptr, e50);
+  EXPECT_EQ(50u, e50->index);
+  EXPECT_EQ(1u, e50->term);
+
+  const LogEntry* e51 = seg.Get(51);
+  ASSERT_NE(nullptr, e51);
+  EXPECT_EQ(51u, e51->index);
+  EXPECT_EQ(2u, e51->term);
 }
 
 }  // namespace dfly

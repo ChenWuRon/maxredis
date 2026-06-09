@@ -12,6 +12,7 @@
 #include "server/raft/log_storage.h"
 #include "server/raft/manifest.h"
 #include "server/raft/raft_types.h"
+#include "server/raft/wal_index.h"
 
 namespace dfly {
 
@@ -50,12 +51,21 @@ class SegmentLogStorage : public ILogStorage {
   std::vector<uint32_t> DiscoverSegments() const;
 
   // Scans a single segment file and appends valid entries to entries_.
+  // Also records each entry's disk location in index_ for O(1) random access.
   void ScanSegment(uint32_t segment_id);
+
+  // Called by ScanSegment for each validated record to build the index.
+  void RebuildIndex(LogIndex index, uint32_t segment_id, uint64_t offset);
 
   std::string dir_;
   ManifestManager manifest_;
   // entries_[i] corresponds to log index i. entries_[0] is a sentinel.
   std::vector<LogEntry> entries_;
+  // Index mapping LogIndex → on-disk location, rebuilt on startup.
+  WalIndex index_;
+  // Highest index seen during recovery scan. Used by LastIndex() and LogSize().
+  // Updated during scan and on Append/TruncateFrom.
+  LogIndex last_recovered_index_ = 0;
 };
 
 }  // namespace dfly

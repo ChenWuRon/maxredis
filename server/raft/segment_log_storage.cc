@@ -107,6 +107,8 @@ void SegmentLogStorage::ScanSegment(uint32_t segment_id) {
   }
 
   while (true) {
+    uint64_t offset = ftello(fp);
+
     RecordHeader hdr;
     size_t nread = fread(&hdr, 1, kHeaderSize, fp);
     if (nread == 0)
@@ -118,6 +120,13 @@ void SegmentLogStorage::ScanSegment(uint32_t segment_id) {
 
     if (hdr.size == 0)
       break;
+
+    // Validate strict monotonic index.
+    if (hdr.index <= last_recovered_index_) {
+      VLOG(1) << "Non-monotonic index " << hdr.index << " (prev="
+              << last_recovered_index_ << ") in " << path << " - stopping scan";
+      break;
+    }
 
     LogEntry entry;
     entry.index = hdr.index;
@@ -137,9 +146,16 @@ void SegmentLogStorage::ScanSegment(uint32_t segment_id) {
     }
 
     entries_.push_back(std::move(entry));
+    RebuildIndex(hdr.index, segment_id, offset);
   }
 
   fclose(fp);
+}
+
+void SegmentLogStorage::RebuildIndex(LogIndex index, uint32_t segment_id,
+                                     uint64_t offset) {
+  index_.Add(index, segment_id, offset);
+  last_recovered_index_ = index;
 }
 
 size_t SegmentLogStorage::LogSize() const {
@@ -147,7 +163,7 @@ size_t SegmentLogStorage::LogSize() const {
 }
 
 LogIndex SegmentLogStorage::LastIndex() const {
-  return entries_.size() - 1;
+  return last_recovered_index_;
 }
 
 Term SegmentLogStorage::LastTerm() const {
@@ -157,14 +173,23 @@ Term SegmentLogStorage::LastTerm() const {
 }
 
 const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
-  if (index >= entries_.size())
+  if (index > last_recovered_index_)
     return nullptr;
-  return &entries_[index];
+  // Fast path: entries are typically 1-indexed contiguous.
+  if (index < entries_.size() && entries_[index].index == index)
+    return &entries_[index];
+  // Slow path: scan for the entry (handles non-contiguous recovery).
+  for (size_t i = 1; i < entries_.size(); i++) {
+    if (entries_[i].index == index)
+      return &entries_[i];
+  }
+  return nullptr;
 }
 
 LogIndex SegmentLogStorage::Append(LogEntry entry) {
   entry.index = entries_.size();
   entries_.push_back(std::move(entry));
+  last_recovered_index_ = entry.index;
   return entry.index;
 }
 
@@ -184,11 +209,15 @@ std::vector<LogEntry> SegmentLogStorage::GetRange(LogIndex start, size_t limit) 
 }
 
 void SegmentLogStorage::TruncateFrom(LogIndex new_last) {
-  DCHECK_LT(new_last, entries_.size());
+  DCHECK_LT(new_last, entries_.size() - 1);
+  index_.Truncate(new_last);
   entries_.resize(new_last + 1);
+  last_recovered_index_ = new_last;
 }
 
 void SegmentLogStorage::Clear() {
+  index_.Clear();
+  last_recovered_index_ = 0;
   entries_.resize(1);
 }
 
