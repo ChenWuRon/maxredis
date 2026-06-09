@@ -1508,6 +1508,62 @@ TEST_F(RaftNodeTest, JointConsensusFullTransition) {
   EXPECT_EQ(1u, n1.cluster_config().voters.count("B"));
   EXPECT_EQ(1u, n1.cluster_config().voters.count("C"));
   EXPECT_EQ(1u, n1.cluster_config().voters.count("D"));
+
+  // PeerManager reflects the applied config
+  EXPECT_EQ(3u, n1.peer_manager().PeerCount());
+  EXPECT_TRUE(n1.peer_manager().HasPeer("B"));
+  EXPECT_TRUE(n1.peer_manager().HasPeer("C"));
+  EXPECT_TRUE(n1.peer_manager().HasPeer("D"));
+}
+
+// Verifies that during kJoint, PeerManager still reflects the old config
+// and only updates when the second entry commits to Stable.
+TEST_F(RaftNodeTest, JointConsensusPeerManagerUpdated) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm;
+  RaftNode n1("A"), n2("B"), n3("C"), n4("D");
+  n1.SetLogStorage(&log_a);
+  n1.SetStateMachine(&sm);
+  n2.SetLogStorage(&log_b);
+  n3.SetLogStorage(&log_c);
+  n4.SetLogStorage(&log_d);
+
+  transport.RegisterNode("A", &n1);
+  transport.RegisterNode("B", &n2);
+  transport.RegisterNode("C", &n3);
+  transport.RegisterNode("D", &n4);
+  n1.SetTransport(&transport);
+  n1.AddPeer("B");
+  n1.AddPeer("C");
+
+  // Initial PeerManager reflects {B, C}
+  ASSERT_EQ(2u, n1.peer_manager().PeerCount());
+
+  // Elect A as leader
+  n1.StartElection();
+  ASSERT_EQ(RaftRole::Leader, n1.role());
+
+  // Begin config change to add D
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+  ASSERT_TRUE(n1.BeginConfigChange(target));
+  n1.ReplicateLog();
+  ASSERT_TRUE(n1.IsJointConsensus());
+
+  // During kJoint, PeerManager still reflects OLD config {B, C}
+  EXPECT_EQ(2u, n1.peer_manager().PeerCount())
+      << "PeerManager unchanged in Joint (still old config)";
+
+  // Finalize the config change
+  ASSERT_TRUE(n1.BeginConfigChange(target));
+  n1.ReplicateLog();
+  ASSERT_EQ(ConfigState::kStable, n1.config_state());
+
+  // After commit, PeerManager reflects NEW config {B, C, D}
+  EXPECT_EQ(3u, n1.peer_manager().PeerCount());
+  EXPECT_TRUE(n1.peer_manager().HasPeer("D"));
 }
 
 // Tests dual-majority commit rule during joint consensus.
@@ -1577,6 +1633,13 @@ TEST_F(JointConsensusDualMajorityTest, BothMajoritiesPass) {
   EXPECT_EQ(ConfigState::kStable, cl.a.config_state())
       << "both majorities pass → final config applied";
   EXPECT_EQ(2u, cl.a.commit_index()) << "commit should advance with both majorities";
+
+  // PeerManager reflects the applied config {B, C, D, E}
+  EXPECT_EQ(4u, cl.a.peer_manager().PeerCount());
+  EXPECT_TRUE(cl.a.peer_manager().HasPeer("B"));
+  EXPECT_TRUE(cl.a.peer_manager().HasPeer("C"));
+  EXPECT_TRUE(cl.a.peer_manager().HasPeer("D"));
+  EXPECT_TRUE(cl.a.peer_manager().HasPeer("E"));
 }
 
 TEST_F(JointConsensusDualMajorityTest, OldPassNewFail) {
