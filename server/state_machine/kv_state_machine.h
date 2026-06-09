@@ -25,7 +25,8 @@ class KvStateMachine : public IStateMachine {
   void Set(DbIndex db_ind, std::string_view key, std::string_view val) override;
   bool Del(DbIndex db_ind, std::string_view key) override;
   bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) override;
-  OpResult<std::string> Get(DbIndex db_ind, std::string_view key) override;
+  OpResult<std::string> Get(DbIndex db_ind, std::string_view key,
+                             ReadConsistency consistency = ReadConsistency::kLocal) override;
   size_t DbSize(DbIndex db_ind) const override;
   void Schedule(DbIndex db_ind, std::string_view key,
                 std::function<void(EngineShard*)> cb) override;

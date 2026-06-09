@@ -747,7 +747,8 @@ class TestStateMachine : public IStateMachine {
     return store.erase(std::string(key)) > 0;
   }
   bool Expire(DbIndex, std::string_view, uint64_t) override { return false; }
-  OpResult<std::string> Get(DbIndex, std::string_view key) override {
+  OpResult<std::string> Get(DbIndex, std::string_view key,
+                             ReadConsistency) override {
     auto it = store.find(std::string(key));
     if (it != store.end())
       return it->second;
@@ -1661,6 +1662,21 @@ TEST_F(RaftNodeTest, JointConsensusNonLeaderRejected) {
 // Integration Tests
 // ---------------------------------------------------------------------------
 
+// Minimal mock transport for ReadIndex tests.
+class ReadIndexMockTransport : public Transport {
+ public:
+  MOCK_METHOD(VoteResponse, SendVoteRequest,
+              (const NodeId& peer_id, const VoteRequest& request), (override));
+  MOCK_METHOD(HeartbeatResponse, SendHeartbeat,
+              (const NodeId& peer_id, const HeartbeatRequest& request), (override));
+  MOCK_METHOD(AppendEntriesResponse, SendAppendEntries,
+              (const NodeId& peer_id, const AppendEntriesRequest& request), (override));
+  MOCK_METHOD(InstallSnapshotResponse, SendInstallSnapshot,
+              (const NodeId& peer_id, const InstallSnapshotRequest& request), (override));
+  MOCK_METHOD(ReadIndexResponse, SendReadIndex,
+              (const NodeId& peer_id, const ReadIndexRequest& request), (override));
+};
+
 // A transport wrapper that silently drops messages to unregistered peers
 // (instead of DCHECK-crashing like LocalTransport does).
 class PartitionedTransport : public Transport {
@@ -1697,6 +1713,13 @@ class PartitionedTransport : public Transport {
     if (!inner_.HasNode(peer_id))
       return {0, false};
     return inner_.SendInstallSnapshot(peer_id, request);
+  }
+
+  ReadIndexResponse SendReadIndex(const NodeId& peer_id,
+                                   const ReadIndexRequest& request) override {
+    if (!inner_.HasNode(peer_id))
+      return {0, false, 0};
+    return inner_.SendReadIndex(peer_id, request);
   }
 
  private:
@@ -2095,6 +2118,257 @@ TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
   EXPECT_EQ(RaftRole::Leader, a.role())
       << "After partition heal, cluster elects a leader";
   EXPECT_TRUE(a.IsJointConsensus());
+}
+
+// ---------------------------------------------------------------------------
+// Linearizable Read (ReadIndex) Tests
+// ---------------------------------------------------------------------------
+
+// Test 1: Single-node leader can serve ReadIndex (lease bypasses quorum).
+TEST_F(RaftNodeTest, ReadIndexSingleNode) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // Single node: lease is valid immediately (leader just became active).
+  // ReadIndex should return commit_index_ (0) after waiting for apply.
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
+
+  // Append and commit a log entry.
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  node.ReplicateLog();
+  EXPECT_EQ(1u, node.last_applied());
+
+  // ReadIndex should now return commit_index_ (1).
+  ri = node.ReadIndex();
+  EXPECT_EQ(1u, ri);
+  EXPECT_EQ(1u, node.last_applied());
+}
+
+// Test 2: Follower cannot serve ReadIndex (returns 0).
+TEST_F(RaftNodeTest, ReadIndexFollowerRejects) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+
+  EXPECT_EQ(RaftRole::Follower, node.role());
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri) << "Follower must reject ReadIndex";
+}
+
+// Test 3: Leader with mock transport – quorum confirmed.
+TEST_F(RaftNodeTest, ReadIndexWithQuorum) {
+  ReadIndexMockTransport transport;
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.SetTransport(&transport);
+  node.AddPeer("N2");
+  node.AddPeer("N3");
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // Expect ReadIndex RPCs to N2 and N3, both success.
+  EXPECT_CALL(transport, SendReadIndex("N2", _))
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+  EXPECT_CALL(transport, SendReadIndex("N3", _))
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
+  // Leader lease should be extended after successful quorum.
+  EXPECT_GT(node.leader_lease_expire(), 0u);
+}
+
+// Test 4: Leader with mock transport – quorum fails (minority ack).
+TEST_F(RaftNodeTest, ReadIndexQuorumFails) {
+  ReadIndexMockTransport transport;
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.SetTransport(&transport);
+  node.AddPeer("N2");
+  node.AddPeer("N3");
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // Only one peer acks – need 2/3 = N1 + 1 = 2 minimum.
+  EXPECT_CALL(transport, SendReadIndex("N2", _))
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+  EXPECT_CALL(transport, SendReadIndex("N3", _))
+      .WillOnce(Return(ReadIndexResponse{1, false, 0}));
+
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri) << "ReadIndex must fail without majority";
+}
+
+// Test 5: Leader discovers higher term during ReadIndex – steps down.
+TEST_F(RaftNodeTest, ReadIndexHigherTermStepsDown) {
+  ReadIndexMockTransport transport;
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.SetTransport(&transport);
+  node.AddPeer("N2");
+  node.AddPeer("N3");
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+  EXPECT_EQ(RaftRole::Leader, node.role());
+
+  // Use a sequence: first call returns success, second returns higher term.
+  // The iteration order over GetPeerIds() is non-deterministic, so we use
+  // .Times(2) and check that at least one response has a higher term.
+  EXPECT_CALL(transport, SendReadIndex(_, _))
+      .Times(2)
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}))
+      .WillOnce(Return(ReadIndexResponse{5, true, 0}));
+
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
+  EXPECT_EQ(RaftRole::Follower, node.role()) << "Leader must step down on higher term";
+  EXPECT_EQ(5u, node.term());
+}
+
+// Test 6: 3-node cluster – leader ReadIndex with real transport.
+TEST_F(RaftNodeTest, ReadIndexThreeNodeCluster) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c;
+  TestStateMachine sm;
+  RaftNode a("A"), b("B"), c("C");
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm);
+  b.SetLogStorage(&log_b);
+  c.SetLogStorage(&log_c);
+
+  transport.RegisterNode("A", &a);
+  transport.RegisterNode("B", &b);
+  transport.RegisterNode("C", &c);
+  a.SetTransport(&transport);
+  b.SetTransport(&transport);
+  c.SetTransport(&transport);
+  a.AddPeer("B");
+  a.AddPeer("C");
+  b.AddPeer("A");
+  b.AddPeer("C");
+  c.AddPeer("A");
+  c.AddPeer("B");
+
+  // Elect A as leader.
+  a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+  ASSERT_EQ(RaftRole::Follower, b.role());
+  ASSERT_EQ(RaftRole::Follower, c.role());
+
+  // Write a value and replicate to followers.
+  sm.Set(0, "x", "1");
+  log_a.Append(LogEntry{1, 0, "SET x 1"});
+  a.ReplicateLog();
+  EXPECT_EQ(1u, a.commit_index());
+  EXPECT_EQ(1u, a.last_applied());
+
+  // ReadIndex on leader should succeed via quorum.
+  LogIndex ri = a.ReadIndex();
+  EXPECT_EQ(1u, ri);
+  EXPECT_EQ(1u, a.last_applied());
+
+  // Follower B cannot serve ReadIndex.
+  ri = b.ReadIndex();
+  EXPECT_EQ(0u, ri) << "Follower must reject ReadIndex";
+  ri = c.ReadIndex();
+  EXPECT_EQ(0u, ri) << "Follower must reject ReadIndex";
+
+  // ReadIndex with lease: second call skips quorum.
+  ri = a.ReadIndex();
+  EXPECT_EQ(1u, ri);
+}
+
+// Test 7: WaitForApplied blocks until state machine catches up.
+TEST_F(RaftNodeTest, WaitForAppliedBlocksUntilCatchUp) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+
+  // Manually set commit_index above last_applied.
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
+  storage.Append(LogEntry{1, 0, "SET c 3"});
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // Force commit_index past last_applied by setting it directly.
+  // This simulates the scenario where commit_index advances but
+  // ApplyCommittedLogs hasn't caught up yet (normally ReplicateLog does both).
+  node.ForceCommitIndex(2);
+  EXPECT_EQ(0u, node.last_applied());
+
+  // WaitForApplied should apply the pending entries.
+  node.WaitForApplied(2);
+  EXPECT_EQ(2u, node.last_applied());
+  EXPECT_EQ("1", sm.store["a"]);
+  EXPECT_EQ("2", sm.store["b"]);
+}
+
+// Test 8: Leader with zero peers uses fast path (self-only quorum).
+TEST_F(RaftNodeTest, ReadIndexZeroPeers) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // With zero peers, self majority = 1/1 = 1. Lease is also valid.
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
+}
+
+// Test 9: Leader lease optimization – second ReadIndex skips RPC.
+TEST_F(RaftNodeTest, ReadIndexLeaderLeaseReusesQuorum) {
+  ReadIndexMockTransport transport;
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.SetTransport(&transport);
+  node.AddPeer("N2");
+  node.AddPeer("N3");
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  // First ReadIndex: must go through quorum (lease is not yet valid).
+  EXPECT_CALL(transport, SendReadIndex("N2", _))
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+  EXPECT_CALL(transport, SendReadIndex("N3", _))
+      .WillOnce(Return(ReadIndexResponse{1, true, 0}));
+  LogIndex ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
+
+  // Second ReadIndex within lease: no RPCs expected.
+  ri = node.ReadIndex();
+  EXPECT_EQ(0u, ri);
 }
 
 }  // namespace dfly

@@ -72,6 +72,12 @@ struct ElectionResult {
   uint32_t votes_rejected = 0;
 };
 
+// Read consistency levels for client queries.
+enum class ReadConsistency : uint8_t {
+  kLocal = 0,       // Fast, may return stale data
+  kLinearizable = 1, // Strong consistency via ReadIndex protocol
+};
+
 // Snapshot anchor entry preserved after log compaction.
 // Allows AppendEntries consistency checks to reference
 // the last index/term covered by a snapshot.

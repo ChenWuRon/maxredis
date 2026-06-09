@@ -17,6 +17,8 @@
 #include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/raft/heartbeat_rpc.h"
+#include "server/raft/install_snapshot_rpc.h"
+#include "server/raft/read_index_rpc.h"
 
 namespace dfly {
 
@@ -49,6 +51,12 @@ class MockTransport : public Transport {
               (const NodeId& peer_id, const HeartbeatRequest& request), (override));
   MOCK_METHOD(AppendEntriesResponse, SendAppendEntries,
               (const NodeId& peer_id, const AppendEntriesRequest& request), (override));
+
+  MOCK_METHOD(InstallSnapshotResponse, SendInstallSnapshot,
+              (const NodeId& peer_id, const InstallSnapshotRequest& request), (override));
+
+  MOCK_METHOD(ReadIndexResponse, SendReadIndex,
+              (const NodeId& peer_id, const ReadIndexRequest& request), (override));
 };
 
 class RaftRoleTest : public Test {

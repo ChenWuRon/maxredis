@@ -24,6 +24,9 @@ class LocalTransport : public Transport {
   InstallSnapshotResponse SendInstallSnapshot(const NodeId& peer_id,
                                                const InstallSnapshotRequest& request) override;
 
+  ReadIndexResponse SendReadIndex(const NodeId& peer_id,
+                                   const ReadIndexRequest& request) override;
+
   bool HasNode(const NodeId& id) const;
 
  private:

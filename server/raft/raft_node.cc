@@ -20,6 +20,7 @@
 #include "server/raft/raft_node.h"
 
 #include <algorithm>
+#include <chrono>
 
 #include "base/logging.h"
 #include "server/raft/apply_progress.h"
@@ -323,6 +324,17 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
   return {storage_.current_term(), true};
 }
 
+ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
+  ReadIndexResponse resp;
+  resp.term = storage_.current_term();
+  resp.success = (request.term >= storage_.current_term() &&
+                  role_ != RaftRole::Candidate);
+  resp.commit_index = commit_index_;
+  VLOG(2) << node_id_ << " OnReadIndex from " << request.leader_id
+          << ": success=" << resp.success << " commit_index=" << resp.commit_index;
+  return resp;
+}
+
 void RaftNode::SendHeartbeatToPeers() {
   HeartbeatRequest req{storage_.current_term(), node_id_};
   for (const auto& peer_id : GetPeerIds()) {
@@ -348,8 +360,87 @@ void RaftNode::StopHeartbeat() {
 void RaftNode::HeartbeatLoop() {
   while (!shutdown_.load(std::memory_order_acquire) && role_ == RaftRole::Leader) {
     SendHeartbeatToPeers();
+    ExtendLeaderLease();
     util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
   }
+}
+
+LogIndex RaftNode::ReadIndex() {
+  if (role_ != RaftRole::Leader) {
+    LOG(WARNING) << node_id_ << " ReadIndex: not leader, role=" << role_;
+    return 0;
+  }
+
+  // Fast path: leader lease is still valid.
+  if (NowMs() < leader_lease_expire_) {
+    LogIndex read_index = commit_index_;
+    VLOG(2) << node_id_ << " ReadIndex fast path: lease valid, read_index=" << read_index;
+    WaitForApplied(read_index);
+    return read_index;
+  }
+
+  // Slow path: send ReadIndex RPC to all peers to confirm quorum.
+  LogIndex read_index = commit_index_;
+  Term current_term = storage_.current_term();
+
+  ReadIndexRequest req;
+  req.term = current_term;
+  req.leader_id = node_id_;
+  req.request_id = ++next_read_index_request_id_;
+
+  size_t success_count = 1;  // Self counts as success
+  size_t total = cluster_config_.voters.size() + 1;
+  size_t majority = total / 2 + 1;
+
+  for (const auto& peer_id : GetPeerIds()) {
+    if (!transport_)
+      break;
+    ReadIndexResponse resp = transport_->SendReadIndex(peer_id, req);
+    if (resp.success && resp.term == current_term) {
+      success_count++;
+    } else if (resp.term > current_term) {
+      // A peer has a higher term -- we are no longer leader.
+      VLOG(1) << node_id_ << " ReadIndex: peer " << peer_id
+              << " has higher term " << resp.term;
+      BecomeFollower(resp.term);
+      return 0;
+    }
+  }
+
+  if (success_count < majority) {
+    VLOG(1) << node_id_ << " ReadIndex: only " << success_count
+            << "/" << majority << " acks, cannot confirm leadership";
+    return 0;
+  }
+
+  VLOG(2) << node_id_ << " ReadIndex: quorum confirmed (" << success_count
+          << "/" << majority << "), read_index=" << read_index;
+
+  // Extend leader lease on successful quorum.
+  ExtendLeaderLease();
+
+  WaitForApplied(read_index);
+  return read_index;
+}
+
+void RaftNode::WaitForApplied(LogIndex target) {
+  while (last_applied_ < target) {
+    ApplyCommittedLogs();
+    if (last_applied_ >= target)
+      break;
+    // Yield to allow log replication / commit advancement to make progress.
+    util::ThisFiber::Yield();
+  }
+}
+
+void RaftNode::ExtendLeaderLease() {
+  leader_lease_expire_ = NowMs() + lease_ms_;
+}
+
+uint64_t RaftNode::NowMs() const {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {

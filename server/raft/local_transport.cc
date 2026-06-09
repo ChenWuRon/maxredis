@@ -43,4 +43,11 @@ InstallSnapshotResponse LocalTransport::SendInstallSnapshot(const NodeId& peer_i
   return it->second->OnInstallSnapshot(request);
 }
 
+ReadIndexResponse LocalTransport::SendReadIndex(const NodeId& peer_id,
+                                                  const ReadIndexRequest& request) {
+  auto it = nodes_.find(peer_id);
+  DCHECK(it != nodes_.end()) << "Unknown peer: " << peer_id;
+  return it->second->OnReadIndex(request);
+}
+
 }  // namespace dfly

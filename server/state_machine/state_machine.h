@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "server/raft/raft_types.h"
 #include "server/storage/common_types.h"
 #include "server/storage/op_status.h"
 
@@ -41,7 +42,8 @@ class IStateMachine {
   virtual void Set(DbIndex db_ind, std::string_view key, std::string_view val) = 0;
   virtual bool Del(DbIndex db_ind, std::string_view key) = 0;
   virtual bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) = 0;
-  virtual OpResult<std::string> Get(DbIndex db_ind, std::string_view key) = 0;
+  virtual OpResult<std::string> Get(DbIndex db_ind, std::string_view key,
+                                     ReadConsistency consistency = ReadConsistency::kLocal) = 0;
   virtual size_t DbSize(DbIndex db_ind) const = 0;
   virtual void Schedule(DbIndex db_ind, std::string_view key,
                          std::function<void(EngineShard*)> cb) = 0;

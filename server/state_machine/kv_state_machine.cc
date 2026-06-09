@@ -85,7 +85,9 @@ bool KvStateMachine::Expire(DbIndex db_ind, std::string_view key, uint64_t expir
   return result;
 }
 
-OpResult<string> KvStateMachine::Get(DbIndex db_ind, std::string_view key) {
+OpResult<string> KvStateMachine::Get(DbIndex db_ind, std::string_view key,
+                                    ReadConsistency consistency) {
+  (void)consistency;
   ShardId sid = Shard(key);
   return shard_set_->Await(sid, [db_ind, key]() -> OpResult<string> {
     EngineShard* es = EngineShard::tlocal();

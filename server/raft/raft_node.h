@@ -32,6 +32,7 @@
 #include "server/raft/peer_manager.h"
 #include "server/raft/raft_storage.h"
 #include "server/raft/raft_types.h"
+#include "server/raft/read_index_rpc.h"
 #include "server/raft/snapshot_receiver.h"
 #include "server/raft/snapshot_sender.h"
 #include "server/raft/transport.h"
@@ -162,6 +163,22 @@ class RaftNode {
   // Follower-side: processes an incoming Heartbeat from the leader.
   HeartbeatResponse OnHeartbeat(const HeartbeatRequest& request);
 
+  // Processes an incoming ReadIndex request from the leader.
+  // Returns success=false if the request's term is stale.
+  ReadIndexResponse OnReadIndex(const ReadIndexRequest& request);
+
+  // Leader-side: implements the ReadIndex protocol.
+  // 1. Records commit_index_ as candidate read index.
+  // 2. Sends ReadIndex RPC to all peers.
+  // 3. Waits for quorum (majority success responses).
+  // 4. Waits for last_applied_ >= read_index.
+  // 5. Returns the confirmed read index.
+  // Uses leader lease optimization if enabled.
+  LogIndex ReadIndex();
+
+  // Blocks until last_applied_ >= target.
+  void WaitForApplied(LogIndex target);
+
   // Leader-side: sends Heartbeat to all peers immediately.
   void SendHeartbeatToPeers();
 
@@ -207,6 +224,15 @@ class RaftNode {
     return last_applied_;
   }
 
+  uint64_t leader_lease_expire() const {
+    return leader_lease_expire_;
+  }
+
+  // Test helper: forces commit_index to bypass replication.
+  void ForceCommitIndex(LogIndex ci) {
+    commit_index_ = ci;
+  }
+
   LogIndex last_snapshot_index() const {
     return last_snapshot_index_;
   }
@@ -250,6 +276,13 @@ class RaftNode {
 
   std::vector<NodeId> GetPeerIds() const;
   void AdvanceCommitIndexJoint();
+  uint64_t NowMs() const;
+  void ExtendLeaderLease();
+
+  // Leader lease: allows skipping ReadIndex quorum within lease period.
+  uint64_t leader_lease_expire_ = 0;
+  uint64_t lease_ms_ = 100;  // default lease duration
+  uint64_t next_read_index_request_id_ = 0;
 
   JointConfig joint_config_;
   ClusterConfig cluster_config_;

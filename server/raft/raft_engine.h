@@ -23,8 +23,10 @@ class RaftEngine {
   ApplyResult SubmitCommand(const CommandId* cid, CmdArgList args);
 
   bool Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms);
-  OpResult<std::string> Get(DbIndex db_ind, std::string_view key);
+  OpResult<std::string> Get(DbIndex db_ind, std::string_view key,
+                            ReadConsistency consistency = ReadConsistency::kLocal);
   size_t DbSize(DbIndex db_ind) const;
+  LogIndex ReadIndex();
   void Schedule(DbIndex db_ind, std::string_view key,
                 std::function<void(EngineShard*)> cb);
 

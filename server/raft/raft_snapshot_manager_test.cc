@@ -44,7 +44,7 @@ class MockSnapshotSM : public IStateMachine {
   void Set(DbIndex, std::string_view, std::string_view) override {}
   bool Del(DbIndex, std::string_view) override { return false; }
   bool Expire(DbIndex, std::string_view, uint64_t) override { return false; }
-  OpResult<std::string> Get(DbIndex, std::string_view) override {
+  OpResult<std::string> Get(DbIndex, std::string_view, ReadConsistency) override {
     return OpStatus::KEY_NOTFOUND;
   }
   size_t DbSize(DbIndex) const override { return 0; }

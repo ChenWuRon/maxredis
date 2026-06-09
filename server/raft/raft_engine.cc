@@ -6,6 +6,7 @@
 
 #include "base/logging.h"
 #include "server/raft/command_encoder.h"
+#include "server/raft/raft_types.h"
 #include "server/raft/raft_node.h"
 #include "server/service/command_registry.h"
 
@@ -55,8 +56,19 @@ bool RaftEngine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at
   return kv_.Expire(db_ind, key, expire_at_ms);
 }
 
-OpResult<std::string> RaftEngine::Get(DbIndex db_ind, std::string_view key) {
+OpResult<std::string> RaftEngine::Get(DbIndex db_ind, std::string_view key,
+                                      ReadConsistency consistency) {
+  if (consistency == ReadConsistency::kLinearizable) {
+    LogIndex ri = ReadIndex();
+    if (ri == 0) {
+      return OpStatus::KEY_NOTFOUND;
+    }
+  }
   return kv_.Get(db_ind, key);
+}
+
+LogIndex RaftEngine::ReadIndex() {
+  return group_.node().ReadIndex();
 }
 
 size_t RaftEngine::DbSize(DbIndex db_ind) const {
