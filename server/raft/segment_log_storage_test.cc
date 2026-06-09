@@ -9,12 +9,90 @@
 #include <gmock/gmock.h>
 
 #include "base/gtest.h"
+#include "server/raft/wal_writer.h"
 
 namespace dfly {
 
 using namespace testing;
 
 class SegmentLogStorageTest : public Test {
+};
+
+class SegmentLogStorageRecoveryTest : public Test {
+ protected:
+  void SetUp() override {
+    dir_ = "/tmp/segment_log_storage_recovery_test_" + std::to_string(getpid());
+    CleanDir();
+  }
+
+  void TearDown() override {
+    CleanDir();
+  }
+
+  void CleanDir() {
+    for (uint32_t i = 0; i < 20; i++) {
+      char buf[256];
+      snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+               static_cast<unsigned long>(i));
+      unlink(buf);
+    }
+    unlink((dir_ + "/manifest.json").c_str());
+    unlink((dir_ + "/manifest.json.tmp").c_str());
+    rmdir(dir_.c_str());
+  }
+
+  // Writes 'count' entries to a segment file using WalWriter.
+  void WriteSegment(uint32_t segment_id, uint32_t count, Term term = 1,
+                    LogIndex start_index = 1) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(segment_id));
+
+    WalWriter writer;
+    ASSERT_TRUE(writer.Open(buf));
+    for (uint32_t i = 0; i < count; i++) {
+      LogEntry entry;
+      entry.term = term;
+      entry.index = start_index + i;
+      entry.command = "cmd" + std::to_string(start_index + i);
+      writer.Append(entry);
+    }
+    ASSERT_TRUE(writer.Flush());
+    writer.Close();
+  }
+
+  // Creates a segment with 'count' valid entries followed by a partial write.
+  // Writes a header with a too-large size so the payload read fails.
+  void WriteSegmentWithCorruptedTail(uint32_t segment_id, uint32_t count) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(segment_id));
+
+    // Write valid entries.
+    WalWriter writer;
+    ASSERT_TRUE(writer.Open(buf));
+    for (uint32_t i = 0; i < count; i++) {
+      LogEntry entry;
+      entry.term = 1;
+      entry.index = i + 1;
+      entry.command = "good_" + std::to_string(i + 1);
+      writer.Append(entry);
+    }
+    ASSERT_TRUE(writer.Flush());
+
+    // Write a partial record: header with large size but no payload.
+    RecordHeader hdr;
+    hdr.index = count + 1;
+    hdr.term = 1;
+    hdr.size = 99999;  // larger than any real payload
+    hdr.crc32 = 0;
+    FILE* fp = fopen(buf, "ab");
+    ASSERT_NE(nullptr, fp);
+    fwrite(&hdr, sizeof(hdr), 1, fp);
+    fclose(fp);
+  }
+
+  std::string dir_;
 };
 
 TEST_F(SegmentLogStorageTest, Empty) {
@@ -113,6 +191,100 @@ TEST_F(SegmentLogStorageTest, WorksWithILogStoragePtr) {
   ASSERT_NE(nullptr, e);
   EXPECT_EQ("via-interface", e->command);
   EXPECT_EQ(1u, storage->LogSize());
+}
+
+// --- Recovery scan tests ---
+
+TEST_F(SegmentLogStorageRecoveryTest, OpenEmptyDir) {
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(0u, seg.LogSize());
+  EXPECT_EQ(0u, seg.LastIndex());
+  EXPECT_EQ(0u, seg.LastTerm());
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, DiscoverSingleSegment) {
+  WriteSegment(1, 100);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(100u, seg.LogSize());
+  EXPECT_EQ(100u, seg.LastIndex());
+
+  const LogEntry* e = seg.Get(50);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(50u, e->index);
+  EXPECT_EQ("cmd50", e->command);
+
+  // Last entry has higher term.
+  EXPECT_EQ("cmd100", seg.Get(100)->command);
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, DiscoverMultipleSegments) {
+  WriteSegment(1, 50, 1, 1);
+  WriteSegment(2, 30, 2, 51);
+  WriteSegment(3, 20, 3, 81);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(100u, seg.LogSize());
+  EXPECT_EQ(100u, seg.LastIndex());
+
+  // First entry from segment 1.
+  const LogEntry* e1 = seg.Get(1);
+  ASSERT_NE(nullptr, e1);
+  EXPECT_EQ(1u, e1->index);
+  EXPECT_EQ(1u, e1->term);
+  EXPECT_EQ("cmd1", e1->command);
+
+  // Entry from segment 2.
+  const LogEntry* e60 = seg.Get(60);
+  ASSERT_NE(nullptr, e60);
+  EXPECT_EQ(60u, e60->index);
+  EXPECT_EQ(2u, e60->term);
+  EXPECT_EQ("cmd60", e60->command);
+
+  // Last entry from segment 3.
+  const LogEntry* e100 = seg.Get(100);
+  ASSERT_NE(nullptr, e100);
+  EXPECT_EQ(100u, e100->index);
+  EXPECT_EQ(3u, e100->term);
+  EXPECT_EQ("cmd100", e100->command);
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, ScanCorruptedTail) {
+  WriteSegmentWithCorruptedTail(1, 50);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(50u, seg.LogSize());
+  EXPECT_EQ(50u, seg.LastIndex());
+
+  // All good entries should be present.
+  for (uint32_t i = 1; i <= 50; i++) {
+    const LogEntry* e = seg.Get(i);
+    ASSERT_NE(nullptr, e) << "missing entry " << i;
+    EXPECT_EQ("good_" + std::to_string(i), e->command);
+  }
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, DiscoverSegmentsOutOfOrder) {
+  // Write segments in non-sequential order to test sorting.
+  WriteSegment(3, 20, 3, 81);
+  WriteSegment(1, 50, 1, 1);
+  WriteSegment(2, 30, 2, 51);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(100u, seg.LogSize());
+
+  // Verify entries are in order (segment 1, then 2, then 3).
+  EXPECT_EQ("cmd1", seg.Get(1)->command);
+  EXPECT_EQ("cmd51", seg.Get(51)->command);
+  EXPECT_EQ("cmd81", seg.Get(81)->command);
+  EXPECT_EQ(1u, seg.Get(1)->term);
+  EXPECT_EQ(2u, seg.Get(51)->term);
+  EXPECT_EQ(3u, seg.Get(81)->term);
 }
 
 }  // namespace dfly
