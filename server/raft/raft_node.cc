@@ -403,6 +403,7 @@ ApplyResult RaftNode::ReplicateLog() {
     req.entries = log_storage_->GetRange(1);
   }
 
+  last_peer_ids_ = peer_ids;
   peer_last_log_index_.resize(peer_ids.size());
   for (size_t i = 0; i < peer_ids.size(); i++) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
@@ -448,14 +449,12 @@ void RaftNode::AdvanceCommitIndex() {
 }
 
 void RaftNode::AdvanceCommitIndexJoint() {
-  auto peer_ids = GetPeerIds();
-
   auto calc_config_commit = [&](const ClusterConfig& config) -> LogIndex {
     std::vector<LogIndex> indexes;
     indexes.push_back(log_storage_->LastIndex());
 
-    for (size_t i = 0; i < peer_ids.size() && i < peer_last_log_index_.size(); i++) {
-      if (config.voters.count(peer_ids[i]) > 0) {
+    for (size_t i = 0; i < last_peer_ids_.size() && i < peer_last_log_index_.size(); i++) {
+      if (config.voters.count(last_peer_ids_[i]) > 0) {
         indexes.push_back(peer_last_log_index_[i]);
       }
     }

@@ -233,6 +233,7 @@ class RaftNode {
   LogIndex last_applied_ = 0;
   LogIndex last_snapshot_index_ = 0;
   Term last_snapshot_term_ = 0;
+  std::vector<NodeId> last_peer_ids_;
   std::vector<LogIndex> peer_last_log_index_;
   std::atomic<bool> shutdown_{false};
   util::fb2::Fiber heartbeat_fiber_;

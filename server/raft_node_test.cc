@@ -1510,6 +1510,104 @@ TEST_F(RaftNodeTest, JointConsensusFullTransition) {
   EXPECT_EQ(1u, n1.cluster_config().voters.count("D"));
 }
 
+// Tests dual-majority commit rule during joint consensus.
+// With old config {B, C} (3 members including leader A, majority=2)
+// and new config {B, C, D, E} (5 members including A, majority=3),
+// verifies that commit requires BOTH majorities.
+class JointConsensusDualMajorityTest : public RaftNodeTest {
+ protected:
+  // Sets up a 5-node cluster with A as leader, voters {B, C}.
+  // Returns the target config that adds D, E: {B, C, D, E}.
+  struct Cluster {
+    LocalTransport transport;
+    CommandLog log_a, log_b, log_c, log_d, log_e;
+    TestStateMachine sm;
+    RaftNode a{"A"}, b{"B"}, c{"C"}, d{"D"}, e{"E"};
+    ClusterConfig target;
+  };
+
+  void SetUpCluster(Cluster& cl) {
+    cl.a.SetLogStorage(&cl.log_a);
+    cl.a.SetStateMachine(&cl.sm);
+    cl.b.SetLogStorage(&cl.log_b);
+    cl.c.SetLogStorage(&cl.log_c);
+    cl.d.SetLogStorage(&cl.log_d);
+    cl.e.SetLogStorage(&cl.log_e);
+
+    cl.transport.RegisterNode("A", &cl.a);
+    cl.transport.RegisterNode("B", &cl.b);
+    cl.transport.RegisterNode("C", &cl.c);
+    cl.transport.RegisterNode("D", &cl.d);
+    cl.transport.RegisterNode("E", &cl.e);
+    cl.a.SetTransport(&cl.transport);
+    cl.a.AddPeer("B");
+    cl.a.AddPeer("C");
+
+    // Elect A as leader
+    ElectionResult election = cl.a.StartElection();
+    ASSERT_EQ(RaftRole::Leader, cl.a.role());
+    ASSERT_EQ(3u, election.votes_received);
+
+    // Begin config change to add D, E
+    cl.target.version = 1;
+    cl.target.voters = {"B", "C", "D", "E"};
+    ASSERT_TRUE(cl.a.BeginConfigChange(cl.target));
+    ASSERT_EQ(ConfigState::kStable, cl.a.config_state());
+
+    // Commit first config entry → enter Joint
+    // All peers (B, C) have log storage → they replicate
+    ASSERT_EQ(1u, cl.log_a.LogSize());
+    cl.a.ReplicateLog();
+    ASSERT_TRUE(cl.a.IsJointConsensus());
+    ASSERT_EQ(ConfigState::kJoint, cl.a.config_state());
+    ASSERT_EQ(1u, cl.a.commit_index());
+    ASSERT_EQ(1u, cl.a.last_applied());
+
+    // Second BeginConfigChange appends final entry
+    ASSERT_TRUE(cl.a.BeginConfigChange(cl.target));
+    ASSERT_EQ(2u, cl.log_a.LogSize());
+  }
+};
+
+TEST_F(JointConsensusDualMajorityTest, BothMajoritiesPass) {
+  Cluster cl;
+  SetUpCluster(cl);
+  // All peers have log_storage → both majorities satisfied → transition to Stable
+  cl.a.ReplicateLog();
+  EXPECT_EQ(ConfigState::kStable, cl.a.config_state())
+      << "both majorities pass → final config applied";
+  EXPECT_EQ(2u, cl.a.commit_index()) << "commit should advance with both majorities";
+}
+
+TEST_F(JointConsensusDualMajorityTest, OldPassNewFail) {
+  Cluster cl;
+  SetUpCluster(cl);
+  // C, D, E lose log storage → only B replicates (besides leader)
+  cl.c.SetLogStorage(nullptr);
+  cl.d.SetLogStorage(nullptr);
+  cl.e.SetLogStorage(nullptr);
+
+  // Old config {B, C}: A replicates + B replicates = 2/3 ✓
+  // New config {B, C, D, E}: A + B = 2/5 ✗ (need 3/5)
+  cl.a.ReplicateLog();
+  EXPECT_TRUE(cl.a.IsJointConsensus());
+  EXPECT_EQ(1u, cl.a.commit_index()) << "commit blocked: new config lacks majority";
+}
+
+TEST_F(JointConsensusDualMajorityTest, OldFailNewPass) {
+  Cluster cl;
+  SetUpCluster(cl);
+  // B, C lose log storage → only D, E replicate (besides leader)
+  cl.b.SetLogStorage(nullptr);
+  cl.c.SetLogStorage(nullptr);
+
+  // Old config {B, C}: A replicates alone = 1/3 ✗ (need 2/3)
+  // New config {B, C, D, E}: A + D + E = 3/5 ✓ (need 3/5)
+  cl.a.ReplicateLog();
+  EXPECT_TRUE(cl.a.IsJointConsensus());
+  EXPECT_EQ(1u, cl.a.commit_index()) << "commit blocked: old config lacks majority";
+}
+
 // Verifies that BeginConfigChange is rejected when not leader.
 TEST_F(RaftNodeTest, JointConsensusNonLeaderRejected) {
   CommandLog log;
