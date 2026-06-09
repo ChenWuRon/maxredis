@@ -1435,4 +1435,92 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
   EXPECT_EQ(1u, n2.last_applied());
 }
 
+// ---------------------------------------------------------------------------
+// Joint Consensus: Stable → Joint → Stable
+//
+// Verifies the full membership change lifecycle:
+//   1. 3-node cluster (A: leader, B, C: followers) in Stable
+//   2. BeginConfigChange to add D → entry appended
+//   3. Entry committed → state transitions to Joint
+//   4. BeginConfigChange again → entry appended
+//   5. Entry committed → state transitions to Stable with new config
+// ---------------------------------------------------------------------------
+TEST_F(RaftNodeTest, JointConsensusFullTransition) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm;
+  RaftNode n1("A"), n2("B"), n3("C"), n4("D");
+  n1.SetLogStorage(&log_a);
+  n1.SetStateMachine(&sm);
+  n2.SetLogStorage(&log_b);
+  n3.SetLogStorage(&log_c);
+  n4.SetLogStorage(&log_d);
+
+  transport.RegisterNode("A", &n1);
+  transport.RegisterNode("B", &n2);
+  transport.RegisterNode("C", &n3);
+  transport.RegisterNode("D", &n4);
+  n1.SetTransport(&transport);
+  n1.AddPeer("B");
+  n1.AddPeer("C");
+
+  // Elect A as leader
+  ElectionResult election = n1.StartElection();
+  ASSERT_EQ(RaftRole::Leader, n1.role());
+  ASSERT_EQ(3u, election.votes_received);
+  EXPECT_EQ(ConfigState::kStable, n1.config_state());
+  EXPECT_EQ(2u, n1.cluster_config().voters.size());
+
+  // Step 1: Begin config change — add node D
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+
+  ASSERT_TRUE(n1.BeginConfigChange(target));
+  // State is still Stable (transition happens when entry is committed)
+  EXPECT_EQ(ConfigState::kStable, n1.config_state());
+  EXPECT_EQ(2u, n1.joint_config().old_config.voters.size());
+  EXPECT_EQ(3u, n1.joint_config().new_config.voters.size());
+
+  // Commit the first config entry — enter Joint
+  ASSERT_EQ(1u, log_a.LogSize());
+  ASSERT_EQ(1u, log_a.LastIndex());
+
+  n1.ReplicateLog();
+  EXPECT_EQ(1u, n1.commit_index()) << "commit_index should advance to 1";
+  EXPECT_EQ(1u, n1.last_applied()) << "last_applied should advance to 1";
+  EXPECT_TRUE(n1.IsJointConsensus());
+  EXPECT_EQ(ConfigState::kJoint, n1.config_state());
+
+  // Verify peers received the entry
+  EXPECT_EQ(1u, log_b.LogSize());
+  EXPECT_EQ(1u, log_c.LogSize());
+
+  // Step 2: Finalize with same target
+  ASSERT_TRUE(n1.BeginConfigChange(target));
+  EXPECT_EQ(ConfigState::kJoint, n1.config_state());
+  EXPECT_EQ(2u, log_a.LogSize());
+
+  // Commit the second config entry — enter Stable with new config
+  n1.ReplicateLog();
+  EXPECT_EQ(ConfigState::kStable, n1.config_state());
+  EXPECT_EQ(3u, n1.cluster_config().voters.size());
+  EXPECT_EQ(1u, n1.cluster_config().voters.count("B"));
+  EXPECT_EQ(1u, n1.cluster_config().voters.count("C"));
+  EXPECT_EQ(1u, n1.cluster_config().voters.count("D"));
+}
+
+// Verifies that BeginConfigChange is rejected when not leader.
+TEST_F(RaftNodeTest, JointConsensusNonLeaderRejected) {
+  CommandLog log;
+  RaftNode node("A");
+  node.SetLogStorage(&log);
+
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C"};
+
+  EXPECT_FALSE(node.BeginConfigChange(target));
+}
+
 }  // namespace dfly

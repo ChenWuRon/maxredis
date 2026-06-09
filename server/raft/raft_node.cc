@@ -8,6 +8,7 @@
 
 #include "base/logging.h"
 #include "server/raft/apply_progress.h"
+#include "server/raft/replicated_command.h"
 #include "server/raft/snapshot_loader.h"
 #include "server/state_machine/state_machine.h"
 
@@ -52,6 +53,48 @@ void RaftNode::SetStoragePath(std::string path) {
 RaftNode::~RaftNode() {
   StopHeartbeat();
   election_timer_.Stop();
+}
+
+std::vector<NodeId> RaftNode::GetPeerIds() const {
+  if (config_state_ == ConfigState::kJoint) {
+    std::unordered_set<NodeId> all;
+    all.insert(joint_config_.old_config.voters.begin(),
+               joint_config_.old_config.voters.end());
+    all.insert(joint_config_.new_config.voters.begin(),
+               joint_config_.new_config.voters.end());
+    return {all.begin(), all.end()};
+  }
+  return {cluster_config_.voters.begin(), cluster_config_.voters.end()};
+}
+
+bool RaftNode::BeginConfigChange(ClusterConfig target) {
+  if (role_ != RaftRole::Leader || !log_storage_)
+    return false;
+
+  if (config_state_ == ConfigState::kJoint) {
+    // Step 2: finalize — append the second config entry
+    if (target.voters != joint_config_.new_config.voters ||
+        target.learners != joint_config_.new_config.learners ||
+        target.version != joint_config_.new_config.version) {
+      return false;
+    }
+    ConfigChangeCommand cmd{target};
+    log_storage_->Append(LogEntry(term(), 0, cmd.Serialize()));
+    VLOG(1) << node_id_ << " BeginConfigChange step 2: append final config version="
+            << target.version;
+    return true;
+  }
+
+  // Step 1: store joint config and append entry (state changes when entry is applied)
+  joint_config_.old_config = cluster_config_;
+  joint_config_.new_config = target;
+
+  ConfigChangeCommand cmd{target};
+  log_storage_->Append(LogEntry(term(), 0, cmd.Serialize()));
+
+  VLOG(1) << node_id_ << " BeginConfigChange step 1: append joint config, target version="
+          << target.version;
+  return true;
 }
 
 void RaftNode::SetRole(RaftRole new_role) {
@@ -165,11 +208,24 @@ ElectionResult RaftNode::StartElection() {
   ElectionResult result;
   result.votes_received = vote_count_;
 
-  for (const auto& peer_id : cluster_config_.voters) {
+  if (config_state_ == ConfigState::kJoint) {
+    old_config_votes_ = (joint_config_.old_config.voters.empty() ||
+                         joint_config_.old_config.voters.count(node_id_) > 0) ? 1 : 0;
+    new_config_votes_ = (joint_config_.new_config.voters.empty() ||
+                         joint_config_.new_config.voters.count(node_id_) > 0) ? 1 : 0;
+  }
+
+  for (const auto& peer_id : GetPeerIds()) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     VoteResponse rsp = transport_->SendVoteRequest(peer_id, request);
     if (rsp.vote_granted) {
       result.votes_received++;
+      if (config_state_ == ConfigState::kJoint) {
+        if (joint_config_.old_config.voters.count(peer_id) > 0)
+          old_config_votes_++;
+        if (joint_config_.new_config.voters.count(peer_id) > 0)
+          new_config_votes_++;
+      }
       VLOG(1) << node_id_ << " received VoteGranted from " << peer_id;
     } else {
       result.votes_rejected++;
@@ -184,6 +240,25 @@ ElectionResult RaftNode::StartElection() {
 }
 
 bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
+  if (config_state_ == ConfigState::kJoint) {
+    size_t old_total = joint_config_.old_config.voters.size() + 1;
+    size_t new_total = joint_config_.new_config.voters.size() + 1;
+    size_t old_majority = old_total / 2 + 1;
+    size_t new_majority = new_total / 2 + 1;
+
+    VLOG(1) << node_id_ << " TryBecomeLeader (joint): old_votes=" << old_config_votes_
+            << "/" << old_majority << " new_votes=" << new_config_votes_
+            << "/" << new_majority;
+
+    if (old_config_votes_ >= old_majority && new_config_votes_ >= new_majority) {
+      VLOG(1) << node_id_ << " election won (joint) term=" << storage_.current_term();
+      BecomeLeader();
+      return true;
+    }
+    VLOG(1) << node_id_ << " election not won (joint): " << result.votes_received;
+    return false;
+  }
+
   size_t total_nodes = cluster_config_.voters.size() + 1;
   size_t majority = total_nodes / 2 + 1;
 
@@ -220,7 +295,7 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 
 void RaftNode::SendHeartbeatToPeers() {
   HeartbeatRequest req{storage_.current_term(), node_id_};
-  for (const auto& peer_id : cluster_config_.voters) {
+  for (const auto& peer_id : GetPeerIds()) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     transport_->SendHeartbeat(peer_id, req);
   }
@@ -306,10 +381,12 @@ ApplyResult RaftNode::ReplicateLog() {
     return {};
 
   size_t log_size = log_storage_->LogSize();
+  auto peer_ids = GetPeerIds();
   VLOG(1) << node_id_ << " ReplicateLog: " << log_size << " entries, "
-          << cluster_config_.voters.size() << " peers";
+          << peer_ids.size() << " peers"
+          << (IsJointConsensus() ? " (joint)" : "");
 
-  if (cluster_config_.voters.empty()) {
+  if (peer_ids.empty()) {
     if (commit_index_ < log_storage_->LastIndex()) {
       commit_index_ = log_storage_->LastIndex();
       VLOG(1) << node_id_ << " fast commit: commit_index=" << commit_index_;
@@ -326,11 +403,10 @@ ApplyResult RaftNode::ReplicateLog() {
     req.entries = log_storage_->GetRange(1);
   }
 
-  std::vector<NodeId> ids{cluster_config_.voters.begin(), cluster_config_.voters.end()};
-  peer_last_log_index_.resize(ids.size());
-  for (size_t i = 0; i < ids.size(); i++) {
+  peer_last_log_index_.resize(peer_ids.size());
+  for (size_t i = 0; i < peer_ids.size(); i++) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
-    AppendEntriesResponse rsp = transport_->SendAppendEntries(ids[i], req);
+    AppendEntriesResponse rsp = transport_->SendAppendEntries(peer_ids[i], req);
     peer_last_log_index_[i] = rsp.last_log_index;
   }
 
@@ -341,6 +417,11 @@ ApplyResult RaftNode::ReplicateLog() {
 void RaftNode::AdvanceCommitIndex() {
   if (!log_storage_)
     return;
+
+  if (config_state_ == ConfigState::kJoint) {
+    AdvanceCommitIndexJoint();
+    return;
+  }
 
   std::vector<LogIndex> indexes;
   indexes.push_back(log_storage_->LastIndex());
@@ -362,6 +443,43 @@ void RaftNode::AdvanceCommitIndex() {
 
   if (candidate > commit_index_) {
     VLOG(1) << node_id_ << " commit_index " << commit_index_ << " -> " << candidate;
+    commit_index_ = candidate;
+  }
+}
+
+void RaftNode::AdvanceCommitIndexJoint() {
+  auto peer_ids = GetPeerIds();
+
+  auto calc_config_commit = [&](const ClusterConfig& config) -> LogIndex {
+    std::vector<LogIndex> indexes;
+    indexes.push_back(log_storage_->LastIndex());
+
+    for (size_t i = 0; i < peer_ids.size() && i < peer_last_log_index_.size(); i++) {
+      if (config.voters.count(peer_ids[i]) > 0) {
+        indexes.push_back(peer_last_log_index_[i]);
+      }
+    }
+
+    if (indexes.empty())
+      return 0;
+
+    std::sort(indexes.rbegin(), indexes.rend());
+    size_t total = config.voters.size() + 1;
+    size_t majority = total / 2 + 1;
+
+    if (majority - 1 >= indexes.size())
+      return 0;
+
+    return indexes[majority - 1];
+  };
+
+  LogIndex old_commit = calc_config_commit(joint_config_.old_config);
+  LogIndex new_commit = calc_config_commit(joint_config_.new_config);
+  LogIndex candidate = std::min(old_commit, new_commit);
+
+  if (candidate > commit_index_) {
+    VLOG(1) << node_id_ << " commit_index " << commit_index_ << " -> " << candidate
+            << " (joint old=" << old_commit << " new=" << new_commit << ")";
     commit_index_ = candidate;
   }
 }
@@ -400,6 +518,28 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
     for (const auto& entry : entries) {
       VLOG(1) << node_id_ << " apply[" << entry.index << "] term=" << entry.term
               << " cmd=" << entry.command;
+      if (entry.command.find("CONFIG_CHANGE") == 0) {
+        ConfigChangeCommand cmd = ConfigChangeCommand::Deserialize(entry.command);
+        if (config_state_ == ConfigState::kJoint) {
+          // Step 2: finalize — transition to stable with new config
+          cluster_config_ = cmd.target;
+          joint_config_ = JointConfig{};
+          config_state_ = ConfigState::kStable;
+          peer_manager_.SetConfig(&cluster_config_);
+          VLOG(1) << node_id_ << " config change step 2: entering Stable, config version="
+                  << cluster_config_.version << " voters=" << cluster_config_.voters.size();
+        } else {
+          // Step 1: enter joint consensus
+          joint_config_.old_config = cluster_config_;
+          joint_config_.new_config = cmd.target;
+          config_state_ = ConfigState::kJoint;
+          VLOG(1) << node_id_ << " config change step 1: entering Joint, old voters="
+                  << joint_config_.old_config.voters.size()
+                  << " new voters=" << joint_config_.new_config.voters.size();
+        }
+        last_applied_ = entry.index;
+        continue;
+      }
       result = state_machine_->ApplyLogEntry(entry);
       last_applied_ = entry.index;
     }

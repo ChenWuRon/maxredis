@@ -93,6 +93,23 @@ class RaftNode {
     return cluster_config_.voters.erase(id) > 0;
   }
 
+  // --- Joint Consensus ---
+
+  // Initiates a membership change via joint consensus.
+  // Must be called on the Leader. Appends a CONFIG_CHANGE log entry.
+  // When the entry is committed, state transitions occur:
+  //   Stable -> Joint (step 1) -> Stable with target (step 2).
+  // The second call (with the same target) finalizes the transition.
+  bool BeginConfigChange(ClusterConfig target);
+
+  const JointConfig& joint_config() const {
+    return joint_config_;
+  }
+
+  bool IsJointConsensus() const {
+    return config_state_ == ConfigState::kJoint;
+  }
+
   const PeerManager& peer_manager() const {
     return peer_manager_;
   }
@@ -192,6 +209,10 @@ class RaftNode {
  private:
   void HeartbeatLoop();
 
+  std::vector<NodeId> GetPeerIds() const;
+  void AdvanceCommitIndexJoint();
+
+  JointConfig joint_config_;
   ClusterConfig cluster_config_;
   ConfigState config_state_ = ConfigState::kStable;
   RaftStorage storage_;
@@ -200,6 +221,8 @@ class RaftNode {
   RaftRole role_ = RaftRole::Follower;
   Term leader_term_ = 0;
   uint32_t vote_count_ = 0;
+  uint32_t old_config_votes_ = 0;
+  uint32_t new_config_votes_ = 0;
 
   Transport* transport_ = nullptr;
   PeerManager peer_manager_{&cluster_config_};
