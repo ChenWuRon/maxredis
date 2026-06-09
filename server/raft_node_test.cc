@@ -1088,6 +1088,65 @@ TEST_F(RaftNodeTest, ReplicatedCommandRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
+// Role transition tests: verify full Follower→Candidate→Leader→Follower cycle
+// with current_term, voted_for, and role all checked per transition.
+// ---------------------------------------------------------------------------
+
+// Follower receives election timeout → Candidate.
+// Verified: role, term incremented, voted_for=self, vote_count=1.
+TEST_F(RaftNodeTest, FollowerToCandidate) {
+  RaftNode node("n1");
+  node.BecomeFollower(5);
+  EXPECT_EQ(RaftRole::Follower, node.role());
+  EXPECT_EQ(5u, node.term());
+  EXPECT_TRUE(node.voted_for().empty());
+  EXPECT_EQ(0u, node.vote_count());
+
+  // Election timeout triggers transition.
+  node.OnElectionTimeout();
+
+  EXPECT_EQ(RaftRole::Candidate, node.role());
+  EXPECT_EQ(6u, node.term());
+  EXPECT_EQ("n1", node.voted_for());
+  EXPECT_EQ(1u, node.vote_count());
+}
+
+// Candidate wins election (single-node self-vote) → Leader.
+// Verified: role, term, leader_term.
+TEST_F(RaftNodeTest, CandidateToLeader) {
+  RaftNode node("n1");
+  node.BecomeFollower(0);
+  node.StartElection();
+
+  EXPECT_EQ(RaftRole::Leader, node.role());
+  EXPECT_EQ(1u, node.term());
+  EXPECT_EQ(1u, node.leader_term());
+  EXPECT_EQ("n1", node.voted_for());
+}
+
+// Leader receives heartbeat with higher term → Follower.
+// Verified: role, term updated, voted_for cleared, vote_count reset.
+TEST_F(RaftNodeTest, LeaderStepDown) {
+  RaftNode node("n1");
+  node.BecomeCandidate();
+  node.BecomeLeader();
+  EXPECT_EQ(RaftRole::Leader, node.role());
+  EXPECT_EQ(1u, node.term());
+  EXPECT_EQ(1u, node.leader_term());
+
+  // Receive a heartbeat from a leader with higher term.
+  HeartbeatRequest req{5, "n2"};
+  HeartbeatResponse rsp = node.OnHeartbeat(req);
+
+  EXPECT_TRUE(rsp.success);
+  EXPECT_EQ(RaftRole::Follower, node.role());
+  EXPECT_EQ(5u, node.term());
+  EXPECT_EQ(0u, node.leader_term());
+  EXPECT_TRUE(node.voted_for().empty());
+  EXPECT_EQ(0u, node.vote_count());
+}
+
+// ---------------------------------------------------------------------------
 // Cluster tests: 3-node cluster communicating through Transport abstraction.
 // ---------------------------------------------------------------------------
 
