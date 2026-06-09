@@ -386,22 +386,27 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
   if (!state_machine_ || !log_storage_)
     return result;
 
+  constexpr size_t kBatchSize = 128;
   LogIndex prev = last_applied_;
+
   while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
-    last_applied_++;
-    const LogEntry* entry = log_storage_->Get(last_applied_);
-    if (!entry) {
-      LOG(WARNING) << node_id_ << " apply[" << last_applied_ << "]: entry not found";
-      last_applied_--;
+    LogIndex start = last_applied_ + 1;
+    size_t limit = std::min<size_t>(kBatchSize, commit_index_ - last_applied_);
+
+    auto entries = log_storage_->GetRange(start, limit);
+    if (entries.empty())
       break;
+
+    for (const auto& entry : entries) {
+      VLOG(1) << node_id_ << " apply[" << entry.index << "] term=" << entry.term
+              << " cmd=" << entry.command;
+      result = state_machine_->ApplyLogEntry(entry);
+      last_applied_ = entry.index;
     }
-    VLOG(1) << node_id_ << " apply[" << last_applied_ << "] term=" << entry->term
-            << " cmd=" << entry->command;
-    result = state_machine_->ApplyLogEntry(*entry);
-  }
-  if (last_applied_ > prev) {
+
     apply_progress_.Update(last_applied_);
   }
+
   return result;
 }
 

@@ -577,4 +577,106 @@ TEST_F(RaftApplyRecoveryTest, BootstrapWithSnapshotNoSnapshotDir) {
   EXPECT_EQ(0u, kv.DbSize(0));
 }
 
+// --- Delta replay after snapshot recovery ---
+
+TEST_F(RaftApplyRecoveryTest, DeltaReplayAfterSnapshot) {
+  // Setup: snapshot at 1000, WAL has 2000 entries.
+  // After recovery, only entries 1001..2000 should be replayed (1000 entries).
+  WriteSnapshotMeta(1000, 5);
+  WriteSnapshotBin({{"k_snap", "v_snap", 0}});
+
+  CommandLog log;
+  PopulateLog(log, 2000);
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+  node.ReplayUnappliedLogs();
+
+  // Verify snapshot data is present.
+  EXPECT_EQ("v_snap", kv.Get(0, "k_snap").value());
+
+  // Only entries 1001..2000 should have been replayed (1000 entries).
+  // After replay, last_applied advances to 2000.
+  EXPECT_EQ(2000u, node.last_applied());
+  EXPECT_EQ(1000u, kv.applied.size());
+
+  // Verify first and last replayed entries.
+  EXPECT_EQ("v1001", kv.Get(0, "k1001").value());
+  EXPECT_EQ("v2000", kv.Get(0, "k2000").value());
+
+  // Entries before the snapshot should NOT be present.
+  EXPECT_FALSE(kv.Get(0, "k999").ok());
+}
+
+TEST_F(RaftApplyRecoveryTest, DeltaReplayOnlyUnappliedPortion) {
+  // 1500 entries in WAL, snapshot at 500, apply.meta at 300.
+  // SetStoragePath: last_applied = max(300, 500) = 500.
+  // Replay should cover entries 501..1500 (1000 entries).
+  WriteApplyMeta(dir_, 300);
+  WriteSnapshotMeta(500, 3);
+  WriteSnapshotBin({{"k_snap", "v_snap", 0}});
+
+  CommandLog log;
+  PopulateLog(log, 1500);
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+
+  EXPECT_EQ(500u, node.last_applied());
+  EXPECT_EQ(500u, node.last_snapshot_index());
+
+  node.ReplayUnappliedLogs();
+  EXPECT_EQ(1500u, node.last_applied());
+  EXPECT_EQ(1000u, kv.applied.size());  // 501..1500
+  EXPECT_EQ("v1500", kv.Get(0, "k1500").value());
+}
+
+TEST_F(RaftApplyRecoveryTest, DeltaReplayNothingToReplay) {
+  // WAL fully covered by snapshot.
+  WriteSnapshotMeta(2000, 7);
+  WriteSnapshotBin({});
+
+  CommandLog log;
+  PopulateLog(log, 500);
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+  node.ReplayUnappliedLogs();
+
+  // Everything is before the snapshot — nothing to replay.
+  EXPECT_EQ(2000u, node.last_applied());
+  EXPECT_EQ(0u, kv.applied.size());
+}
+
+TEST_F(RaftApplyRecoveryTest, DeltaReplayFullWalAfterSnapshot) {
+  // WAL starts after the snapshot index.
+  WriteSnapshotMeta(3000, 10);
+  WriteSnapshotBin({{"k_old", "v_old", 0}});
+
+  CommandLog log;
+  PopulateLog(log, 1000);
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+  node.ReplayUnappliedLogs();
+
+  // last_applied was 3000 after snapshot, log has 1000 entries (indices 1..1000).
+  // All log entries are before the snapshot → nothing replayed.
+  EXPECT_EQ(3000u, node.last_applied());
+  EXPECT_EQ(0u, kv.applied.size());
+  EXPECT_EQ("v_old", kv.Get(0, "k_old").value());
+}
+
 }  // namespace dfly
