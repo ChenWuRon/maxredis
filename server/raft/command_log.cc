@@ -15,11 +15,22 @@ CommandLog::CommandLog() {
 }
 
 size_t CommandLog::LogSize() const {
-  return entries_.size() - 1;
+  if (entries_.size() <= 1)
+    return 0;
+  return LastIndex() - FirstIndex() + 1;
+}
+
+LogIndex CommandLog::FirstIndex() const {
+  if (entries_.size() <= 1)
+    return 0;
+  LogIndex first = base_index_ + 1;
+  return (first <= LastIndex()) ? first : 0;
 }
 
 LogIndex CommandLog::LastIndex() const {
-  return entries_.size() - 1;
+  if (entries_.size() <= 1)
+    return 0;
+  return base_index_ + entries_.size() - 1;
 }
 
 Term CommandLog::LastTerm() const {
@@ -29,45 +40,77 @@ Term CommandLog::LastTerm() const {
 }
 
 const LogEntry* CommandLog::Get(LogIndex index) const {
-  if (index >= entries_.size())
+  if (index < base_index_ || index > LastIndex())
     return nullptr;
-  return &entries_[index];
+  return &entries_[index - base_index_];
 }
 
 LogIndex CommandLog::Append(LogEntry entry) {
-  entry.index = entries_.size();
+  entry.index = LastIndex() + 1;
   entries_.push_back(std::move(entry));
   return entry.index;
 }
 
 std::vector<LogEntry> CommandLog::GetRange(LogIndex start, size_t limit) const {
-  if (start > LastIndex())
+  if (start < FirstIndex() || start > LastIndex())
     return {};
 
-  DCHECK_GE(start, 1u);
+  size_t physical_start = start - base_index_;
+  DCHECK_GE(physical_start, 1u);
   size_t end = (limit == 0) ? entries_.size()
-                            : std::min(entries_.size(), size_t(start + limit));
+                            : std::min(entries_.size(), physical_start + limit);
   std::vector<LogEntry> result;
-  result.reserve(end - start);
-  for (size_t i = start; i < end; i++) {
+  result.reserve(end - physical_start);
+  for (size_t i = physical_start; i < end; i++) {
     result.push_back(entries_[i]);
   }
   return result;
 }
 
 void CommandLog::TruncateFrom(LogIndex new_last) {
-  DCHECK_LT(new_last, entries_.size());
-  entries_.resize(new_last + 1);  // +1 for sentinel
+  if (new_last <= base_index_) {
+    entries_.resize(1);
+    return;
+  }
+  size_t physical = new_last - base_index_;
+  DCHECK_LT(physical, entries_.size());
+  entries_.resize(physical + 1);  // +1 for sentinel
+}
+
+bool CommandLog::CompactUpTo(LogIndex index) {
+  if (index <= base_index_)
+    return true;
+
+  if (index >= LastIndex()) {
+    base_index_ = index;
+    entries_.resize(1);
+    return true;
+  }
+
+  // Remove entries [1 .. index - base_index_] and update base_index_.
+  // Physical index of the first entry to keep:
+  size_t keep_from = index - base_index_ + 1;
+  if (keep_from < entries_.size()) {
+    // Shift remaining entries to start after sentinel.
+    std::move(entries_.begin() + keep_from, entries_.end(),
+              entries_.begin() + 1);
+    entries_.resize(entries_.size() - keep_from + 1);
+  } else {
+    entries_.resize(1);
+  }
+  base_index_ = index;
+  return true;
 }
 
 void CommandLog::Clear() {
+  base_index_ = 0;
   entries_.resize(1);  // keep sentinel
 }
 
 void CommandLog::AppendLog(const std::vector<LogEntry>& entries) {
   for (const auto& e : entries) {
     LogEntry copy = e;
-    copy.index = entries_.size();
+    copy.index = LastIndex() + 1;
     entries_.push_back(std::move(copy));
   }
 }

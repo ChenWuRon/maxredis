@@ -33,6 +33,7 @@
 #include "server/raft/raft_storage.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/snapshot_receiver.h"
+#include "server/raft/snapshot_sender.h"
 #include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/state_machine/state_machine.h"
@@ -179,6 +180,20 @@ class RaftNode {
     snapshot_receiver_ = receiver;
   }
 
+  void SetSnapshotDir(std::string dir) {
+    snapshot_dir_ = std::move(dir);
+  }
+
+  const std::string& snapshot_dir() const {
+    return snapshot_dir_;
+  }
+
+  // Returns true if a follower at |next_index| should receive a snapshot
+  // instead of AppendEntries.
+  static bool ShouldInstallSnapshot(LogIndex next_index, LogIndex snapshot_index) {
+    return snapshot_index > 0 && next_index <= snapshot_index;
+  }
+
   // Associates a state machine for applying committed entries.
   void SetStateMachine(IStateMachine* sm) {
     state_machine_ = sm;
@@ -258,6 +273,7 @@ class RaftNode {
   LogIndex last_applied_ = 0;
   LogIndex last_snapshot_index_ = 0;
   Term last_snapshot_term_ = 0;
+  std::string snapshot_dir_;
   std::vector<NodeId> last_peer_ids_;
   std::vector<LogIndex> peer_last_log_index_;
   std::atomic<bool> shutdown_{false};

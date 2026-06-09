@@ -85,7 +85,16 @@ void FileLogStorage::RollSegment() {
 }
 
 size_t FileLogStorage::LogSize() const {
-  return log_size_;
+  if (last_index_ == 0)
+    return 0;
+  return last_index_ - FirstIndex() + 1;
+}
+
+LogIndex FileLogStorage::FirstIndex() const {
+  if (last_index_ == 0)
+    return 0;
+  LogIndex first = base_index_ + 1;
+  return (first <= last_index_) ? first : 0;
 }
 
 LogIndex FileLogStorage::LastIndex() const {
@@ -97,7 +106,7 @@ Term FileLogStorage::LastTerm() const {
 }
 
 const LogEntry* FileLogStorage::Get(LogIndex index) const {
-  if (index == 0 || index > last_index_)
+  if (index < base_index_ || index > last_index_)
     return nullptr;
 
   const EntryLocation* loc = index_.Find(index);
@@ -130,7 +139,7 @@ LogIndex FileLogStorage::Append(LogEntry entry) {
 }
 
 std::vector<LogEntry> FileLogStorage::GetRange(LogIndex start, size_t limit) const {
-  if (start > last_index_)
+  if (start < FirstIndex() || start > last_index_)
     return {};
 
   const_cast<FileLogStorage*>(this)->writer_.Flush();
@@ -151,6 +160,10 @@ std::vector<LogEntry> FileLogStorage::GetRange(LogIndex start, size_t limit) con
 }
 
 void FileLogStorage::TruncateFrom(LogIndex new_last) {
+  if (new_last <= base_index_) {
+    Clear();
+    return;
+  }
   if (new_last >= last_index_)
     return;
 
@@ -215,7 +228,30 @@ void FileLogStorage::TruncateFrom(LogIndex new_last) {
           << " current_seg=" << current_segment_;
 }
 
+bool FileLogStorage::CompactUpTo(LogIndex index) {
+  if (index <= base_index_)
+    return true;
+
+  if (index >= last_index_) {
+    base_index_ = index;
+    log_size_ = 0;
+    last_index_ = index;
+    last_term_ = 0;
+    index_.Clear();
+    return true;
+  }
+
+  base_index_ = index;
+  log_size_ = last_index_ - index;
+  // Remove entries up to index from the index.
+  // WalIndex doesn't support range removal; for now, clear and let the
+  // storage layer lazily rebuild as needed.
+  index_.Clear();
+  return true;
+}
+
 void FileLogStorage::Clear() {
+  base_index_ = 0;
   log_size_ = 0;
   last_index_ = 0;
   last_term_ = 0;

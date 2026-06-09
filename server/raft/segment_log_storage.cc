@@ -160,7 +160,16 @@ void SegmentLogStorage::RebuildIndex(LogIndex index, Term term,
 }
 
 size_t SegmentLogStorage::LogSize() const {
+  if (entries_.size() <= 1)
+    return 0;
   return entries_.size() - 1;
+}
+
+LogIndex SegmentLogStorage::FirstIndex() const {
+  if (entries_.size() <= 1)
+    return 0;
+  LogIndex first = base_index_ + 1;
+  return (first <= last_index_) ? first : 0;
 }
 
 LogIndex SegmentLogStorage::LastIndex() const {
@@ -172,11 +181,12 @@ Term SegmentLogStorage::LastTerm() const {
 }
 
 const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
-  if (index > last_index_)
+  if (index < base_index_ || index > last_index_)
     return nullptr;
-  // Fast path: entries are typically 1-indexed contiguous.
-  if (index < entries_.size() && entries_[index].index == index)
-    return &entries_[index];
+  // Fast path: entries are typically contiguous at entries_[index - base_index_].
+  size_t physical = index - base_index_;
+  if (physical < entries_.size() && entries_[physical].index == index)
+    return &entries_[physical];
   // Slow path: scan for the entry (handles non-contiguous recovery).
   for (size_t i = 1; i < entries_.size(); i++) {
     if (entries_[i].index == index)
@@ -186,7 +196,7 @@ const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
 }
 
 LogIndex SegmentLogStorage::Append(LogEntry entry) {
-  entry.index = entries_.size();
+  entry.index = last_index_ + 1;
   last_index_ = entry.index;
   last_term_ = entry.term;
   entries_.push_back(std::move(entry));
@@ -194,29 +204,69 @@ LogIndex SegmentLogStorage::Append(LogEntry entry) {
 }
 
 std::vector<LogEntry> SegmentLogStorage::GetRange(LogIndex start, size_t limit) const {
-  if (start > LastIndex())
+  if (start < FirstIndex() || start > LastIndex())
     return {};
 
-  DCHECK_GE(start, 1u);
+  size_t physical = start - base_index_;
+  DCHECK_GE(physical, 1u);
   size_t end = (limit == 0) ? entries_.size()
-                            : std::min(entries_.size(), size_t(start + limit));
+                            : std::min(entries_.size(), physical + limit);
   std::vector<LogEntry> result;
-  result.reserve(end - start);
-  for (size_t i = start; i < end; i++) {
+  result.reserve(end - physical);
+  for (size_t i = physical; i < end; i++) {
     result.push_back(entries_[i]);
   }
   return result;
 }
 
 void SegmentLogStorage::TruncateFrom(LogIndex new_last) {
-  DCHECK_LT(new_last, entries_.size() - 1);
+  if (new_last <= base_index_) {
+    index_.Clear();
+    last_index_ = 0;
+    last_term_ = 0;
+    entries_.resize(1);
+    return;
+  }
+  size_t physical = new_last - base_index_;
+  DCHECK_LT(physical, entries_.size());
   index_.Truncate(new_last);
   last_index_ = new_last;
-  last_term_ = entries_[new_last].term;
-  entries_.resize(new_last + 1);
+  last_term_ = entries_[physical].term;
+  entries_.resize(physical + 1);
+}
+
+bool SegmentLogStorage::CompactUpTo(LogIndex index) {
+  if (index <= base_index_)
+    return true;
+
+  if (index >= last_index_) {
+    base_index_ = index;
+    index_.Clear();
+    last_index_ = index;
+    last_term_ = 0;
+    entries_.resize(1);
+    return true;
+  }
+
+  // Remove entries [1 .. index - base_index_] and update base_index_.
+  size_t keep_from = index - base_index_ + 1;
+  if (keep_from < entries_.size()) {
+    std::move(entries_.begin() + keep_from, entries_.end(),
+              entries_.begin() + 1);
+    entries_.resize(entries_.size() - keep_from + 1);
+  } else {
+    entries_.resize(1);
+  }
+  base_index_ = index;
+  // Update WalIndex: remove entries up to index.
+  // Since we shift entries, the WalIndex would be stale.
+  // For simplicity, clear and rely on lazy rebuild.
+  index_.Clear();
+  return true;
 }
 
 void SegmentLogStorage::Clear() {
+  base_index_ = 0;
   index_.Clear();
   last_index_ = 0;
   last_term_ = 0;

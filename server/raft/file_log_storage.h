@@ -44,12 +44,14 @@ class FileLogStorage : public ILogStorage {
   // --- ILogStorage ---
 
   size_t LogSize() const final;
+  LogIndex FirstIndex() const final;
   LogIndex LastIndex() const final;
   Term LastTerm() const final;
   const LogEntry* Get(LogIndex index) const final;
   LogIndex Append(LogEntry entry) final;
   std::vector<LogEntry> GetRange(LogIndex start, size_t limit = 0) const final;
   void TruncateFrom(LogIndex new_last) final;
+  bool CompactUpTo(LogIndex index) final;
   void Clear() final;
 
  private:
@@ -71,6 +73,7 @@ class FileLogStorage : public ILogStorage {
   // Cached read file handles per segment. Opened lazily.
   mutable std::vector<FILE*> read_files_;
 
+  LogIndex base_index_ = 0;
   size_t log_size_ = 0;
   LogIndex last_index_ = 0;
   Term last_term_ = 0;

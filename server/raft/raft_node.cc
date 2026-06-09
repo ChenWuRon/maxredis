@@ -38,6 +38,7 @@ void RaftNode::SetStoragePath(std::string path) {
   if (!path.empty() && path.back() != '/')
     path += '/';
 
+  snapshot_dir_ = path;
   storage_ = RaftStorage(path + "meta.json");
   storage_.Load();
 
@@ -418,7 +419,41 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
     return {storage_.current_term(), false};
   }
 
-  return snapshot_receiver_->HandleChunk(req);
+  InstallSnapshotResponse rsp = snapshot_receiver_->HandleChunk(req);
+
+  if (rsp.success && req.done) {
+    VLOG(1) << node_id_ << " snapshot complete: index=" << req.last_included_index
+            << " term=" << req.last_included_term;
+
+    // Load snapshot into state machine.
+    if (state_machine_) {
+      if (!state_machine_->LoadSnapshot(snapshot_receiver_->bin_path())) {
+        LOG(WARNING) << node_id_ << " failed to load snapshot from "
+                     << snapshot_receiver_->bin_path();
+        rsp.success = false;
+        return rsp;
+      }
+    }
+
+    // Update Raft state.
+    last_applied_ = req.last_included_index;
+    commit_index_ = std::max(commit_index_, req.last_included_index);
+    last_snapshot_index_ = req.last_included_index;
+    last_snapshot_term_ = req.last_included_term;
+    apply_progress_.Update(last_applied_);
+
+    // The snapshot covers all entries up to last_included_index.
+    // Clear the log since those entries are now superseded.
+    if (log_storage_) {
+      log_storage_->Clear();
+    }
+
+    VLOG(1) << node_id_ << " state restored: last_applied=" << last_applied_
+            << " commit_index=" << commit_index_
+            << " snapshot_index=" << last_snapshot_index_;
+  }
+
+  return rsp;
 }
 
 ApplyResult RaftNode::ReplicateLog() {
@@ -439,13 +474,40 @@ ApplyResult RaftNode::ReplicateLog() {
     return ApplyCommittedLogs();
   }
 
+  Term current_term = storage_.current_term();
+
+  // Check if any peers need a snapshot before sending AppendEntries.
+  bool any_snapshot_sent = false;
+  if (last_snapshot_index_ > 0) {
+    peer_last_log_index_.resize(peer_ids.size());
+    for (size_t i = 0; i < peer_ids.size(); i++) {
+      LogIndex next_index = peer_last_log_index_[i] + 1;
+      if (ShouldInstallSnapshot(next_index, last_snapshot_index_)) {
+        VLOG(1) << node_id_ << " sending snapshot to " << peer_ids[i]
+                << " next_index=" << next_index
+                << " snapshot_index=" << last_snapshot_index_;
+        std::string snapshot_path = snapshot_dir_ + "snapshot.bin";
+        SnapshotSender sender(snapshot_path, transport_);
+        bool ok = sender.SendSnapshot(peer_ids[i], current_term, node_id_,
+                                       last_snapshot_index_, last_snapshot_term_);
+        if (ok) {
+          peer_last_log_index_[i] = last_snapshot_index_;
+        }
+        any_snapshot_sent = true;
+      }
+    }
+  }
+
+  // Send AppendEntries to all peers.
   AppendEntriesRequest req;
-  req.term = storage_.current_term();
+  req.term = current_term;
   req.leader_id = node_id_;
   req.leader_commit = commit_index_;
 
   if (log_size > 0) {
-    req.entries = log_storage_->GetRange(1);
+    LogIndex first = log_storage_->FirstIndex();
+    if (first > 0)
+      req.entries = log_storage_->GetRange(first);
   }
 
   last_peer_ids_ = peer_ids;
@@ -453,7 +515,9 @@ ApplyResult RaftNode::ReplicateLog() {
   for (size_t i = 0; i < peer_ids.size(); i++) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     AppendEntriesResponse rsp = transport_->SendAppendEntries(peer_ids[i], req);
-    peer_last_log_index_[i] = rsp.last_log_index;
+    if (!any_snapshot_sent || rsp.last_log_index > peer_last_log_index_[i]) {
+      peer_last_log_index_[i] = rsp.last_log_index;
+    }
   }
 
   AdvanceCommitIndex();

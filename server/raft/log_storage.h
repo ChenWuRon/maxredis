@@ -21,6 +21,9 @@ class ILogStorage {
   // Returns the number of entries in the log (excluding sentinel).
   virtual size_t LogSize() const = 0;
 
+  // Returns the index of the first available entry (0 if empty).
+  virtual LogIndex FirstIndex() const = 0;
+
   // Returns the index of the last entry (0 if empty).
   virtual LogIndex LastIndex() const = 0;
 
@@ -28,7 +31,7 @@ class ILogStorage {
   virtual Term LastTerm() const = 0;
 
   // Returns a pointer to the entry at 'index', or nullptr if index is out of range.
-  // 1-based. 1 <= index <= LastIndex() for valid entries.
+  // 1-based. FirstIndex() <= index <= LastIndex() for valid entries.
   virtual const LogEntry* Get(LogIndex index) const = 0;
 
   // Appends a single entry. Automatically assigns entry.index = LastIndex() + 1.
@@ -42,6 +45,10 @@ class ILogStorage {
   // Removes all entries with index > new_last. new_last itself is preserved.
   // Used when a leader's log conflicts with our own.
   virtual void TruncateFrom(LogIndex new_last) = 0;
+
+  // Removes all entries with index <= index. FirstIndex() becomes index + 1.
+  // Used during log compaction to discard entries covered by a snapshot.
+  virtual bool CompactUpTo(LogIndex index) = 0;
 
   // Removes all entries. Retains only the sentinel.
   virtual void Clear() = 0;

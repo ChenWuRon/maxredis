@@ -23,6 +23,10 @@ class SnapshotReceiver {
   // Cleans up any stale snapshot.recv.tmp from a previous crash.
   void Init();
 
+  const std::string& bin_path() const {
+    return bin_path_;
+  }
+
   // Processes a single InstallSnapshot chunk.
   // Writes data to snapshot.recv.tmp at the given offset.
   // When request.done is true, fsyncs and renames to snapshot.bin.

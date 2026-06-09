@@ -6,16 +6,25 @@
 
 #include <gmock/gmock.h>
 
+#include <absl/container/flat_hash_map.h>
+
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "base/gtest.h"
+#include <fstream>
+
 #include "server/raft/command_log.h"
 #include "server/raft/command_encoder.h"
 #include "server/raft/local_transport.h"
 #include "server/raft/log_storage.h"
 #include "server/raft/replicated_command.h"
+#include "server/raft/snapshot_meta.h"
+#include "server/raft/snapshot_receiver.h"
+#include "server/raft/snapshot_sender.h"
+#include "server/raft/snapshot_writer.h"
 #include "server/raft/transport.h"
 #include "server/service/command_registry.h"
 #include "server/state_machine/state_machine.h"
@@ -725,21 +734,83 @@ TEST_F(RaftNodeTest, AppendEntriesStaleTermRejected) {
 // Test-only state machine that records applied commands.
 class TestStateMachine : public IStateMachine {
  public:
+  absl::flat_hash_map<std::string, std::string> store;
   std::vector<LogEntry> applied;
 
   ApplyResult Apply(const CommandId*, CmdArgList) override {
     return {ApplyOp::OK, 0};
   }
-  void Set(DbIndex, std::string_view, std::string_view) override {}
-  bool Del(DbIndex, std::string_view) override { return false; }
+  void Set(DbIndex, std::string_view key, std::string_view val) override {
+    store[std::string(key)] = std::string(val);
+  }
+  bool Del(DbIndex, std::string_view key) override {
+    return store.erase(std::string(key)) > 0;
+  }
   bool Expire(DbIndex, std::string_view, uint64_t) override { return false; }
-  OpResult<std::string> Get(DbIndex, std::string_view) override { return OpStatus::KEY_NOTFOUND; }
-  size_t DbSize(DbIndex) const override { return 0; }
+  OpResult<std::string> Get(DbIndex, std::string_view key) override {
+    auto it = store.find(std::string(key));
+    if (it != store.end())
+      return it->second;
+    return OpStatus::KEY_NOTFOUND;
+  }
+  size_t DbSize(DbIndex) const override { return store.size(); }
   void Schedule(DbIndex, std::string_view, std::function<void(EngineShard*)>) override {}
 
   ApplyResult ApplyLogEntry(const LogEntry& entry) override {
     applied.push_back(entry);
+    std::string_view cmd = entry.command;
+    auto space1 = cmd.find(' ');
+    if (space1 != std::string_view::npos) {
+      auto space2 = cmd.find(' ', space1 + 1);
+      if (space2 != std::string_view::npos) {
+        std::string_view key = cmd.substr(space1 + 1, space2 - space1 - 1);
+        std::string_view val = cmd.substr(space2 + 1);
+        Set(0, key, val);
+      }
+    }
     return {ApplyOp::OK, 1};
+  }
+
+  bool SaveSnapshot(const std::string& path) override {
+    SnapshotWriter writer(path);
+    if (!writer.Open())
+      return false;
+    for (const auto& [k, v] : store) {
+      if (!writer.Add({k, v, 0}))
+        return false;
+    }
+    return writer.Finalize(store.size());
+  }
+
+  bool LoadSnapshot(const std::string& path) override {
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp)
+      return false;
+    uint32_t magic;
+    if (fread(&magic, sizeof(magic), 1, fp) != 1 || magic != kSnapshotMagic) {
+      fclose(fp);
+      return false;
+    }
+    uint32_t num_records;
+    if (fread(&num_records, sizeof(num_records), 1, fp) != 1) {
+      fclose(fp);
+      return false;
+    }
+    store.clear();
+    for (uint32_t i = 0; i < num_records; i++) {
+      uint32_t key_len, value_len;
+      uint64_t expire_at;
+      if (fread(&key_len, sizeof(key_len), 1, fp) != 1) break;
+      if (fread(&value_len, sizeof(value_len), 1, fp) != 1) break;
+      if (fread(&expire_at, sizeof(expire_at), 1, fp) != 1) break;
+      std::string key(key_len, '\0');
+      if (key_len > 0 && fread(key.data(), 1, key_len, fp) != key_len) break;
+      std::string value(value_len, '\0');
+      if (value_len > 0 && fread(value.data(), 1, value_len, fp) != value_len) break;
+      store[std::move(key)] = std::move(value);
+    }
+    fclose(fp);
+    return true;
   }
 };
 
@@ -844,12 +915,14 @@ TEST_F(RaftNodeTest, FollowerAppliesViaLeaderCommit) {
 class MockLogStorage : public ILogStorage {
  public:
   MOCK_METHOD(size_t, LogSize, (), (const, override));
+  MOCK_METHOD(LogIndex, FirstIndex, (), (const, override));
   MOCK_METHOD(LogIndex, LastIndex, (), (const, override));
   MOCK_METHOD(Term, LastTerm, (), (const, override));
   MOCK_METHOD(const LogEntry*, Get, (LogIndex), (const, override));
   MOCK_METHOD(LogIndex, Append, (LogEntry), (override));
   MOCK_METHOD(std::vector<LogEntry>, GetRange, (LogIndex, size_t), (const, override));
   MOCK_METHOD(void, TruncateFrom, (LogIndex), (override));
+  MOCK_METHOD(bool, CompactUpTo, (LogIndex), (override));
   MOCK_METHOD(void, Clear, (), (override));
 
   // Convenience helper for GetRange with default limit.
@@ -874,6 +947,9 @@ TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
   node.SetTransport(&transport);
   node.AddPeer("F1");
   node.AddPeer("F2");
+
+  EXPECT_CALL(mock_storage, FirstIndex())
+      .WillOnce(Return(1));
 
   EXPECT_CALL(mock_storage, LastIndex())
       .WillOnce(Return(5));
@@ -1612,6 +1688,13 @@ class PartitionedTransport : public Transport {
     if (!inner_.HasNode(peer_id))
       return {0, false, 0};
     return inner_.SendAppendEntries(peer_id, request);
+  }
+
+  InstallSnapshotResponse SendInstallSnapshot(const NodeId& peer_id,
+                                               const InstallSnapshotRequest& request) override {
+    if (!inner_.HasNode(peer_id))
+      return {0, false};
+    return inner_.SendInstallSnapshot(peer_id, request);
   }
 
  private:

@@ -71,12 +71,14 @@ class TestLogStorage : public ILogStorage {
   Term last_term = 0;
 
   size_t LogSize() const override { return last_index; }
+  LogIndex FirstIndex() const override { return 0; }
   LogIndex LastIndex() const override { return last_index; }
   Term LastTerm() const override { return last_term; }
   const LogEntry* Get(LogIndex) const override { return nullptr; }
   LogIndex Append(LogEntry) override { return 0; }
   std::vector<LogEntry> GetRange(LogIndex, size_t) const override { return {}; }
   void TruncateFrom(LogIndex) override {}
+  bool CompactUpTo(LogIndex) override { return true; }
   void Clear() override {}
 };
 
