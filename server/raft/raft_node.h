@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "server/raft/append_entries_rpc.h"
+#include "server/raft/election_timer.h"
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/log_storage.h"
 #include "server/raft/raft_types.h"
@@ -65,6 +66,10 @@ class RaftNode {
 
   Term leader_term() const {
     return leader_term_;
+  }
+
+  const ElectionTimer& election_timer() const {
+    return election_timer_;
   }
 
   // Follower-side: processes an incoming Heartbeat from the leader.
@@ -128,6 +133,8 @@ class RaftNode {
   std::atomic<bool> shutdown_{false};
   util::fb2::Fiber heartbeat_fiber_;
   uint32_t heartbeat_interval_ms_ = 50;
+  ElectionTimer election_timer_;
+  bool election_started_ = false;
 };
 
 }  // namespace dfly

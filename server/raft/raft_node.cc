@@ -21,6 +21,13 @@ void RaftNode::BecomeFollower(Term term) {
   leader_term_ = 0;
   voted_for_.clear();
   vote_count_ = 0;
+
+  // Lazy-start the election timer on first use, then reset on every follower transition.
+  if (!election_started_) {
+    election_started_ = true;
+    election_timer_.Start([this] { StartElection(); });
+  }
+  election_timer_.Reset();
 }
 
 void RaftNode::OnElectionTimeout() {
@@ -34,12 +41,14 @@ void RaftNode::BecomeCandidate() {
   role_ = RaftRole::Candidate;
   voted_for_ = node_id_;
   vote_count_ = 1;
+  election_timer_.Deactivate();
 }
 
 void RaftNode::BecomeLeader() {
   DCHECK_EQ(role_, RaftRole::Candidate);
   role_ = RaftRole::Leader;
   leader_term_ = term_;
+  election_timer_.Deactivate();
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
@@ -129,6 +138,9 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
   if (request.term >= term_) {
     BecomeFollower(request.term);
   }
+
+  // Reset the election timer: we've heard from the leader.
+  election_timer_.Reset();
 
   return {term_, true};
 }
@@ -242,9 +254,16 @@ void RaftNode::AdvanceCommitIndex() {
     indexes.push_back(idx);
   }
 
+  if (indexes.empty())
+    return;
+
   std::sort(indexes.rbegin(), indexes.rend());
   size_t total = peers_.size() + 1;
   size_t majority = total / 2 + 1;
+
+  if (majority - 1 >= indexes.size())
+    return;
+
   LogIndex candidate = indexes[majority - 1];
 
   if (candidate > commit_index_) {
