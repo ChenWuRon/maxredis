@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <unordered_set>
 #include <vector>
 
 #include "server/raft/append_entries_rpc.h"
@@ -67,12 +68,29 @@ class RaftNode {
     transport_ = transport;
   }
 
+  const ClusterConfig& cluster_config() const {
+    return cluster_config_;
+  }
+
+  ConfigState config_state() const {
+    return config_state_;
+  }
+
+  void SetConfigState(ConfigState state) {
+    config_state_ = state;
+  }
+
+  void SetClusterConfig(ClusterConfig config) {
+    cluster_config_ = std::move(config);
+    peer_manager_.SetConfig(&cluster_config_);
+  }
+
   void AddPeer(const NodeId& id) {
-    peer_manager_.AddPeer(id);
+    cluster_config_.voters.insert(id);
   }
 
   bool RemovePeer(const NodeId& id) {
-    return peer_manager_.RemovePeer(id);
+    return cluster_config_.voters.erase(id) > 0;
   }
 
   const PeerManager& peer_manager() const {
@@ -174,6 +192,8 @@ class RaftNode {
  private:
   void HeartbeatLoop();
 
+  ClusterConfig cluster_config_;
+  ConfigState config_state_ = ConfigState::kStable;
   RaftStorage storage_;
   ApplyProgress apply_progress_;
   NodeId node_id_;
@@ -182,7 +202,7 @@ class RaftNode {
   uint32_t vote_count_ = 0;
 
   Transport* transport_ = nullptr;
-  PeerManager peer_manager_;
+  PeerManager peer_manager_{&cluster_config_};
 
   ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;

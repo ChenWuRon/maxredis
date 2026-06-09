@@ -1,37 +1,41 @@
 #include "server/raft/peer_manager.h"
 
-#include <algorithm>
-
 namespace dfly {
 
+PeerManager::PeerManager(ClusterConfig* config) : config_(config) {
+}
+
+void PeerManager::SetConfig(ClusterConfig* config) {
+  config_ = config;
+}
+
 void PeerManager::AddPeer(const NodeId& id) {
-  if (std::find(peer_ids_.begin(), peer_ids_.end(), id) == peer_ids_.end()) {
-    peer_ids_.push_back(id);
-  }
+  if (config_)
+    config_->voters.insert(id);
 }
 
 bool PeerManager::RemovePeer(const NodeId& id) {
-  auto it = std::find(peer_ids_.begin(), peer_ids_.end(), id);
-  if (it == peer_ids_.end())
+  if (!config_)
     return false;
-  peer_ids_.erase(it);
-  return true;
+  return config_->voters.erase(id) > 0;
 }
 
 bool PeerManager::HasPeer(const NodeId& id) const {
-  return std::find(peer_ids_.begin(), peer_ids_.end(), id) != peer_ids_.end();
+  return config_ && config_->voters.count(id) > 0;
 }
 
 size_t PeerManager::PeerCount() const {
-  return peer_ids_.size();
+  return config_ ? config_->voters.size() : 0;
 }
 
 size_t PeerManager::ClusterSize() const {
-  return peer_ids_.size() + 1;
+  return PeerCount() + 1;
 }
 
-const std::vector<NodeId>& PeerManager::GetPeerIds() const {
-  return peer_ids_;
+std::vector<NodeId> PeerManager::GetPeerIds() const {
+  if (!config_)
+    return {};
+  return {config_->voters.begin(), config_->voters.end()};
 }
 
 }  // namespace dfly

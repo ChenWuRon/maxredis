@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace dfly {
@@ -43,6 +44,22 @@ struct LogEntry {
   bool operator==(const LogEntry& o) const {
     return term == o.term && index == o.index && command == o.command;
   }
+};
+
+struct ClusterConfig {
+  uint64_t version = 0;
+  std::unordered_set<NodeId> voters;
+  std::unordered_set<NodeId> learners;
+};
+
+enum class ConfigState : uint8_t {
+  kStable = 0,
+  kJoint = 1,
+};
+
+struct JointConfig {
+  ClusterConfig old_config;
+  ClusterConfig new_config;
 };
 
 struct ElectionResult {

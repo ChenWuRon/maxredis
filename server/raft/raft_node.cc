@@ -165,7 +165,7 @@ ElectionResult RaftNode::StartElection() {
   ElectionResult result;
   result.votes_received = vote_count_;
 
-  for (const auto& peer_id : peer_manager_.GetPeerIds()) {
+  for (const auto& peer_id : cluster_config_.voters) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     VoteResponse rsp = transport_->SendVoteRequest(peer_id, request);
     if (rsp.vote_granted) {
@@ -184,7 +184,7 @@ ElectionResult RaftNode::StartElection() {
 }
 
 bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
-  size_t total_nodes = peer_manager_.ClusterSize();
+  size_t total_nodes = cluster_config_.voters.size() + 1;
   size_t majority = total_nodes / 2 + 1;
 
   VLOG(1) << node_id_ << " TryBecomeLeader: votes=" << result.votes_received
@@ -220,7 +220,7 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 
 void RaftNode::SendHeartbeatToPeers() {
   HeartbeatRequest req{storage_.current_term(), node_id_};
-  for (const auto& peer_id : peer_manager_.GetPeerIds()) {
+  for (const auto& peer_id : cluster_config_.voters) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     transport_->SendHeartbeat(peer_id, req);
   }
@@ -307,9 +307,9 @@ ApplyResult RaftNode::ReplicateLog() {
 
   size_t log_size = log_storage_->LogSize();
   VLOG(1) << node_id_ << " ReplicateLog: " << log_size << " entries, "
-          << peer_manager_.PeerCount() << " peers";
+          << cluster_config_.voters.size() << " peers";
 
-  if (peer_manager_.PeerCount() == 0) {
+  if (cluster_config_.voters.empty()) {
     if (commit_index_ < log_storage_->LastIndex()) {
       commit_index_ = log_storage_->LastIndex();
       VLOG(1) << node_id_ << " fast commit: commit_index=" << commit_index_;
@@ -326,7 +326,7 @@ ApplyResult RaftNode::ReplicateLog() {
     req.entries = log_storage_->GetRange(1);
   }
 
-  auto ids = peer_manager_.GetPeerIds();
+  std::vector<NodeId> ids{cluster_config_.voters.begin(), cluster_config_.voters.end()};
   peer_last_log_index_.resize(ids.size());
   for (size_t i = 0; i < ids.size(); i++) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
@@ -352,7 +352,7 @@ void RaftNode::AdvanceCommitIndex() {
     return;
 
   std::sort(indexes.rbegin(), indexes.rend());
-  size_t total = peer_manager_.ClusterSize();
+  size_t total = cluster_config_.voters.size() + 1;
   size_t majority = total / 2 + 1;
 
   if (majority - 1 >= indexes.size())
