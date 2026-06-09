@@ -7,8 +7,15 @@
 #include <absl/strings/numbers.h>
 #include <absl/time/clock.h>
 
+#include <atomic>
+#include <vector>
+
 #include "server/raft/raft_types.h"
+#include "server/raft/snapshot_writer.h"
 #include "server/service/command_registry.h"
+#include "server/service/state_serializer.h"
+#include "server/storage/db_slice.h"
+#include "server/storage/engine_shard_set.h"
 #include "util/proactor_pool.h"
 
 namespace dfly {
@@ -116,6 +123,39 @@ ApplyResult KvStateMachine::ApplyLogEntry(const LogEntry& entry) {
     return {ApplyOp::OK, found ? 1u : 0u};
   }
   return {ApplyOp::ERROR, 0};
+}
+
+bool KvStateMachine::SaveSnapshot(const std::string& path) {
+  // Collect entries from all shards in parallel.
+  size_t shard_count = shard_set_->size();
+  std::vector<SnapshotData> shard_data(shard_count);
+
+  shard_set_->RunBriefInParallel([&](EngineShard* es) {
+    ShardId sid = es->shard_id();
+    shard_data[sid] = StateSerializer::Export(es->db_slice);
+  });
+
+  // Merge all shard snapshots.
+  size_t total = 0;
+  for (const auto& sd : shard_data)
+    total += sd.entries.size();
+
+  SnapshotWriter writer(path);
+  if (!writer.Open())
+    return false;
+
+  for (auto& sd : shard_data) {
+    for (auto& e : sd.entries) {
+      SnapshotRecord record;
+      record.key = std::move(e.key);
+      record.value = std::move(e.value);
+      record.expire_at = e.expire_ms;
+      if (!writer.Add(record))
+        return false;
+    }
+  }
+
+  return writer.Finalize(total);
 }
 
 void KvStateMachine::Schedule(DbIndex db_ind, std::string_view key,

@@ -29,6 +29,8 @@ class KvStateMachine : public IStateMachine {
   void Schedule(DbIndex db_ind, std::string_view key,
                 std::function<void(EngineShard*)> cb) override;
 
+  bool SaveSnapshot(const std::string& path) override;
+
  private:
   EngineShardSet* shard_set_;
   util::ProactorPool* pp_;

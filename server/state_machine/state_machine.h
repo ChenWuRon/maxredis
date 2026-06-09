@@ -45,6 +45,12 @@ class IStateMachine {
   virtual size_t DbSize(DbIndex db_ind) const = 0;
   virtual void Schedule(DbIndex db_ind, std::string_view key,
                          std::function<void(EngineShard*)> cb) = 0;
+
+  // Exports the entire state machine state to a binary snapshot file at |path|.
+  // Returns true on success.
+  virtual bool SaveSnapshot(const std::string& path) {
+    return false;
+  }
 };
 
 }  // namespace dfly
