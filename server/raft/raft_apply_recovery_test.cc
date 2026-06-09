@@ -8,6 +8,7 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include "server/raft/segment_log_storage.h"
 #include "server/raft/snapshot_meta.h"
 #include "server/raft/snapshot_writer.h"
+#include "server/raft/wal_writer.h"
 #include "server/service/command_registry.h"
 #include "server/state_machine/state_machine.h"
 
@@ -297,6 +299,26 @@ class RaftApplyRecoveryTest : public Test {
     for (const auto& r : records)
       CHECK(writer.Add(r));
     CHECK(writer.Finalize(records.size()));
+  }
+
+  // Writes a WAL segment with "SET key_{idx} val_{idx}" commands for use with InMemoryKV.
+  void WriteSegmentWithCommands(uint32_t segment_id, uint32_t count,
+                                LogIndex start_index, Term term) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(segment_id));
+    WalWriter writer;
+    CHECK(writer.Open(buf));
+    for (uint32_t i = 0; i < count; i++) {
+      LogIndex idx = start_index + i;
+      LogEntry entry;
+      entry.term = term;
+      entry.index = idx;
+      entry.command = "SET key_" + std::to_string(idx) + " val_" + std::to_string(idx);
+      writer.Append(entry);
+    }
+    CHECK(writer.Flush());
+    writer.Close();
   }
 
   // Appends count entries with sequential "SET key{i} value{i}" commands to log.
@@ -677,6 +699,86 @@ TEST_F(RaftApplyRecoveryTest, DeltaReplayFullWalAfterSnapshot) {
   EXPECT_EQ(3000u, node.last_applied());
   EXPECT_EQ(0u, kv.applied.size());
   EXPECT_EQ("v_old", kv.Get(0, "k_old").value());
+}
+
+// --- End-to-end snapshot recovery ---
+
+TEST_F(RaftApplyRecoveryTest, EndToEndSnapshotRecovery) {
+  constexpr LogIndex kSnapshotIndex = 10000;
+  constexpr LogIndex kDeltaWrites = 1000;
+  constexpr LogIndex kTotalEntries = kSnapshotIndex + kDeltaWrites;
+  constexpr Term kPreSnapTerm = 3;
+  constexpr Term kSnapTerm = 5;
+
+  // Phase 1: Create persistent WAL segments.
+  // Pre-snapshot entries (indices 1..10000, term=3).
+  WriteSegmentWithCommands(1, kSnapshotIndex, 1, kPreSnapTerm);
+  // Post-snapshot entries (indices 10001..11000, term=5).
+  WriteSegmentWithCommands(2, kDeltaWrites, kSnapshotIndex + 1, kSnapTerm);
+
+  // Phase 2: Create snapshot at index 10000, containing every 10th key.
+  WriteSnapshotMeta(kSnapshotIndex, kSnapTerm);
+  std::vector<SnapshotRecord> snap_records;
+  for (LogIndex i = 10; i <= kSnapshotIndex; i += 10) {
+    snap_records.push_back({"snap_key_" + std::to_string(i),
+                            "snap_val_" + std::to_string(i), 0});
+  }
+  WriteSnapshotBin(snap_records);
+
+  // Phase 3: Set apply.meta to match snapshot index.
+  WriteApplyMeta(dir_, kSnapshotIndex);
+
+  // Phase 4: Recover from persistent WAL.
+  SegmentLogStorage log(dir_);
+  ASSERT_TRUE(log.Open());
+  ASSERT_EQ(static_cast<size_t>(kTotalEntries), log.LastIndex());
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+
+  auto t_start = std::chrono::steady_clock::now();
+  node.SetStoragePath(dir_);
+  auto t_snap = std::chrono::steady_clock::now();
+  node.ReplayUnappliedLogs();
+  auto t_end = std::chrono::steady_clock::now();
+
+  // Phase 5: Verify recovery state.
+
+  // Snapshot metadata recovered.
+  EXPECT_EQ(kSnapTerm, node.last_snapshot_term());
+  EXPECT_EQ(kSnapshotIndex, node.last_snapshot_index());
+  EXPECT_EQ(kTotalEntries, node.last_applied());
+
+  // Snapshot keys present.
+  for (LogIndex i = 10; i <= kSnapshotIndex; i += 10) {
+    auto res = kv.Get(0, "snap_key_" + std::to_string(i));
+    ASSERT_TRUE(res.ok()) << "missing snap key " << i;
+    EXPECT_EQ("snap_val_" + std::to_string(i), res.value());
+  }
+
+  // Pre-snapshot keys NOT present (they were not included in the snapshot).
+  // Key 5 was not in the snapshot's every-10th selection.
+  auto pre_snap = kv.Get(0, "key_5");
+  EXPECT_FALSE(pre_snap.ok()) << "pre-snapshot key 5 should not exist";
+
+  // Delta keys (post-snapshot WAL) all present.
+  for (LogIndex i = kSnapshotIndex + 1; i <= kTotalEntries; i++) {
+    auto res = kv.Get(0, "key_" + std::to_string(i));
+    ASSERT_TRUE(res.ok()) << "missing delta key " << i;
+    EXPECT_EQ("val_" + std::to_string(i), res.value());
+  }
+
+  // Metrics.
+  auto recovery_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+  auto snapshot_ms = std::chrono::duration<double, std::milli>(t_snap - t_start).count();
+  auto wal_ms = std::chrono::duration<double, std::milli>(t_end - t_snap).count();
+  LOG(INFO) << "Recovery metrics: total=" << recovery_ms << "ms"
+            << " snapshot_load=" << snapshot_ms << "ms"
+            << " wal_replay=" << wal_ms << "ms";
+  // Verify recovery completed within reasonable time (10s for 11K entries).
+  EXPECT_LT(recovery_ms, 10000);
 }
 
 }  // namespace dfly
