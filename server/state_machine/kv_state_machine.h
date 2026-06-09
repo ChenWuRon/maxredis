@@ -31,6 +31,7 @@ class KvStateMachine : public IStateMachine {
                 std::function<void(EngineShard*)> cb) override;
 
   bool SaveSnapshot(const std::string& path) override;
+  bool LoadSnapshot(const std::string& path) override;
 
   // Sets the snapshot barrier for write-freeze during snapshot.
   // May be nullptr (no barrier).

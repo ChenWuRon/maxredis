@@ -51,6 +51,12 @@ class IStateMachine {
   virtual bool SaveSnapshot(const std::string& path) {
     return false;
   }
+
+  // Loads state from a binary snapshot file at |path|.
+  // Replaces all existing state. Returns true on success.
+  virtual bool LoadSnapshot(const std::string& path) {
+    return false;
+  }
 };
 
 }  // namespace dfly

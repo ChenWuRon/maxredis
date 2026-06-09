@@ -8,6 +8,8 @@
 #include <absl/time/clock.h>
 
 #include <atomic>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "server/raft/raft_types.h"
@@ -170,6 +172,60 @@ bool KvStateMachine::SaveSnapshot(const std::string& path) {
   }
 
   return writer.Finalize(total);
+}
+
+bool KvStateMachine::LoadSnapshot(const std::string& path) {
+  FILE* fp = fopen(path.c_str(), "rb");
+  if (!fp)
+    return false;
+
+  uint32_t magic;
+  if (fread(&magic, sizeof(magic), 1, fp) != 1 || magic != kSnapshotMagic) {
+    fclose(fp);
+    return false;
+  }
+
+  uint32_t num_records;
+  if (fread(&num_records, sizeof(num_records), 1, fp) != 1) {
+    fclose(fp);
+    return false;
+  }
+
+  uint64_t now = NowMs();
+  uint32_t loaded = 0;
+
+  for (uint32_t i = 0; i < num_records; i++) {
+    uint32_t key_len, value_len;
+    uint64_t expire_at;
+
+    if (fread(&key_len, sizeof(key_len), 1, fp) != 1) break;
+    if (fread(&value_len, sizeof(value_len), 1, fp) != 1) break;
+    if (fread(&expire_at, sizeof(expire_at), 1, fp) != 1) break;
+
+    std::string key(key_len, '\0');
+    if (key_len > 0 && fread(key.data(), 1, key_len, fp) != key_len) break;
+
+    std::string value(value_len, '\0');
+    if (value_len > 0 && fread(value.data(), 1, value_len, fp) != value_len) break;
+
+    if (expire_at > 0 && expire_at < now)
+      continue;
+
+    ShardId sid = Shard(key);
+    shard_set_->Await(sid, [db_ind = 0, key = std::move(key), value = std::move(value), expire_at] {
+      EngineShard* es = EngineShard::tlocal();
+      auto [it, inserted] = es->db_slice.AddOrFind(0, key);
+      it->second.value = value;
+      if (expire_at > 0)
+        es->db_slice.SetExpire(0, key, expire_at);
+    });
+
+    loaded++;
+  }
+
+  fclose(fp);
+
+  return loaded == num_records;
 }
 
 void KvStateMachine::Schedule(DbIndex db_ind, std::string_view key,
