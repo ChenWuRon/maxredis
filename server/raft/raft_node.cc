@@ -14,6 +14,11 @@ namespace dfly {
 RaftNode::RaftNode(NodeId node_id) : node_id_(std::move(node_id)) {
 }
 
+void RaftNode::SetStoragePath(std::string path) {
+  storage_ = RaftStorage(std::move(path));
+  storage_.Load();
+}
+
 RaftNode::~RaftNode() {
   StopHeartbeat();
   election_timer_.Stop();
@@ -23,12 +28,13 @@ void RaftNode::SetRole(RaftRole new_role) {
   RaftRole old_role = role_;
   role_ = new_role;
 
-  VLOG(1) << "RaftNode " << node_id_ << " term=" << term_ << ": " << old_role << " -> " << new_role;
+  VLOG(1) << "RaftNode " << node_id_ << " term=" << storage_.current_term()
+          << ": " << old_role << " -> " << new_role;
 
   switch (new_role) {
     case RaftRole::Follower:
       leader_term_ = 0;
-      voted_for_.clear();
+      storage_.set_voted_for("");
       vote_count_ = 0;
       if (!election_started_) {
         election_started_ = true;
@@ -38,14 +44,14 @@ void RaftNode::SetRole(RaftRole new_role) {
       StopHeartbeat();
       break;
     case RaftRole::Candidate:
-      term_++;
-      voted_for_ = node_id_;
+      storage_.set_current_term(storage_.current_term() + 1);
+      storage_.set_voted_for(node_id_);
       vote_count_ = 1;
       election_timer_.Deactivate();
       StopHeartbeat();
       break;
     case RaftRole::Leader:
-      leader_term_ = term_;
+      leader_term_ = storage_.current_term();
       election_timer_.Deactivate();
       StopHeartbeat();
       StartHeartbeat(heartbeat_interval_ms_);
@@ -54,8 +60,8 @@ void RaftNode::SetRole(RaftRole new_role) {
 }
 
 void RaftNode::BecomeFollower(Term term) {
-  DCHECK_GE(term, term_);
-  term_ = term;
+  DCHECK_GE(term, storage_.current_term());
+  storage_.set_current_term(term);
   SetRole(RaftRole::Follower);
 }
 
@@ -75,20 +81,23 @@ void RaftNode::OnElectionTimeout() {
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
-  if (request.term < term_) {
+  Term cur_term = storage_.current_term();
+  if (request.term < cur_term) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
-            << ": stale term " << request.term << " < " << term_;
-    return {term_, false};
+            << ": stale term " << request.term << " < " << cur_term;
+    return {cur_term, false};
   }
 
-  if (request.term > term_) {
+  if (request.term > cur_term) {
     BecomeFollower(request.term);
+    cur_term = storage_.current_term();
   }
 
-  if (!voted_for_.empty() && voted_for_ != request.candidate_id) {
+  const NodeId& voted = storage_.voted_for();
+  if (!voted.empty() && voted != request.candidate_id) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
-            << ": already voted for " << voted_for_;
-    return {term_, false};
+            << ": already voted for " << voted;
+    return {storage_.current_term(), false};
   }
 
   Term local_last_term = log_storage_ ? log_storage_->LastTerm() : 0;
@@ -97,30 +106,30 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   if (request.last_log_term < local_last_term) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": log term " << request.last_log_term << " < " << local_last_term;
-    return {term_, false};
+    return {storage_.current_term(), false};
   }
   if (request.last_log_term == local_last_term && request.last_log_index < local_last_index) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
             << ": log index " << request.last_log_index << " < " << local_last_index;
-    return {term_, false};
+    return {storage_.current_term(), false};
   }
 
-  voted_for_ = request.candidate_id;
+  storage_.set_voted_for(request.candidate_id);
   VLOG(1) << node_id_ << " grants VoteRequest to " << request.candidate_id
-          << " term=" << term_;
-  return {term_, true};
+          << " term=" << storage_.current_term();
+  return {storage_.current_term(), true};
 }
 
 ElectionResult RaftNode::StartElection() {
   BecomeCandidate();
 
   VoteRequest request;
-  request.term = term_;
+  request.term = storage_.current_term();
   request.candidate_id = node_id_;
   request.last_log_index = log_storage_ ? log_storage_->LastIndex() : 0;
   request.last_log_term = log_storage_ ? log_storage_->LastTerm() : 0;
 
-  VLOG(1) << node_id_ << " starts election term=" << term_
+  VLOG(1) << node_id_ << " starts election term=" << storage_.current_term()
           << " last_log=" << request.last_log_index << "/" << request.last_log_term;
 
   ElectionResult result;
@@ -152,7 +161,7 @@ bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
           << " majority=" << majority << " total=" << total_nodes;
 
   if (result.votes_received >= majority) {
-    VLOG(1) << node_id_ << " election won term=" << term_;
+    VLOG(1) << node_id_ << " election won term=" << storage_.current_term();
     BecomeLeader();
     return true;
   }
@@ -161,13 +170,14 @@ bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
 }
 
 HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
-  if (request.term < term_) {
+  Term cur_term = storage_.current_term();
+  if (request.term < cur_term) {
     VLOG(2) << node_id_ << " rejects Heartbeat from " << request.leader_id
-            << ": stale term " << request.term << " < " << term_;
-    return {term_, false};
+            << ": stale term " << request.term << " < " << cur_term;
+    return {cur_term, false};
   }
 
-  if (request.term >= term_) {
+  if (request.term >= cur_term) {
     VLOG(1) << node_id_ << " accepts Heartbeat from leader " << request.leader_id
             << " term=" << request.term;
     BecomeFollower(request.term);
@@ -175,11 +185,11 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 
   election_timer_.Reset();
 
-  return {term_, true};
+  return {storage_.current_term(), true};
 }
 
 void RaftNode::SendHeartbeatToPeers() {
-  HeartbeatRequest req{term_, node_id_};
+  HeartbeatRequest req{storage_.current_term(), node_id_};
   for (const auto& peer_id : peer_manager_.GetPeerIds()) {
     DCHECK(transport_) << "Transport not set for multi-node operation";
     transport_->SendHeartbeat(peer_id, req);
@@ -208,14 +218,15 @@ void RaftNode::HeartbeatLoop() {
 }
 
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {
-  if (req.term < term_) {
+  Term cur_term = storage_.current_term();
+  if (req.term < cur_term) {
     VLOG(2) << node_id_ << " rejects AppendEntries from " << req.leader_id
-            << ": stale term " << req.term << " < " << term_;
+            << ": stale term " << req.term << " < " << cur_term;
     LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
-    return {term_, false, my_last};
+    return {cur_term, false, my_last};
   }
 
-  if (req.term >= term_) {
+  if (req.term >= cur_term) {
     VLOG(1) << node_id_ << " accepts AppendEntries from leader " << req.leader_id
             << " term=" << req.term << " entries=" << req.entries.size();
     BecomeFollower(req.term);
@@ -224,12 +235,12 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   if (log_storage_) {
     if (req.prev_log_index > log_storage_->LastIndex()) {
       VLOG(2) << node_id_ << " rejects AppendEntries: gap at prev_log=" << req.prev_log_index;
-      return {term_, false, log_storage_->LastIndex()};
+      return {storage_.current_term(), false, log_storage_->LastIndex()};
     }
     if (req.prev_log_index > 0 &&
         log_storage_->Get(req.prev_log_index).term != req.prev_log_term) {
       VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
-      return {term_, false, req.prev_log_index - 1};
+      return {storage_.current_term(), false, req.prev_log_index - 1};
     }
 
     for (const auto& entry : req.entries) {
@@ -254,7 +265,7 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
     ApplyCommittedLogs();
   }
 
-  return {term_, true, my_last};
+  return {storage_.current_term(), true, my_last};
 }
 
 ApplyResult RaftNode::ReplicateLog() {
@@ -274,7 +285,7 @@ ApplyResult RaftNode::ReplicateLog() {
   }
 
   AppendEntriesRequest req;
-  req.term = term_;
+  req.term = storage_.current_term();
   req.leader_id = node_id_;
   req.leader_commit = commit_index_;
 

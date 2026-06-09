@@ -12,6 +12,7 @@
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/log_storage.h"
 #include "server/raft/peer_manager.h"
+#include "server/raft/raft_storage.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
@@ -25,6 +26,18 @@ class RaftNode {
   explicit RaftNode(NodeId node_id = "");
   ~RaftNode();
 
+  // Set the persistence path for Raft metadata.
+  // This also loads existing state from disk if available.
+  void SetStoragePath(std::string path);
+
+  RaftStorage& storage() {
+    return storage_;
+  }
+
+  const RaftStorage& storage() const {
+    return storage_;
+  }
+
   const NodeId& node_id() const {
     return node_id_;
   }
@@ -34,11 +47,11 @@ class RaftNode {
   }
 
   Term term() const {
-    return term_;
+    return storage_.current_term();
   }
 
   const NodeId& voted_for() const {
-    return voted_for_;
+    return storage_.voted_for();
   }
 
   uint32_t vote_count() const {
@@ -139,11 +152,10 @@ class RaftNode {
  private:
   void HeartbeatLoop();
 
+  RaftStorage storage_;
   NodeId node_id_;
   RaftRole role_ = RaftRole::Follower;
-  Term term_ = 0;
   Term leader_term_ = 0;
-  NodeId voted_for_;
   uint32_t vote_count_ = 0;
 
   Transport* transport_ = nullptr;
