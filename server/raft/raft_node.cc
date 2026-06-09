@@ -8,6 +8,7 @@
 
 #include "base/logging.h"
 #include "server/raft/apply_progress.h"
+#include "server/raft/snapshot_loader.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
@@ -27,6 +28,23 @@ void RaftNode::SetStoragePath(std::string path) {
   apply_progress_ = ApplyProgress(path + "apply.meta");
   apply_progress_.Load();
   last_applied_ = apply_progress_.LastApplied();
+
+  // Recover from snapshot if one exists.
+  // This must happen after state_machine_ is set.
+  if (state_machine_) {
+    SnapshotLoader loader(path);
+    LoadedSnapshot loaded;
+    if (loader.Load(&loaded) == SnapshotLoadStatus::OK) {
+      LOG(INFO) << node_id_ << " RecoverFromSnapshot: index=" << loaded.meta.index
+                << " term=" << loaded.meta.term;
+      if (state_machine_->LoadSnapshot(loaded.bin_path)) {
+        last_applied_ = std::max(last_applied_, loaded.meta.index);
+        last_snapshot_index_ = loaded.meta.index;
+        last_snapshot_term_ = loaded.meta.term;
+        apply_progress_.Update(last_applied_);
+      }
+    }
+  }
 
   VLOG(1) << node_id_ << " SetStoragePath: last_applied=" << last_applied_;
 }

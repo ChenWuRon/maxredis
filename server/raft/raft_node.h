@@ -136,6 +136,14 @@ class RaftNode {
     return last_applied_;
   }
 
+  LogIndex last_snapshot_index() const {
+    return last_snapshot_index_;
+  }
+
+  Term last_snapshot_term() const {
+    return last_snapshot_term_;
+  }
+
   // Follower-side: processes an incoming AppendEntries request.
   AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
 
@@ -180,6 +188,8 @@ class RaftNode {
   IStateMachine* state_machine_ = nullptr;
   LogIndex commit_index_ = 0;
   LogIndex last_applied_ = 0;
+  LogIndex last_snapshot_index_ = 0;
+  Term last_snapshot_term_ = 0;
   std::vector<LogIndex> peer_last_log_index_;
   std::atomic<bool> shutdown_{false};
   util::fb2::Fiber heartbeat_fiber_;

@@ -21,6 +21,8 @@
 #include "server/raft/command_encoder.h"
 #include "server/raft/replicated_command.h"
 #include "server/raft/segment_log_storage.h"
+#include "server/raft/snapshot_meta.h"
+#include "server/raft/snapshot_writer.h"
 #include "server/service/command_registry.h"
 #include "server/state_machine/state_machine.h"
 
@@ -86,6 +88,48 @@ class InMemoryKV : public IStateMachine {
 
   void Schedule(DbIndex, std::string_view,
                 std::function<void(EngineShard*)>) override {}
+
+  bool SaveSnapshot(const std::string& path) override {
+    SnapshotWriter writer(path);
+    if (!writer.Open())
+      return false;
+    for (const auto& [k, v] : store_) {
+      if (!writer.Add({k, v, 0}))
+        return false;
+    }
+    return writer.Finalize(store_.size());
+  }
+
+  bool LoadSnapshot(const std::string& path) override {
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp)
+      return false;
+    uint32_t magic;
+    if (fread(&magic, sizeof(magic), 1, fp) != 1 || magic != kSnapshotMagic) {
+      fclose(fp);
+      return false;
+    }
+    uint32_t num_records;
+    if (fread(&num_records, sizeof(num_records), 1, fp) != 1) {
+      fclose(fp);
+      return false;
+    }
+    store_.clear();
+    for (uint32_t i = 0; i < num_records; i++) {
+      uint32_t key_len, value_len;
+      uint64_t expire_at;
+      if (fread(&key_len, sizeof(key_len), 1, fp) != 1) break;
+      if (fread(&value_len, sizeof(value_len), 1, fp) != 1) break;
+      if (fread(&expire_at, sizeof(expire_at), 1, fp) != 1) break;
+      std::string key(key_len, '\0');
+      if (key_len > 0 && fread(key.data(), 1, key_len, fp) != key_len) break;
+      std::string value(value_len, '\0');
+      if (value_len > 0 && fread(value.data(), 1, value_len, fp) != value_len) break;
+      store_[key] = value;
+    }
+    fclose(fp);
+    return true;
+  }
 
  private:
   absl::flat_hash_map<std::string, std::string> store_;
@@ -234,7 +278,25 @@ class RaftApplyRecoveryTest : public Test {
     unlink((dir_ + "/apply.meta.tmp").c_str());
     unlink((dir_ + "/meta.json").c_str());
     unlink((dir_ + "/meta.json.tmp").c_str());
+    unlink((dir_ + "/snapshot.meta").c_str());
+    unlink((dir_ + "/snapshot.bin").c_str());
     rmdir(dir_.c_str());
+  }
+
+  // Writes snapshot.meta with the given index/term.
+  void WriteSnapshotMeta(LogIndex index, Term term) {
+    SnapshotMetaStorage sms(dir_ + "/snapshot.meta");
+    sms.Load();
+    sms.SetMeta({index, term, 100});
+  }
+
+  // Creates a snapshot.bin with the given entries.
+  void WriteSnapshotBin(const std::vector<SnapshotRecord>& records) {
+    SnapshotWriter writer(dir_ + "/snapshot.bin");
+    CHECK(writer.Open());
+    for (const auto& r : records)
+      CHECK(writer.Add(r));
+    CHECK(writer.Finalize(records.size()));
   }
 
   // Appends count entries with sequential "SET key{i} value{i}" commands to log.
@@ -424,6 +486,95 @@ TEST_F(RaftApplyRecoveryTest, NoLogStorage) {
   node.ReplayUnappliedLogs();
   EXPECT_EQ(10u, node.last_applied());
   EXPECT_EQ(10u, node.apply_progress().LastApplied());
+}
+
+// --- Snapshot recovery tests ---
+
+TEST_F(RaftApplyRecoveryTest, BootstrapWithSnapshot) {
+  WriteSnapshotMeta(500000, 17);
+  WriteSnapshotBin({{"k1", "v1", 0}, {"k2", "v2", 0}});
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+  node.ReplayUnappliedLogs();
+
+  // Snapshot should have been loaded during SetStoragePath.
+  EXPECT_EQ(500000u, node.last_snapshot_index());
+  EXPECT_EQ(17u, node.last_snapshot_term());
+  EXPECT_EQ(500000u, node.last_applied());
+  EXPECT_EQ(2u, kv.DbSize(0));
+  EXPECT_EQ("v1", kv.Get(0, "k1").value());
+  EXPECT_EQ("v2", kv.Get(0, "k2").value());
+}
+
+TEST_F(RaftApplyRecoveryTest, SnapshotIndexDominatesApplyMeta) {
+  // apply.meta says 10, but snapshot is at 500000.
+  WriteApplyMeta(dir_, 10);
+  WriteSnapshotMeta(500000, 17);
+  WriteSnapshotBin({{"k1", "v1", 0}});
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+
+  // last_applied_ should be max(apply.meta, snapshot.index).
+  EXPECT_EQ(500000u, node.last_applied());
+  EXPECT_EQ(500000u, node.last_snapshot_index());
+  EXPECT_EQ(17u, node.last_snapshot_term());
+}
+
+TEST_F(RaftApplyRecoveryTest, NoSnapshotWithoutStateMachine) {
+  WriteSnapshotMeta(500000, 17);
+  WriteSnapshotBin({{"k1", "v1", 0}});
+
+  RaftNode node("N1");
+  // No SetStateMachine → snapshot loading skipped in SetStoragePath.
+  node.SetStoragePath(dir_);
+  EXPECT_EQ(0u, node.last_snapshot_index());
+  EXPECT_EQ(0u, node.last_snapshot_term());
+  EXPECT_EQ(0u, node.last_applied());
+}
+
+TEST_F(RaftApplyRecoveryTest, SnapshotRecoveryWithWALReplay) {
+  WriteSnapshotMeta(500000, 17);
+  WriteSnapshotBin({{"k_snap", "v_snap", 0}});
+
+  CommandLog log;
+  PopulateLog(log, 10);  // entries 1..10
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetLogStorage(&log);
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+
+  // SetStoragePath loaded snapshot → last_applied = 500000.
+  EXPECT_EQ(500000u, node.last_applied());
+
+  // WAL has entries 1..10, all below last_applied → nothing to replay.
+  node.ReplayUnappliedLogs();
+  EXPECT_EQ(500000u, node.last_applied());
+  EXPECT_EQ("v_snap", kv.Get(0, "k_snap").value());
+  // WAL entries were not replayed since they're before the snapshot.
+  EXPECT_EQ(0u, kv.applied.size());
+}
+
+TEST_F(RaftApplyRecoveryTest, BootstrapWithSnapshotNoSnapshotDir) {
+  // No snapshot files exist, just apply.meta.
+  WriteApplyMeta(dir_, 42);
+
+  InMemoryKV kv;
+  RaftNode node("N1");
+  node.SetStateMachine(&kv);
+  node.SetStoragePath(dir_);
+
+  EXPECT_EQ(42u, node.last_applied());
+  EXPECT_EQ(0u, node.last_snapshot_index());
+  EXPECT_EQ(0u, node.last_snapshot_term());
+  EXPECT_EQ(0u, kv.DbSize(0));
 }
 
 }  // namespace dfly
