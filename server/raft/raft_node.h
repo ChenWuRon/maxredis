@@ -1,6 +1,21 @@
 // Copyright 2021, Roman Gershman.  All rights reserved.
 // See LICENSE for licensing terms.
 //
+// STRICT REQUIREMENTS
+// Implement Raft Joint Consensus exactly as described in
+// Raft paper section: "Membership Changes"
+//
+// DO NOT implement one-step membership change.
+// DO NOT directly replace old configuration with new configuration.
+//
+// The implementation MUST use:
+//   Stable → Joint → Stable
+// state transitions.
+//
+// Commit in Joint state MUST require:
+//   majority(old_config) AND majority(new_config)
+// simultaneously.
+//
 
 #pragma once
 

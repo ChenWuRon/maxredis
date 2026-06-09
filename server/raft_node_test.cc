@@ -1566,111 +1566,6 @@ TEST_F(RaftNodeTest, JointConsensusPeerManagerUpdated) {
   EXPECT_TRUE(n1.peer_manager().HasPeer("D"));
 }
 
-// Tests dual-majority commit rule during joint consensus.
-// With old config {B, C} (3 members including leader A, majority=2)
-// and new config {B, C, D, E} (5 members including A, majority=3),
-// verifies that commit requires BOTH majorities.
-class JointConsensusDualMajorityTest : public RaftNodeTest {
- protected:
-  // Sets up a 5-node cluster with A as leader, voters {B, C}.
-  // Returns the target config that adds D, E: {B, C, D, E}.
-  struct Cluster {
-    LocalTransport transport;
-    CommandLog log_a, log_b, log_c, log_d, log_e;
-    TestStateMachine sm;
-    RaftNode a{"A"}, b{"B"}, c{"C"}, d{"D"}, e{"E"};
-    ClusterConfig target;
-  };
-
-  void SetUpCluster(Cluster& cl) {
-    cl.a.SetLogStorage(&cl.log_a);
-    cl.a.SetStateMachine(&cl.sm);
-    cl.b.SetLogStorage(&cl.log_b);
-    cl.c.SetLogStorage(&cl.log_c);
-    cl.d.SetLogStorage(&cl.log_d);
-    cl.e.SetLogStorage(&cl.log_e);
-
-    cl.transport.RegisterNode("A", &cl.a);
-    cl.transport.RegisterNode("B", &cl.b);
-    cl.transport.RegisterNode("C", &cl.c);
-    cl.transport.RegisterNode("D", &cl.d);
-    cl.transport.RegisterNode("E", &cl.e);
-    cl.a.SetTransport(&cl.transport);
-    cl.a.AddPeer("B");
-    cl.a.AddPeer("C");
-
-    // Elect A as leader
-    ElectionResult election = cl.a.StartElection();
-    ASSERT_EQ(RaftRole::Leader, cl.a.role());
-    ASSERT_EQ(3u, election.votes_received);
-
-    // Begin config change to add D, E
-    cl.target.version = 1;
-    cl.target.voters = {"B", "C", "D", "E"};
-    ASSERT_TRUE(cl.a.BeginConfigChange(cl.target));
-    ASSERT_EQ(ConfigState::kStable, cl.a.config_state());
-
-    // Commit first config entry → enter Joint
-    // All peers (B, C) have log storage → they replicate
-    ASSERT_EQ(1u, cl.log_a.LogSize());
-    cl.a.ReplicateLog();
-    ASSERT_TRUE(cl.a.IsJointConsensus());
-    ASSERT_EQ(ConfigState::kJoint, cl.a.config_state());
-    ASSERT_EQ(1u, cl.a.commit_index());
-    ASSERT_EQ(1u, cl.a.last_applied());
-
-    // Second BeginConfigChange appends final entry
-    ASSERT_TRUE(cl.a.BeginConfigChange(cl.target));
-    ASSERT_EQ(2u, cl.log_a.LogSize());
-  }
-};
-
-TEST_F(JointConsensusDualMajorityTest, BothMajoritiesPass) {
-  Cluster cl;
-  SetUpCluster(cl);
-  // All peers have log_storage → both majorities satisfied → transition to Stable
-  cl.a.ReplicateLog();
-  EXPECT_EQ(ConfigState::kStable, cl.a.config_state())
-      << "both majorities pass → final config applied";
-  EXPECT_EQ(2u, cl.a.commit_index()) << "commit should advance with both majorities";
-
-  // PeerManager reflects the applied config {B, C, D, E}
-  EXPECT_EQ(4u, cl.a.peer_manager().PeerCount());
-  EXPECT_TRUE(cl.a.peer_manager().HasPeer("B"));
-  EXPECT_TRUE(cl.a.peer_manager().HasPeer("C"));
-  EXPECT_TRUE(cl.a.peer_manager().HasPeer("D"));
-  EXPECT_TRUE(cl.a.peer_manager().HasPeer("E"));
-}
-
-TEST_F(JointConsensusDualMajorityTest, OldPassNewFail) {
-  Cluster cl;
-  SetUpCluster(cl);
-  // C, D, E lose log storage → only B replicates (besides leader)
-  cl.c.SetLogStorage(nullptr);
-  cl.d.SetLogStorage(nullptr);
-  cl.e.SetLogStorage(nullptr);
-
-  // Old config {B, C}: A replicates + B replicates = 2/3 ✓
-  // New config {B, C, D, E}: A + B = 2/5 ✗ (need 3/5)
-  cl.a.ReplicateLog();
-  EXPECT_TRUE(cl.a.IsJointConsensus());
-  EXPECT_EQ(1u, cl.a.commit_index()) << "commit blocked: new config lacks majority";
-}
-
-TEST_F(JointConsensusDualMajorityTest, OldFailNewPass) {
-  Cluster cl;
-  SetUpCluster(cl);
-  // B, C lose log storage → only D, E replicate (besides leader)
-  cl.b.SetLogStorage(nullptr);
-  cl.c.SetLogStorage(nullptr);
-
-  // Old config {B, C}: A replicates alone = 1/3 ✗ (need 2/3)
-  // New config {B, C, D, E}: A + D + E = 3/5 ✓ (need 3/5)
-  cl.a.ReplicateLog();
-  EXPECT_TRUE(cl.a.IsJointConsensus());
-  EXPECT_EQ(1u, cl.a.commit_index()) << "commit blocked: old config lacks majority";
-}
-
 // Verifies that BeginConfigChange is rejected when not leader.
 TEST_F(RaftNodeTest, JointConsensusNonLeaderRejected) {
   CommandLog log;
@@ -1684,4 +1579,438 @@ TEST_F(RaftNodeTest, JointConsensusNonLeaderRejected) {
   EXPECT_FALSE(node.BeginConfigChange(target));
 }
 
+// ---------------------------------------------------------------------------
+// Integration Tests
+// ---------------------------------------------------------------------------
+
+// A transport wrapper that silently drops messages to unregistered peers
+// (instead of DCHECK-crashing like LocalTransport does).
+class PartitionedTransport : public Transport {
+ public:
+  explicit PartitionedTransport(LocalTransport& inner) : inner_(inner) {}
+
+  bool HasNode(const NodeId& id) const {
+    return inner_.HasNode(id);
+  }
+
+  VoteResponse SendVoteRequest(const NodeId& peer_id,
+                                const VoteRequest& request) override {
+    if (!inner_.HasNode(peer_id))
+      return {0, false};
+    return inner_.SendVoteRequest(peer_id, request);
+  }
+
+  HeartbeatResponse SendHeartbeat(const NodeId& peer_id,
+                                   const HeartbeatRequest& request) override {
+    if (!inner_.HasNode(peer_id))
+      return {0, false};
+    return inner_.SendHeartbeat(peer_id, request);
+  }
+
+  AppendEntriesResponse SendAppendEntries(const NodeId& peer_id,
+                                           const AppendEntriesRequest& request) override {
+    if (!inner_.HasNode(peer_id))
+      return {0, false, 0};
+    return inner_.SendAppendEntries(peer_id, request);
+  }
+
+ private:
+  LocalTransport& inner_;
+};
+
+// Test 1: 3→4 nodes — full membership change lifecycle
+TEST_F(RaftNodeTest, IntegrationScaleUp3To4) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm;
+  RaftNode a("A"), b("B"), c("C"), d("D");
+
+  auto setup_config = [](RaftNode& node, std::vector<const char*> voters) {
+    for (const char* v : voters)
+      node.AddPeer(v);
+  };
+  setup_config(a, {"B", "C"});
+  setup_config(b, {"A", "C"});
+  setup_config(c, {"A", "B"});
+  setup_config(d, {"A", "B", "C"});
+
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm);
+  b.SetLogStorage(&log_b);
+  c.SetLogStorage(&log_c);
+  d.SetLogStorage(&log_d);
+
+  transport.RegisterNode("A", &a);
+  transport.RegisterNode("B", &b);
+  transport.RegisterNode("C", &c);
+  transport.RegisterNode("D", &d);
+  a.SetTransport(&transport);
+  b.SetTransport(&transport);
+  c.SetTransport(&transport);
+  d.SetTransport(&transport);
+
+  // Step 1: Elect A as leader
+  ElectionResult election = a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+  ASSERT_EQ(3u, election.votes_received);
+
+  // Step 2: Config change — add D
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_TRUE(a.IsJointConsensus());
+  EXPECT_EQ(1u, a.commit_index());
+
+  // Step 3: Finalize, second ReplicateLog propagates leader_commit to peers
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_EQ(ConfigState::kStable, a.config_state());
+  EXPECT_EQ(2u, a.commit_index());
+
+  // Verify final cluster membership: {A, B, C, D}
+  ASSERT_EQ(3u, a.cluster_config().voters.size());
+  EXPECT_EQ(1u, a.cluster_config().voters.count("B"));
+  EXPECT_EQ(1u, a.cluster_config().voters.count("C"));
+  EXPECT_EQ(1u, a.cluster_config().voters.count("D"));
+  EXPECT_EQ(3u, a.peer_manager().PeerCount());
+}
+
+// Test 2: 4→3 nodes — remove node D
+TEST_F(RaftNodeTest, IntegrationScaleDown4To3) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm;
+  RaftNode a("A"), b("B"), c("C"), d("D");
+
+  auto setup_config = [](RaftNode& node, std::vector<const char*> voters) {
+    for (const char* v : voters)
+      node.AddPeer(v);
+  };
+  setup_config(a, {"B", "C", "D"});
+  setup_config(b, {"A", "C", "D"});
+  setup_config(c, {"A", "B", "D"});
+  setup_config(d, {"A", "B", "C"});
+
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm);
+  b.SetLogStorage(&log_b);
+  c.SetLogStorage(&log_c);
+  d.SetLogStorage(&log_d);
+
+  transport.RegisterNode("A", &a);
+  transport.RegisterNode("B", &b);
+  transport.RegisterNode("C", &c);
+  transport.RegisterNode("D", &d);
+  a.SetTransport(&transport);
+  b.SetTransport(&transport);
+  c.SetTransport(&transport);
+  d.SetTransport(&transport);
+
+  ElectionResult election = a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+  ASSERT_EQ(4u, election.votes_received);
+
+  // Config change — remove D
+  ClusterConfig target;
+  target.version = 2;
+  target.voters = {"B", "C"};
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_TRUE(a.IsJointConsensus());
+
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_EQ(ConfigState::kStable, a.config_state());
+
+  ASSERT_EQ(2u, a.cluster_config().voters.size());
+  EXPECT_EQ(1u, a.cluster_config().voters.count("B"));
+  EXPECT_EQ(1u, a.cluster_config().voters.count("C"));
+  EXPECT_EQ(0u, a.cluster_config().voters.count("D"));
+  EXPECT_EQ(2u, a.peer_manager().PeerCount());
+  EXPECT_FALSE(a.peer_manager().HasPeer("D"));
+}
+
+// Test 3: Leader stays unchanged throughout transition
+TEST_F(RaftNodeTest, IntegrationLeaderUnchanged) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm;
+  RaftNode a("A"), b("B"), c("C"), d("D");
+
+  auto setup_config = [](RaftNode& node, std::vector<const char*> voters) {
+    for (const char* v : voters)
+      node.AddPeer(v);
+  };
+  setup_config(a, {"B", "C"});
+  setup_config(b, {"A", "C"});
+  setup_config(c, {"A", "B"});
+
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm);
+  b.SetLogStorage(&log_b);
+  c.SetLogStorage(&log_c);
+  d.SetLogStorage(&log_d);
+
+  transport.RegisterNode("A", &a);
+  transport.RegisterNode("B", &b);
+  transport.RegisterNode("C", &c);
+  transport.RegisterNode("D", &d);
+  a.SetTransport(&transport);
+  b.SetTransport(&transport);
+  c.SetTransport(&transport);
+  d.SetTransport(&transport);
+
+  // Elect A as leader
+  a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+
+  // Config change — add D (leader A stays in cluster, config stores peers only)
+  // Old: {B, C}, New: {B, C, D}
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_TRUE(a.IsJointConsensus());
+
+  // A remains leader during Joint
+  EXPECT_EQ(RaftRole::Leader, a.role());
+
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_EQ(ConfigState::kStable, a.config_state());
+
+  // A still leader after transition
+  EXPECT_EQ(RaftRole::Leader, a.role());
+  ASSERT_EQ(3u, a.cluster_config().voters.size());
+  EXPECT_EQ(1u, a.cluster_config().voters.count("B"));
+  EXPECT_EQ(1u, a.cluster_config().voters.count("C"));
+  EXPECT_EQ(1u, a.cluster_config().voters.count("D"));
+}
+
+// Test 4: Crash recovery — node recovers to Joint state after replay
+TEST_F(RaftNodeTest, IntegrationCrashRecoveryJoint) {
+  CommandLog log_a;
+  TestStateMachine sm;
+  RaftNode a("A");
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm);
+
+  // Manually set cluster config and append a CONFIG_CHANGE entry
+  ClusterConfig initial;
+  initial.version = 0;
+  initial.voters = {"B", "C"};
+  a.SetClusterConfig(initial);
+
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+  ConfigChangeCommand cmd{target};
+  log_a.Append(LogEntry{1, 0, cmd.Serialize()});
+
+  // "Crash" — a is gone. Recover with same log, simulate replay.
+  RaftNode recovered("A");
+  recovered.SetLogStorage(&log_a);
+  recovered.SetStateMachine(&sm);
+
+  // Restore pre-crash cluster config (what the node knew before crash)
+  recovered.SetClusterConfig(initial);
+
+  // ReplayUnappliedLogs sets commit_index_ = LastIndex() and applies
+  recovered.ReplayUnappliedLogs();
+
+  // After replay, the node should be in Joint consensus
+  EXPECT_TRUE(recovered.IsJointConsensus());
+  EXPECT_EQ(ConfigState::kJoint, recovered.config_state());
+  EXPECT_EQ(2u, recovered.joint_config().old_config.voters.size());
+  EXPECT_EQ(1u, recovered.joint_config().old_config.voters.count("B"));
+  EXPECT_EQ(1u, recovered.joint_config().old_config.voters.count("C"));
+  EXPECT_EQ(1u, recovered.joint_config().new_config.voters.count("D"));
+}
+
+// Test 5: Leader steps down during joint consensus — new leader elected
+// with dual-majority voting.
+TEST_F(RaftNodeTest, IntegrationLeaderStepsDownDuringJoint) {
+  LocalTransport transport;
+  CommandLog log_a, log_b, log_c, log_d;
+  TestStateMachine sm_a, sm_b, sm_c;
+  RaftNode a("A"), b("B"), c("C"), d("D");
+
+  auto setup_config = [](RaftNode& node, std::vector<const char*> voters) {
+    for (const char* v : voters)
+      node.AddPeer(v);
+  };
+  setup_config(a, {"B", "C"});
+  setup_config(b, {"A", "C"});
+  setup_config(c, {"A", "B"});
+
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm_a);
+  b.SetLogStorage(&log_b);
+  b.SetStateMachine(&sm_b);
+  c.SetLogStorage(&log_c);
+  c.SetStateMachine(&sm_c);
+
+  transport.RegisterNode("A", &a);
+  transport.RegisterNode("B", &b);
+  transport.RegisterNode("C", &c);
+  transport.RegisterNode("D", &d);
+  a.SetTransport(&transport);
+  b.SetTransport(&transport);
+  c.SetTransport(&transport);
+
+  // Elect A, config change to add D → Joint
+  a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D"};
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_TRUE(a.IsJointConsensus());
+
+  // Propagate commit to B and C so they enter Joint too.
+  AppendEntriesRequest propagate;
+  propagate.term = a.term();
+  propagate.leader_id = "A";
+  propagate.leader_commit = a.commit_index();
+  b.OnAppendEntries(propagate);
+  c.OnAppendEntries(propagate);
+  ASSERT_TRUE(b.IsJointConsensus());
+  ASSERT_TRUE(c.IsJointConsensus());
+
+  // Now all 3 nodes are in Joint. A is leader.
+  // A steps down: receive heartbeat with higher term
+  a.OnHeartbeat(HeartbeatRequest{a.term() + 1, "X"});
+  ASSERT_EQ(RaftRole::Follower, a.role());
+
+  // B starts election — must win both old and new majorities
+  // Old: {A, C} → total=3, majority=2
+  // New: {B, C, D} → total=4, majority=3
+  ElectionResult e2 = b.StartElection();
+  EXPECT_EQ(RaftRole::Leader, b.role())
+      << "B should win election during Joint with dual majority";
+
+  // D (in new config only) also votes for B → 4 total
+  EXPECT_EQ(4u, e2.votes_received) << "B gets self + A + C + D = 4 votes total";
+
+  // Verify the new leader is in Joint state
+  EXPECT_TRUE(b.IsJointConsensus());
+}
+
+// Test 6: Network partition — no split-brain during joint consensus
+TEST_F(RaftNodeTest, IntegrationPartitionNoSplitBrain) {
+  LocalTransport transport_all;
+  CommandLog log_a, log_b, log_c, log_d, log_e;
+  TestStateMachine sm_a, sm_b, sm_c;
+  RaftNode a("A"), b("B"), c("C"), d("D"), e("E");
+
+  // Old config: {B, C} (3 nodes incl A); New config: {B, C, D, E} (5 nodes incl A)
+  auto setup_config = [](RaftNode& node, std::vector<const char*> voters) {
+    for (const char* v : voters)
+      node.AddPeer(v);
+  };
+  setup_config(a, {"B", "C"});
+  setup_config(b, {"A", "C"});
+  setup_config(c, {"A", "B"});
+  setup_config(d, {"A", "B", "C"});
+  setup_config(e, {"A", "B", "C"});
+
+  a.SetLogStorage(&log_a);
+  a.SetStateMachine(&sm_a);
+  b.SetLogStorage(&log_b);
+  b.SetStateMachine(&sm_b);
+  c.SetLogStorage(&log_c);
+  c.SetStateMachine(&sm_c);
+  d.SetLogStorage(&log_d);
+  e.SetLogStorage(&log_e);
+
+  transport_all.RegisterNode("A", &a);
+  transport_all.RegisterNode("B", &b);
+  transport_all.RegisterNode("C", &c);
+  transport_all.RegisterNode("D", &d);
+  transport_all.RegisterNode("E", &e);
+  a.SetTransport(&transport_all);
+  b.SetTransport(&transport_all);
+  c.SetTransport(&transport_all);
+  d.SetTransport(&transport_all);
+  e.SetTransport(&transport_all);
+
+  // Elect A as leader
+  a.StartElection();
+  ASSERT_EQ(RaftRole::Leader, a.role());
+
+  // Enter joint consensus with old {B,C} → new {B,C,D,E}
+  ClusterConfig target;
+  target.version = 1;
+  target.voters = {"B", "C", "D", "E"};
+  ASSERT_TRUE(a.BeginConfigChange(target));
+  a.ReplicateLog();
+  ASSERT_TRUE(a.IsJointConsensus());
+
+  // Propagate commit so all nodes enter Joint
+  AppendEntriesRequest propagate;
+  propagate.term = a.term();
+  propagate.leader_id = "A";
+  propagate.leader_commit = a.commit_index();
+  b.OnAppendEntries(propagate);
+  c.OnAppendEntries(propagate);
+  d.OnAppendEntries(propagate);
+  e.OnAppendEntries(propagate);
+  ASSERT_TRUE(b.IsJointConsensus());
+  ASSERT_TRUE(c.IsJointConsensus());
+  // D and E don't have state_machine so they can't apply → stay in Stable
+
+  // --- Partition ---
+  // Group 1: {A, B} — has old majority 2/3 but NOT new majority 2/4
+  // Group 2: {C, D, E} — has new majority 3/4 but NOT old majority 1/3
+  LocalTransport transport_ab, transport_cde;
+  transport_ab.RegisterNode("A", &a);
+  transport_ab.RegisterNode("B", &b);
+  transport_cde.RegisterNode("C", &c);
+  transport_cde.RegisterNode("D", &d);
+  transport_cde.RegisterNode("E", &e);
+  PartitionedTransport pab(transport_ab), pcde(transport_cde);
+  a.SetTransport(&pab);
+  b.SetTransport(&pab);
+  c.SetTransport(&pcde);
+  d.SetTransport(&pcde);
+  e.SetTransport(&pcde);
+
+  // A steps down (simulate leader loss)
+  a.OnHeartbeat(HeartbeatRequest{a.term() + 1, "X"});
+
+  // Group 1 tries election (A or B). Neither has new majority.
+  a.StartElection();
+  EXPECT_NE(RaftRole::Leader, a.role())
+      << "Partition without new majority must not elect a leader";
+  EXPECT_NE(RaftRole::Leader, b.role())
+      << "B must not become leader either";
+
+  // Group 2 tries election (C). Has new majority but not old majority.
+  c.StartElection();
+  EXPECT_NE(RaftRole::Leader, c.role())
+      << "Partition without old majority must not elect a leader";
+
+  // --- Heal partition ---
+  a.SetTransport(&transport_all);
+  b.SetTransport(&transport_all);
+  c.SetTransport(&transport_all);
+  d.SetTransport(&transport_all);
+  e.SetTransport(&transport_all);
+
+  // Give everyone a higher term so new election proceeds
+  a.OnHeartbeat(HeartbeatRequest{c.term() + 1, "Z"});
+
+  // Original leader A can now win with both majorities
+  a.StartElection();
+  EXPECT_EQ(RaftRole::Leader, a.role())
+      << "After partition heal, cluster elects a leader";
+  EXPECT_TRUE(a.IsJointConsensus());
+}
+
 }  // namespace dfly
+

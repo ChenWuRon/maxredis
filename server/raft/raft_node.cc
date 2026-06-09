@@ -1,6 +1,21 @@
 // Copyright 2021, Roman Gershman.  All rights reserved.
 // See LICENSE for licensing terms.
 //
+// STRICT REQUIREMENTS
+// Implement Raft Joint Consensus exactly as described in
+// Raft paper section: "Membership Changes"
+//
+// DO NOT implement one-step membership change.
+// DO NOT directly replace old configuration with new configuration.
+//
+// The implementation MUST use:
+//   Stable → Joint → Stable
+// state transitions.
+//
+// Commit in Joint state MUST require:
+//   majority(old_config) AND majority(new_config)
+// simultaneously.
+//
 
 #include "server/raft/raft_node.h"
 
@@ -62,9 +77,17 @@ std::vector<NodeId> RaftNode::GetPeerIds() const {
                joint_config_.old_config.voters.end());
     all.insert(joint_config_.new_config.voters.begin(),
                joint_config_.new_config.voters.end());
+    all.erase(node_id_);
     return {all.begin(), all.end()};
   }
-  return {cluster_config_.voters.begin(), cluster_config_.voters.end()};
+  auto& voters = cluster_config_.voters;
+  std::vector<NodeId> result;
+  result.reserve(voters.size());
+  for (const auto& v : voters) {
+    if (v != node_id_)
+      result.push_back(v);
+  }
+  return result;
 }
 
 bool RaftNode::BeginConfigChange(ClusterConfig target) {
@@ -504,7 +527,6 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
     return result;
 
   constexpr size_t kBatchSize = 128;
-  LogIndex prev = last_applied_;
 
   while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
     LogIndex start = last_applied_ + 1;
