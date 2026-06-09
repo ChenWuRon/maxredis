@@ -173,11 +173,26 @@ bool RaftStorage::Deserialize(const std::string& data) {
     }
   }
 
-  // Parse voted_for
+  // Parse voted_for (handle escaped quotes)
   pos = find_field(std::string(kFieldVotedFor));
   if (pos != std::string::npos && pos < data.size() && data[pos] == '"') {
-    auto end_quote = data.find('"', pos + 1);
-    if (end_quote != std::string::npos) {
+    bool escaped = false;
+    size_t end_quote = std::string::npos;
+    for (size_t i = pos + 1; i < data.size(); i++) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (data[i] == '\\') {
+        escaped = true;
+        continue;
+      }
+      if (data[i] == '"') {
+        end_quote = i;
+        break;
+      }
+    }
+    if (end_quote != std::string::npos && end_quote > pos + 1) {
       voted_for_ = UnescapeJson(data.substr(pos + 1, end_quote - pos - 1));
     }
   }

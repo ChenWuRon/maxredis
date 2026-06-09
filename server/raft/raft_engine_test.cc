@@ -68,7 +68,8 @@ TEST(RaftEngineTest, FastCommitPathSingleNode) {
 
   // Log entry appended
   EXPECT_EQ(1u, engine.log().LogSize());
-  EXPECT_EQ("SET a 1", engine.log().Get(1).command);
+  ASSERT_NE(nullptr, engine.log().Get(1));
+  EXPECT_EQ("SET a 1", engine.log().Get(1)->command);
 
   // Commit index advanced to last log index
   EXPECT_EQ(1u, engine.group().node().commit_index());

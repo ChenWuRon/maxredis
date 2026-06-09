@@ -23,8 +23,8 @@ class CommandLog : public ILogStorage {
   size_t LogSize() const final;
   LogIndex LastIndex() const final;
   Term LastTerm() const final;
-  const LogEntry& Get(LogIndex index) const final;
-  void Append(LogEntry entry) final;
+  const LogEntry* Get(LogIndex index) const final;
+  LogIndex Append(LogEntry entry) final;
   std::vector<LogEntry> GetRange(LogIndex start, size_t limit = 0) const final;
   void TruncateFrom(LogIndex new_last) final;
   void Clear() final;

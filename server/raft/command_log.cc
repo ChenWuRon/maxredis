@@ -28,20 +28,23 @@ Term CommandLog::LastTerm() const {
   return entries_.back().term;
 }
 
-const LogEntry& CommandLog::Get(LogIndex index) const {
-  DCHECK_LT(index, entries_.size());
-  return entries_[index];
+const LogEntry* CommandLog::Get(LogIndex index) const {
+  if (index >= entries_.size())
+    return nullptr;
+  return &entries_[index];
 }
 
-void CommandLog::Append(LogEntry entry) {
+LogIndex CommandLog::Append(LogEntry entry) {
   entry.index = entries_.size();
   entries_.push_back(std::move(entry));
+  return entry.index;
 }
 
 std::vector<LogEntry> CommandLog::GetRange(LogIndex start, size_t limit) const {
-  DCHECK_GE(start, 1u);
-  DCHECK_LE(start, entries_.size());
+  if (start > LastIndex())
+    return {};
 
+  DCHECK_GE(start, 1u);
   size_t end = (limit == 0) ? entries_.size()
                             : std::min(entries_.size(), size_t(start + limit));
   std::vector<LogEntry> result;

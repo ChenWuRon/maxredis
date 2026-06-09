@@ -620,9 +620,12 @@ TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
   leader.ReplicateLog();
 
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("cmd1", follower_storage.Get(1).command);
-  EXPECT_EQ("cmd2", follower_storage.Get(2).command);
-  EXPECT_EQ("cmd3", follower_storage.Get(3).command);
+  ASSERT_NE(nullptr, follower_storage.Get(1));
+  EXPECT_EQ("cmd1", follower_storage.Get(1)->command);
+  ASSERT_NE(nullptr, follower_storage.Get(2));
+  EXPECT_EQ("cmd2", follower_storage.Get(2)->command);
+  ASSERT_NE(nullptr, follower_storage.Get(3));
+  EXPECT_EQ("cmd3", follower_storage.Get(3)->command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
@@ -647,8 +650,10 @@ TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
   leader.ReplicateLog();
 
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("b", follower_storage.Get(2).command);
-  EXPECT_EQ("c", follower_storage.Get(3).command);
+  ASSERT_NE(nullptr, follower_storage.Get(2));
+  EXPECT_EQ("b", follower_storage.Get(2)->command);
+  ASSERT_NE(nullptr, follower_storage.Get(3));
+  EXPECT_EQ("c", follower_storage.Get(3)->command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesRejectsPrevLogMismatch) {
@@ -697,7 +702,7 @@ TEST_F(RaftNodeTest, AppendEntriesAcceptsMatchingPrevLog) {
 
   EXPECT_TRUE(rsp.success);
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("c", follower_storage.Get(3).command);
+  EXPECT_EQ("c", follower_storage.Get(3)->command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesStaleTermRejected) {
@@ -841,8 +846,8 @@ class MockLogStorage : public ILogStorage {
   MOCK_METHOD(size_t, LogSize, (), (const, override));
   MOCK_METHOD(LogIndex, LastIndex, (), (const, override));
   MOCK_METHOD(Term, LastTerm, (), (const, override));
-  MOCK_METHOD(const LogEntry&, Get, (LogIndex), (const, override));
-  MOCK_METHOD(void, Append, (LogEntry), (override));
+  MOCK_METHOD(const LogEntry*, Get, (LogIndex), (const, override));
+  MOCK_METHOD(LogIndex, Append, (LogEntry), (override));
   MOCK_METHOD(std::vector<LogEntry>, GetRange, (LogIndex, size_t), (const, override));
   MOCK_METHOD(void, TruncateFrom, (LogIndex), (override));
   MOCK_METHOD(void, Clear, (), (override));
@@ -892,7 +897,8 @@ TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
   // Verify peers received the entries
   EXPECT_EQ(5u, f1_storage.LastIndex());
   EXPECT_EQ(5u, f2_storage.LastIndex());
-  EXPECT_EQ("e", f1_storage.Get(5).command);
+  ASSERT_NE(nullptr, f1_storage.Get(5));
+  EXPECT_EQ("e", f1_storage.Get(5)->command);
 }
 
 TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
@@ -924,11 +930,11 @@ TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
       .WillRepeatedly(Return(3));
 
   EXPECT_CALL(mock_storage, Get(1))
-      .WillRepeatedly(ReturnRef(entry1));
+      .WillRepeatedly(Return(&entry1));
   EXPECT_CALL(mock_storage, Get(2))
-      .WillRepeatedly(ReturnRef(entry2));
+      .WillRepeatedly(Return(&entry2));
   EXPECT_CALL(mock_storage, Get(3))
-      .WillRepeatedly(ReturnRef(entry3));
+      .WillRepeatedly(Return(&entry3));
 
   // Should detect conflict at index 3, truncate to index 2, and append leader entry
   EXPECT_CALL(mock_storage, TruncateFrom(2));
@@ -1335,10 +1341,14 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLogReplication) {
   // Followers received entries via Transport->SendAppendEntries
   EXPECT_EQ(2u, f1_storage.LogSize());
   EXPECT_EQ(2u, f2_storage.LogSize());
-  EXPECT_EQ("SET a 1", f1_storage.Get(1).command);
-  EXPECT_EQ("SET b 2", f1_storage.Get(2).command);
-  EXPECT_EQ("SET a 1", f2_storage.Get(1).command);
-  EXPECT_EQ("SET b 2", f2_storage.Get(2).command);
+  ASSERT_NE(nullptr, f1_storage.Get(1));
+  EXPECT_EQ("SET a 1", f1_storage.Get(1)->command);
+  ASSERT_NE(nullptr, f1_storage.Get(2));
+  EXPECT_EQ("SET b 2", f1_storage.Get(2)->command);
+  ASSERT_NE(nullptr, f2_storage.Get(1));
+  EXPECT_EQ("SET a 1", f2_storage.Get(1)->command);
+  ASSERT_NE(nullptr, f2_storage.Get(2));
+  EXPECT_EQ("SET b 2", f2_storage.Get(2)->command);
 
   // CommitIndex advanced (majority = 2, all 3 nodes have entries)
   EXPECT_EQ(2u, leader.commit_index());
@@ -1414,7 +1424,8 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
 
   // N3 received the entry via transport
   EXPECT_EQ(1u, l3_storage.LogSize());
-  EXPECT_EQ("SET x 1", l3_storage.Get(1).command);
+  ASSERT_NE(nullptr, l3_storage.Get(1));
+  EXPECT_EQ("SET x 1", l3_storage.Get(1)->command);
 
   // N1 rejected (higher term)
   EXPECT_EQ(0u, l1_storage.LogSize());

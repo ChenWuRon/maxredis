@@ -32,10 +32,11 @@ TEST_F(CommandLogTest, AppendSingle) {
 TEST_F(CommandLogTest, GetEntry) {
   CommandLog log;
   log.Append(LogEntry(1, 0, "SET a 1"));
-  const auto& entry = log.Get(1);
-  EXPECT_EQ(1u, entry.term);
-  EXPECT_EQ(1u, entry.index);
-  EXPECT_EQ("SET a 1", entry.command);
+  const auto* entry = log.Get(1);
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ(1u, entry->term);
+  EXPECT_EQ(1u, entry->index);
+  EXPECT_EQ("SET a 1", entry->command);
 }
 
 TEST_F(CommandLogTest, IndexAutoAssignment) {
@@ -46,9 +47,12 @@ TEST_F(CommandLogTest, IndexAutoAssignment) {
 
   EXPECT_EQ(3u, log.LogSize());
   EXPECT_EQ(3u, log.LastIndex());
-  EXPECT_EQ(1u, log.Get(1).index);
-  EXPECT_EQ(2u, log.Get(2).index);
-  EXPECT_EQ(3u, log.Get(3).index);
+  ASSERT_NE(nullptr, log.Get(1));
+  EXPECT_EQ(1u, log.Get(1)->index);
+  ASSERT_NE(nullptr, log.Get(2));
+  EXPECT_EQ(2u, log.Get(2)->index);
+  ASSERT_NE(nullptr, log.Get(3));
+  EXPECT_EQ(3u, log.Get(3)->index);
 }
 
 TEST_F(CommandLogTest, SequentialAppend) {
@@ -60,10 +64,13 @@ TEST_F(CommandLogTest, SequentialAppend) {
 
   EXPECT_EQ(100u, log.LogSize());
   EXPECT_EQ(100u, log.LastIndex());
-  EXPECT_EQ(1u, log.Get(1).index);
-  EXPECT_EQ(50u, log.Get(50).index);
-  EXPECT_EQ(100u, log.Get(100).index);
-  EXPECT_EQ("cmd50", log.Get(50).command);
+  ASSERT_NE(nullptr, log.Get(1));
+  EXPECT_EQ(1u, log.Get(1)->index);
+  ASSERT_NE(nullptr, log.Get(50));
+  EXPECT_EQ(50u, log.Get(50)->index);
+  ASSERT_NE(nullptr, log.Get(100));
+  EXPECT_EQ(100u, log.Get(100)->index);
+  EXPECT_EQ("cmd50", log.Get(50)->command);
 }
 
 TEST_F(CommandLogTest, GetPreservesTerms) {
@@ -71,8 +78,10 @@ TEST_F(CommandLogTest, GetPreservesTerms) {
   log.Append(LogEntry(3, 0, "x"));
   log.Append(LogEntry(4, 0, "y"));
 
-  EXPECT_EQ(3u, log.Get(1).term);
-  EXPECT_EQ(4u, log.Get(2).term);
+  ASSERT_NE(nullptr, log.Get(1));
+  EXPECT_EQ(3u, log.Get(1)->term);
+  ASSERT_NE(nullptr, log.Get(2));
+  EXPECT_EQ(4u, log.Get(2)->term);
 }
 
 // --- ILogStorage interface tests ---
@@ -120,7 +129,8 @@ TEST_F(CommandLogTest, TruncateFrom) {
 
   log.TruncateFrom(1);
   EXPECT_EQ(1u, log.LogSize());
-  EXPECT_EQ("a", log.Get(1).command);
+  ASSERT_NE(nullptr, log.Get(1));
+  EXPECT_EQ("a", log.Get(1)->command);
 }
 
 TEST_F(CommandLogTest, Clear) {
@@ -143,9 +153,11 @@ TEST_F(CommandLogTest, AppendLogBatch) {
 
   log.AppendLog(batch);
   EXPECT_EQ(3u, log.LogSize());
-  EXPECT_EQ(1u, log.Get(1).index);
-  EXPECT_EQ(3u, log.Get(3).index);
-  EXPECT_EQ("c", log.Get(3).command);
+  ASSERT_NE(nullptr, log.Get(1));
+  EXPECT_EQ(1u, log.Get(1)->index);
+  ASSERT_NE(nullptr, log.Get(3));
+  EXPECT_EQ(3u, log.Get(3)->index);
+  EXPECT_EQ("c", log.Get(3)->command);
 }
 
 TEST_F(CommandLogTest, TruncateFromThenAppend) {
@@ -160,8 +172,9 @@ TEST_F(CommandLogTest, TruncateFromThenAppend) {
 
   log.Append(LogEntry(2, 0, "new_cmd"));
   EXPECT_EQ(3u, log.LastIndex());
-  EXPECT_EQ("new_cmd", log.Get(3).command);
-  EXPECT_EQ(2u, log.Get(3).term);
+  ASSERT_NE(nullptr, log.Get(3));
+  EXPECT_EQ("new_cmd", log.Get(3)->command);
+  EXPECT_EQ(2u, log.Get(3)->term);
 }
 
 }  // namespace dfly

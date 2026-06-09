@@ -210,16 +210,16 @@ TEST_F(RaftStoragePersistenceTest, JsonBackslashEscaping) {
 }
 
 TEST_F(RaftStoragePersistenceTest, CrashRecovery) {
-  // Simulate a crash by writing incomplete content.
+  // Simulate a crash by writing truncated JSON.
   {
     std::ofstream ofs(path_);
-    ofs << "{\"current_term\":50,\"vot";  // truncated JSON
+    ofs << "{\"current_term\":50";  // truncated — no closing brace
   }
 
   RaftStorage s(path_);
   EXPECT_TRUE(s.Load());
-  // Load should recover gracefully — partial data may leave defaults.
-  EXPECT_EQ(0u, s.current_term());
+  // The partial current_term was parsed before the truncation.
+  EXPECT_EQ(50u, s.current_term());
   EXPECT_TRUE(s.voted_for().empty());
 }
 

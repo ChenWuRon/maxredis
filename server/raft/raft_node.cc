@@ -237,15 +237,18 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
       VLOG(2) << node_id_ << " rejects AppendEntries: gap at prev_log=" << req.prev_log_index;
       return {storage_.current_term(), false, log_storage_->LastIndex()};
     }
-    if (req.prev_log_index > 0 &&
-        log_storage_->Get(req.prev_log_index).term != req.prev_log_term) {
-      VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
-      return {storage_.current_term(), false, req.prev_log_index - 1};
+    if (req.prev_log_index > 0) {
+      const LogEntry* prev = log_storage_->Get(req.prev_log_index);
+      if (!prev || prev->term != req.prev_log_term) {
+        VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
+        return {storage_.current_term(), false, req.prev_log_index - 1};
+      }
     }
 
     for (const auto& entry : req.entries) {
       if (entry.index <= log_storage_->LastIndex()) {
-        if (log_storage_->Get(entry.index).term != entry.term) {
+        const LogEntry* existing = log_storage_->Get(entry.index);
+        if (!existing || existing->term != entry.term) {
           VLOG(1) << node_id_ << " truncate from " << (entry.index - 1);
           log_storage_->TruncateFrom(entry.index - 1);
           log_storage_->Append(entry);
@@ -340,10 +343,14 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
 
   while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
     last_applied_++;
-    const LogEntry& entry = log_storage_->Get(last_applied_);
-    VLOG(1) << node_id_ << " apply[" << last_applied_ << "] term=" << entry.term
-            << " cmd=" << entry.command;
-    result = state_machine_->ApplyLogEntry(entry);
+    const LogEntry* entry = log_storage_->Get(last_applied_);
+    if (!entry) {
+      LOG(WARNING) << node_id_ << " apply[" << last_applied_ << "]: entry not found";
+      break;
+    }
+    VLOG(1) << node_id_ << " apply[" << last_applied_ << "] term=" << entry->term
+            << " cmd=" << entry->command;
+    result = state_machine_->ApplyLogEntry(*entry);
   }
   return result;
 }
