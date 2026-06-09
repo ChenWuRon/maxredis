@@ -9,6 +9,7 @@
 
 #include "server/raft/append_entries_rpc.h"
 #include "server/raft/heartbeat_rpc.h"
+#include "server/raft/log_storage.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/vote_rpc.h"
 #include "util/fibers/fibers.h"
@@ -16,7 +17,6 @@
 namespace dfly {
 
 class IStateMachine;
-class RaftStorage;
 
 class RaftNode {
  public:
@@ -79,9 +79,9 @@ class RaftNode {
   // Stops the heartbeat fiber.
   void StopHeartbeat();
 
-  // Associates a RaftStorage for log operations.
-  void SetStorage(RaftStorage* storage) {
-    storage_ = storage;
+  // Associates a log storage for log operations.
+  void SetLogStorage(ILogStorage* storage) {
+    log_storage_ = storage;
   }
 
   // Associates a state machine for applying committed entries.
@@ -120,7 +120,7 @@ class RaftNode {
   uint32_t vote_count_ = 0;
   std::vector<RaftNode*> peers_;
 
-  RaftStorage* storage_ = nullptr;
+  ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;
   LogIndex commit_index_ = 0;
   LogIndex last_applied_ = 0;

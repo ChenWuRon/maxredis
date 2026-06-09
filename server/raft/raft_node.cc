@@ -7,7 +7,6 @@
 #include <algorithm>
 
 #include "base/logging.h"
-#include "server/raft/raft_storage.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
@@ -152,7 +151,7 @@ void RaftNode::HeartbeatLoop() {
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {
   // Rule 1: Stale term — reject.
   if (req.term < term_) {
-    LogIndex my_last = storage_ ? storage_->LastLogIndex() : 0;
+    LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
     return {term_, false, my_last};
   }
 
@@ -162,29 +161,29 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   }
 
   // Rule 3: Check prev_log_index / prev_log_term match.
-  if (storage_) {
-    if (req.prev_log_index > storage_->LastLogIndex()) {
-      return {term_, false, storage_->LastLogIndex()};
+  if (log_storage_) {
+    if (req.prev_log_index > log_storage_->LastIndex()) {
+      return {term_, false, log_storage_->LastIndex()};
     }
     if (req.prev_log_index > 0 &&
-        storage_->EntryAt(req.prev_log_index).term != req.prev_log_term) {
+        log_storage_->Get(req.prev_log_index).term != req.prev_log_term) {
       return {term_, false, req.prev_log_index - 1};
     }
 
     // Rule 4: Append entries with index matching.
     for (const auto& entry : req.entries) {
-      if (entry.index <= storage_->LastLogIndex()) {
-        if (storage_->EntryAt(entry.index).term != entry.term) {
-          storage_->TruncateSuffix(entry.index - 1);
-          storage_->AppendLog(entry);
+      if (entry.index <= log_storage_->LastIndex()) {
+        if (log_storage_->Get(entry.index).term != entry.term) {
+          log_storage_->TruncateFrom(entry.index - 1);
+          log_storage_->Append(entry);
         }
-      } else if (entry.index == storage_->LastLogIndex() + 1) {
-        storage_->AppendLog(entry);
+      } else if (entry.index == log_storage_->LastIndex() + 1) {
+        log_storage_->Append(entry);
       }
     }
   }
 
-  LogIndex my_last = storage_ ? storage_->LastLogIndex() : 0;
+  LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
 
   // Follower applies entries up to leader_commit.
   if (req.leader_commit > commit_index_) {
@@ -196,7 +195,7 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
 }
 
 void RaftNode::ReplicateLog() {
-  if (!storage_ || peers_.empty())
+  if (!log_storage_ || peers_.empty())
     return;
 
   AppendEntriesRequest req;
@@ -205,9 +204,9 @@ void RaftNode::ReplicateLog() {
   req.leader_commit = commit_index_;
 
   // Send all entries from the beginning.
-  size_t log_size = storage_->LogSize();
+  size_t log_size = log_storage_->LogSize();
   if (log_size > 0) {
-    req.entries = storage_->ReadLog(1);
+    req.entries = log_storage_->GetRange(1);
   }
 
   peer_last_log_index_.resize(peers_.size());
@@ -221,11 +220,11 @@ void RaftNode::ReplicateLog() {
 }
 
 void RaftNode::AdvanceCommitIndex() {
-  if (!storage_)
+  if (!log_storage_)
     return;
 
   std::vector<LogIndex> indexes;
-  indexes.push_back(storage_->LastLogIndex());
+  indexes.push_back(log_storage_->LastIndex());
   for (auto idx : peer_last_log_index_) {
     indexes.push_back(idx);
   }
@@ -241,12 +240,12 @@ void RaftNode::AdvanceCommitIndex() {
 }
 
 void RaftNode::ApplyCommittedLogs() {
-  if (!state_machine_ || !storage_)
+  if (!state_machine_ || !log_storage_)
     return;
 
-  while (last_applied_ < commit_index_ && last_applied_ < storage_->LastLogIndex()) {
+  while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
     last_applied_++;
-    const LogEntry& entry = storage_->EntryAt(last_applied_);
+    const LogEntry& entry = log_storage_->Get(last_applied_);
     state_machine_->ApplyLogEntry(entry);
   }
 }

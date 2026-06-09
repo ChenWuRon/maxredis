@@ -7,26 +7,42 @@
 #include <cstddef>
 #include <vector>
 
+#include "server/raft/log_storage.h"
 #include "server/raft/raft_types.h"
 
 namespace dfly {
 
-class CommandLog {
+// In-memory implementation of ILogStorage.
+// Entries are 1-indexed: entries_[0] is a sentinel.
+class CommandLog : public ILogStorage {
  public:
   CommandLog();
 
-  // Returns the number of entries.
-  size_t Size() const;
+  // --- ILogStorage interface ---
 
-  // Returns the index of the last entry (0 if empty).
-  LogIndex LastIndex() const;
+  size_t LogSize() const final;
+  LogIndex LastIndex() const final;
+  Term LastTerm() const final;
+  const LogEntry& Get(LogIndex index) const final;
+  void Append(LogEntry entry) final;
+  std::vector<LogEntry> GetRange(LogIndex start, size_t limit = 0) const final;
+  void TruncateFrom(LogIndex new_last) final;
+  void Clear() final;
 
-  // Appends an entry. Automatically assigns its index.
-  void Append(LogEntry entry);
+  // --- Legacy aliases (for backward compatibility) ---
 
-  // Returns a reference to the entry at 'index'. 1-based.
-  // Requires 1 <= index <= LastIndex().
-  const LogEntry& Get(LogIndex index) const;
+  size_t Size() const {
+    return LogSize();
+  }
+
+  void AppendLog(LogEntry entry) {
+    Append(std::move(entry));
+  }
+
+  void AppendLog(const std::vector<LogEntry>& entries);
+
+  // Batch append (not part of ILogStorage, kept for compatibility).
+  void AppendBatch(const std::vector<LogEntry>& entries);
 
  private:
   // entries_[i] corresponds to log index i. entries_[0] is a sentinel.

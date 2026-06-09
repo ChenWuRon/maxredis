@@ -10,6 +10,7 @@ namespace dfly {
 
 RaftEngine::RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp)
     : kv_(shard_set, pp), group_(0) {
+  group_.node().SetLogStorage(&log_);
 }
 
 ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {

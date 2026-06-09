@@ -10,7 +10,8 @@
 #include <vector>
 
 #include "base/gtest.h"
-#include "server/raft/raft_storage.h"
+#include "server/raft/command_log.h"
+#include "server/raft/log_storage.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
@@ -264,11 +265,6 @@ TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
   n1.AddPeer(&n3);
 
   ElectionResult r = n1.StartElection();
-  // n1 term = 2 (since n2 has term 1, n1 becomes term 2 via Follower step-down)
-  // Actually: n1.StartElection → BecomeCandidate → term 0→1
-  // n2 rejects (voted for Other), n3 grants
-  // votes = self(1) + n3(1) = 2
-  // Majority = 3/2+1 = 2
   EXPECT_EQ(2u, r.votes_received);
   EXPECT_EQ(RaftRole::Leader, n1.role());
 }
@@ -404,56 +400,56 @@ TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
 // --- AppendEntries tests ---
 
 TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
-  RaftStorage leader_storage, follower_storage;
+  CommandLog leader_storage, follower_storage;
   RaftNode leader("L1"), follower("F1");
-  leader.SetStorage(&leader_storage);
-  follower.SetStorage(&follower_storage);
+  leader.SetLogStorage(&leader_storage);
+  follower.SetLogStorage(&follower_storage);
   leader.AddPeer(&follower);
 
-  leader_storage.AppendLog(LogEntry{1, 0, "cmd1"});
-  leader_storage.AppendLog(LogEntry{1, 0, "cmd2"});
-  leader_storage.AppendLog(LogEntry{2, 0, "cmd3"});
+  leader_storage.Append(LogEntry{1, 0, "cmd1"});
+  leader_storage.Append(LogEntry{1, 0, "cmd2"});
+  leader_storage.Append(LogEntry{2, 0, "cmd3"});
 
   leader.ReplicateLog();
 
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("cmd1", follower_storage.EntryAt(1).command);
-  EXPECT_EQ("cmd2", follower_storage.EntryAt(2).command);
-  EXPECT_EQ("cmd3", follower_storage.EntryAt(3).command);
+  EXPECT_EQ("cmd1", follower_storage.Get(1).command);
+  EXPECT_EQ("cmd2", follower_storage.Get(2).command);
+  EXPECT_EQ("cmd3", follower_storage.Get(3).command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
-  RaftStorage leader_storage, follower_storage;
+  CommandLog leader_storage, follower_storage;
   RaftNode leader("L1"), follower("F1");
-  leader.SetStorage(&leader_storage);
-  follower.SetStorage(&follower_storage);
+  leader.SetLogStorage(&leader_storage);
+  follower.SetLogStorage(&follower_storage);
   leader.AddPeer(&follower);
 
-  leader_storage.AppendLog(LogEntry{1, 0, "a"});
-  leader_storage.AppendLog(LogEntry{1, 0, "b"});
-  leader_storage.AppendLog(LogEntry{2, 0, "c"});
+  leader_storage.Append(LogEntry{1, 0, "a"});
+  leader_storage.Append(LogEntry{1, 0, "b"});
+  leader_storage.Append(LogEntry{2, 0, "c"});
 
   // Follower already has first entry
-  follower_storage.AppendLog(LogEntry{1, 0, "a"});
+  follower_storage.Append(LogEntry{1, 0, "a"});
 
   leader.ReplicateLog();
 
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("b", follower_storage.EntryAt(2).command);
-  EXPECT_EQ("c", follower_storage.EntryAt(3).command);
+  EXPECT_EQ("b", follower_storage.Get(2).command);
+  EXPECT_EQ("c", follower_storage.Get(3).command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesRejectsPrevLogMismatch) {
-  RaftStorage leader_storage, follower_storage;
+  CommandLog leader_storage, follower_storage;
   RaftNode leader("L1"), follower("F1");
-  leader.SetStorage(&leader_storage);
-  follower.SetStorage(&follower_storage);
+  leader.SetLogStorage(&leader_storage);
+  follower.SetLogStorage(&follower_storage);
   leader.AddPeer(&follower);
 
-  leader_storage.AppendLog(LogEntry{2, 0, "x"});
+  leader_storage.Append(LogEntry{2, 0, "x"});
 
   // Follower has a different entry at index 1
-  follower_storage.AppendLog(LogEntry{1, 0, "y"});
+  follower_storage.Append(LogEntry{1, 0, "y"});
 
   // Manually send with specific prev_log_index/term that won't match
   AppendEntriesRequest req;
@@ -469,12 +465,12 @@ TEST_F(RaftNodeTest, AppendEntriesRejectsPrevLogMismatch) {
 }
 
 TEST_F(RaftNodeTest, AppendEntriesAcceptsMatchingPrevLog) {
-  RaftStorage follower_storage;
+  CommandLog follower_storage;
   RaftNode follower("F1");
-  follower.SetStorage(&follower_storage);
+  follower.SetLogStorage(&follower_storage);
 
-  follower_storage.AppendLog(LogEntry{1, 0, "a"});
-  follower_storage.AppendLog(LogEntry{2, 0, "b"});
+  follower_storage.Append(LogEntry{1, 0, "a"});
+  follower_storage.Append(LogEntry{2, 0, "b"});
 
   AppendEntriesRequest req;
   req.term = 2;
@@ -489,13 +485,13 @@ TEST_F(RaftNodeTest, AppendEntriesAcceptsMatchingPrevLog) {
 
   EXPECT_TRUE(rsp.success);
   EXPECT_EQ(3, follower_storage.LogSize());
-  EXPECT_EQ("c", follower_storage.EntryAt(3).command);
+  EXPECT_EQ("c", follower_storage.Get(3).command);
 }
 
 TEST_F(RaftNodeTest, AppendEntriesStaleTermRejected) {
-  RaftStorage follower_storage;
+  CommandLog follower_storage;
   RaftNode follower("F1");
-  follower.SetStorage(&follower_storage);
+  follower.SetLogStorage(&follower_storage);
   follower.BecomeFollower(10);
 
   AppendEntriesRequest req;
@@ -531,19 +527,19 @@ class TestStateMachine : public IStateMachine {
 };
 
 TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
-  RaftStorage leader_storage, f1_storage, f2_storage;
+  CommandLog leader_storage, f1_storage, f2_storage;
   TestStateMachine sm;
 
   RaftNode leader("L1"), follower1("F1"), follower2("F2");
-  leader.SetStorage(&leader_storage);
+  leader.SetLogStorage(&leader_storage);
   leader.SetStateMachine(&sm);
-  follower1.SetStorage(&f1_storage);
-  follower2.SetStorage(&f2_storage);
+  follower1.SetLogStorage(&f1_storage);
+  follower2.SetLogStorage(&f2_storage);
   leader.AddPeer(&follower1);
   leader.AddPeer(&follower2);
 
-  leader_storage.AppendLog(LogEntry{1, 0, "SET a 1"});
-  leader_storage.AppendLog(LogEntry{1, 0, "SET b 2"});
+  leader_storage.Append(LogEntry{1, 0, "SET a 1"});
+  leader_storage.Append(LogEntry{1, 0, "SET b 2"});
 
   leader.ReplicateLog();
 
@@ -558,31 +554,31 @@ TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
 
 TEST_F(RaftNodeTest, CommitStopsWithoutMajority) {
   // 5 nodes: majority = 3. Only 2 peers receive the entry → commit doesn't advance.
-  RaftStorage leader_storage;
+  CommandLog leader_storage;
   TestStateMachine sm;
 
   RaftNode leader("L1");
-  leader.SetStorage(&leader_storage);
+  leader.SetLogStorage(&leader_storage);
   leader.SetStateMachine(&sm);
 
   RaftNode p1("P1"), p2("P2"), p3("P3"), p4("P4");
-  RaftStorage s1, s2, s3, s4;
-  p1.SetStorage(&s1);
-  p2.SetStorage(&s2);
-  p3.SetStorage(&s3);
-  p4.SetStorage(&s4);
+  CommandLog s1, s2, s3, s4;
+  p1.SetLogStorage(&s1);
+  p2.SetLogStorage(&s2);
+  p3.SetLogStorage(&s3);
+  p4.SetLogStorage(&s4);
   leader.AddPeer(&p1);
   leader.AddPeer(&p2);
   leader.AddPeer(&p3);
   leader.AddPeer(&p4);
 
-  leader_storage.AppendLog(LogEntry{1, 0, "SET a 1"});
+  leader_storage.Append(LogEntry{1, 0, "SET a 1"});
 
   // Manually replicate to only 1 peer (total with leader = 2, majority = 3)
   AppendEntriesRequest req;
   req.term = 1;
   req.leader_id = "L1";
-  req.entries = leader_storage.ReadLog(1);
+  req.entries = leader_storage.GetRange(1);
   p1.OnAppendEntries(req);
 
   // Update peer tracking manually
@@ -594,14 +590,14 @@ TEST_F(RaftNodeTest, CommitStopsWithoutMajority) {
 }
 
 TEST_F(RaftNodeTest, FollowerAppliesViaLeaderCommit) {
-  RaftStorage storage;
+  CommandLog storage;
   TestStateMachine sm;
   RaftNode follower("F1");
-  follower.SetStorage(&storage);
+  follower.SetLogStorage(&storage);
   follower.SetStateMachine(&sm);
 
-  storage.AppendLog(LogEntry{1, 0, "SET a 1"});
-  storage.AppendLog(LogEntry{1, 0, "SET b 2"});
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
 
   // Simulate leader sending AppendEntries with leader_commit=2
   AppendEntriesRequest req;
@@ -617,6 +613,106 @@ TEST_F(RaftNodeTest, FollowerAppliesViaLeaderCommit) {
   ASSERT_EQ(2u, sm.applied.size());
   EXPECT_EQ("SET a 1", sm.applied[0].command);
   EXPECT_EQ("SET b 2", sm.applied[1].command);
+}
+
+// --- ILogStorage mock-based tests ---
+
+// A mock ILogStorage for testing RaftNode interactions.
+class MockLogStorage : public ILogStorage {
+ public:
+  MOCK_METHOD(size_t, LogSize, (), (const, override));
+  MOCK_METHOD(LogIndex, LastIndex, (), (const, override));
+  MOCK_METHOD(Term, LastTerm, (), (const, override));
+  MOCK_METHOD(const LogEntry&, Get, (LogIndex), (const, override));
+  MOCK_METHOD(void, Append, (LogEntry), (override));
+  MOCK_METHOD(std::vector<LogEntry>, GetRange, (LogIndex, size_t), (const, override));
+  MOCK_METHOD(void, TruncateFrom, (LogIndex), (override));
+  MOCK_METHOD(void, Clear, (), (override));
+
+  // Convenience helper for GetRange with default limit.
+  std::vector<LogEntry> GetRange(LogIndex start) const {
+    return GetRange(start, 0);
+  }
+};
+
+TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
+  MockLogStorage mock_storage;
+  CommandLog f1_storage, f2_storage;
+
+  RaftNode node("N1"), f1("F1"), f2("F2");
+  node.SetLogStorage(&mock_storage);
+  f1.SetLogStorage(&f1_storage);
+  f2.SetLogStorage(&f2_storage);
+  node.AddPeer(&f1);
+  node.AddPeer(&f2);
+
+  EXPECT_CALL(mock_storage, LastIndex())
+      .WillOnce(Return(5));
+
+  EXPECT_CALL(mock_storage, GetRange(1, 0))
+      .WillOnce(Return(std::vector<LogEntry>{
+          LogEntry{1, 1, "a"}, LogEntry{1, 2, "b"}, LogEntry{1, 3, "c"},
+          LogEntry{2, 4, "d"}, LogEntry{2, 5, "e"}}));
+
+  EXPECT_CALL(mock_storage, LogSize())
+      .WillRepeatedly(Return(5));
+
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  node.ReplicateLog();
+
+  // commit_index should advance (3 nodes, majority=2, all have 5 entries)
+  EXPECT_EQ(5u, node.commit_index());
+
+  // Verify peers received the entries
+  EXPECT_EQ(5u, f1_storage.LastIndex());
+  EXPECT_EQ(5u, f2_storage.LastIndex());
+  EXPECT_EQ("e", f1_storage.Get(5).command);
+}
+
+TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
+  MockLogStorage mock_storage;
+  RaftNode follower("F1");
+  follower.SetLogStorage(&mock_storage);
+
+  // Follower log:
+  // idx 1: term 1, "a"
+  // idx 2: term 2, "b"
+  // idx 3: term 2, "c"
+  LogEntry entry1{1, 1, "a"};
+  LogEntry entry2{2, 2, "b"};
+  LogEntry entry3{2, 3, "c"};
+
+  // Leader sends a heartbeat with new entries.
+  // prev_log_index=2, prev_log_term=2 matches follower → pass the check.
+  // Then at index 3, leader's entry has term 3 but follower has term 2 → conflict!
+  AppendEntriesRequest req;
+  req.term = 3;
+  req.leader_id = "L1";
+  req.prev_log_index = 2;
+  req.prev_log_term = 2;  // matches follower's idx 2
+
+  LogEntry leader_entry{3, 3, "SET x 1"};  // term 3 at index 3 — conflicts with follower
+  req.entries = {leader_entry};
+
+  EXPECT_CALL(mock_storage, LastIndex())
+      .WillRepeatedly(Return(3));
+
+  EXPECT_CALL(mock_storage, Get(1))
+      .WillRepeatedly(ReturnRef(entry1));
+  EXPECT_CALL(mock_storage, Get(2))
+      .WillRepeatedly(ReturnRef(entry2));
+  EXPECT_CALL(mock_storage, Get(3))
+      .WillRepeatedly(ReturnRef(entry3));
+
+  // Should detect conflict at index 3, truncate to index 2, and append leader entry
+  EXPECT_CALL(mock_storage, TruncateFrom(2));
+  EXPECT_CALL(mock_storage, Append(_));
+
+  AppendEntriesResponse rsp = follower.OnAppendEntries(req);
+
+  EXPECT_TRUE(rsp.success);
 }
 
 }  // namespace dfly
