@@ -1009,6 +1009,101 @@ TEST_F(RaftNodeTest, SingleNodeCommitFollowerRole) {
   EXPECT_EQ(1u, node.last_applied());
 }
 
+// ---------------------------------------------------------------------------
+// CommitIndex and Apply pipeline tests.
+// ---------------------------------------------------------------------------
+
+// Directly tests AdvanceCommitIndex: 3 log entries, majority reached.
+// commit_index advances 0 → 3.
+TEST_F(RaftNodeTest, AdvanceCommitIndex) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
+  storage.Append(LogEntry{1, 0, "SET c 3"});
+
+  EXPECT_EQ(0u, node.commit_index());
+
+  // Single-node: majority = 1, LastIndex = 3 → commit_index = 3.
+  node.AdvanceCommitIndex();
+
+  EXPECT_EQ(3u, node.commit_index());
+  EXPECT_EQ(0u, node.last_applied());  // Apply not yet called.
+}
+
+// Directly tests ApplyCommittedLogs: 3 committed entries applied in order.
+TEST_F(RaftNodeTest, ApplyCommittedLogs) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
+  storage.Append(LogEntry{1, 0, "SET c 3"});
+
+  node.AdvanceCommitIndex();
+  EXPECT_EQ(3u, node.commit_index());
+
+  ApplyResult result = node.ApplyCommittedLogs();
+
+  EXPECT_EQ(3u, node.last_applied());
+  ASSERT_EQ(3u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
+  EXPECT_EQ("SET c 3", sm.applied[2].command);
+  EXPECT_EQ(ApplyOp::OK, result.op);
+  // affected_rows is from the last applied entry only.
+  EXPECT_EQ(1u, result.affected_rows);
+}
+
+// Idempotency: calling AdvanceCommitIndex + ApplyCommittedLogs twice
+// must not duplicate or skip entries.
+TEST_F(RaftNodeTest, ApplyOrderPreserved) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
+  storage.Append(LogEntry{1, 0, "SET c 3"});
+
+  // Round 1: advance and apply.
+  node.AdvanceCommitIndex();
+  node.ApplyCommittedLogs();
+
+  EXPECT_EQ(3u, node.commit_index());
+  EXPECT_EQ(3u, node.last_applied());
+  ASSERT_EQ(3u, sm.applied.size());
+
+  // Round 2: same operation — must be a no-op.
+  node.AdvanceCommitIndex();
+  ApplyResult result = node.ApplyCommittedLogs();
+
+  EXPECT_EQ(3u, node.commit_index());   // unchanged
+  EXPECT_EQ(3u, node.last_applied());   // unchanged
+  ASSERT_EQ(3u, sm.applied.size());     // not 6 — no duplicate apply
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
+  EXPECT_EQ("SET c 3", sm.applied[2].command);
+  // No entries applied on second call.
+  EXPECT_EQ(ApplyOp::OK, result.op);
+  EXPECT_EQ(0u, result.affected_rows);
+}
+
 TEST_F(RaftNodeTest, CommandEncoderEncodesSET) {
   CommandId set_cmd("SET", CO::WRITE, -3, 1, 1, 1);
   auto args_vec = MakeCmdArgs({"SET", "a", "1"});
