@@ -4,6 +4,8 @@
 
 #include "server/raft/raft_engine.h"
 
+#include "server/raft/command_encoder.h"
+#include "server/raft/raft_node.h"
 #include "server/service/command_registry.h"
 
 namespace dfly {
@@ -15,7 +17,20 @@ RaftEngine::RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp)
 }
 
 ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
-  return kv_.Apply(cid, args);
+  auto cmd = CommandEncoder::Encode(cid, args);
+
+  if (!cmd) {
+    return kv_.Apply(cid, args);
+  }
+
+  if (group_.node().role() != RaftRole::Leader) {
+    return {ApplyOp::ERROR, 0};
+  }
+
+  LogEntry entry(group_.node().term(), 0, cmd->Serialize());
+  log_.Append(entry);
+
+  return group_.node().ReplicateLog();
 }
 
 bool RaftEngine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {

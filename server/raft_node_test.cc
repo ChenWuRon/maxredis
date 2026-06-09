@@ -6,12 +6,16 @@
 
 #include <gmock/gmock.h>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "base/gtest.h"
 #include "server/raft/command_log.h"
+#include "server/raft/command_encoder.h"
 #include "server/raft/log_storage.h"
+#include "server/raft/replicated_command.h"
+#include "server/service/command_registry.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
@@ -857,6 +861,154 @@ TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
   AppendEntriesResponse rsp = follower.OnAppendEntries(req);
 
   EXPECT_TRUE(rsp.success);
+}
+
+// --- New pipeline tests ---
+
+// Helper to create a CmdArgList from string literals for testing.
+std::vector<MutableStrSpan> MakeCmdArgs(std::initializer_list<const char*> args) {
+  std::vector<MutableStrSpan> result;
+  for (auto* s : args) {
+    result.emplace_back(const_cast<char*>(s), strlen(s));
+  }
+  return result;
+}
+
+TEST_F(RaftNodeTest, SingleNodeCommitAdvances) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+
+  ApplyResult result = node.ReplicateLog();
+
+  EXPECT_EQ(1u, node.commit_index());
+  EXPECT_EQ(1u, node.last_applied());
+  ASSERT_EQ(1u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ(ApplyOp::OK, result.op);
+  EXPECT_EQ(1u, result.affected_rows);
+}
+
+TEST_F(RaftNodeTest, SingleNodeCommitMultipleEntries) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+  node.BecomeCandidate();
+  node.BecomeLeader();
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+  storage.Append(LogEntry{1, 0, "SET b 2"});
+
+  ApplyResult result = node.ReplicateLog();
+
+  EXPECT_EQ(2u, node.commit_index());
+  EXPECT_EQ(2u, node.last_applied());
+  ASSERT_EQ(2u, sm.applied.size());
+  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ("SET b 2", sm.applied[1].command);
+  EXPECT_EQ(result.op, ApplyOp::OK);
+}
+
+TEST_F(RaftNodeTest, SingleNodeCommitFollowerRole) {
+  CommandLog storage;
+  TestStateMachine sm;
+  RaftNode node("N1");
+  node.SetLogStorage(&storage);
+  node.SetStateMachine(&sm);
+
+  storage.Append(LogEntry{1, 0, "SET a 1"});
+
+  node.ReplicateLog();
+
+  // Single-node with no peers should commit regardless of role.
+  EXPECT_EQ(1u, node.commit_index());
+  EXPECT_EQ(1u, node.last_applied());
+}
+
+TEST_F(RaftNodeTest, CommandEncoderEncodesSET) {
+  CommandId set_cmd("SET", CO::WRITE, -3, 1, 1, 1);
+  auto args_vec = MakeCmdArgs({"SET", "a", "1"});
+  CmdArgList args{args_vec.data(), args_vec.size()};
+
+  auto cmd = CommandEncoder::Encode(&set_cmd, args);
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(CommandType::SET, cmd->type);
+  ASSERT_EQ(3u, cmd->args.size());
+  EXPECT_EQ("SET", cmd->args[0]);
+  EXPECT_EQ("a", cmd->args[1]);
+  EXPECT_EQ("1", cmd->args[2]);
+  EXPECT_EQ("SET a 1", cmd->Serialize());
+}
+
+TEST_F(RaftNodeTest, CommandEncoderEncodesDEL) {
+  CommandId del_cmd("DEL", CO::WRITE, -2, 1, 1, 1);
+  auto args_vec = MakeCmdArgs({"DEL", "mykey"});
+  CmdArgList args{args_vec.data(), args_vec.size()};
+
+  auto cmd = CommandEncoder::Encode(&del_cmd, args);
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(CommandType::DEL, cmd->type);
+  ASSERT_EQ(2u, cmd->args.size());
+  EXPECT_EQ("DEL", cmd->args[0]);
+  EXPECT_EQ("mykey", cmd->args[1]);
+  EXPECT_EQ("DEL mykey", cmd->Serialize());
+}
+
+TEST_F(RaftNodeTest, CommandEncoderEncodesEXPIRE) {
+  CommandId expire_cmd("EXPIRE", CO::WRITE, 3, 1, 1, 1);
+  auto args_vec = MakeCmdArgs({"EXPIRE", "a", "10"});
+  CmdArgList args{args_vec.data(), args_vec.size()};
+
+  auto cmd = CommandEncoder::Encode(&expire_cmd, args);
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(CommandType::EXPIRE, cmd->type);
+  ASSERT_EQ(3u, cmd->args.size());
+  EXPECT_EQ("EXPIRE", cmd->args[0]);
+  EXPECT_EQ("a", cmd->args[1]);
+  EXPECT_EQ("10", cmd->args[2]);
+  EXPECT_EQ("EXPIRE a 10", cmd->Serialize());
+}
+
+TEST_F(RaftNodeTest, CommandEncoderRejectsReadOnly) {
+  CommandId get_cmd("GET", CO::READONLY | CO::FAST, 2, 1, 1, 1);
+  auto args_vec = MakeCmdArgs({"GET", "a"});
+  CmdArgList args{args_vec.data(), args_vec.size()};
+
+  auto cmd = CommandEncoder::Encode(&get_cmd, args);
+  EXPECT_FALSE(cmd.has_value());
+}
+
+TEST_F(RaftNodeTest, CommandEncoderRejectsUnknown) {
+  CommandId unknown_cmd("UNKNOWN", CO::WRITE, -1, 0, 0, 0);
+  auto args_vec = MakeCmdArgs({"UNKNOWN", "arg"});
+  CmdArgList args{args_vec.data(), args_vec.size()};
+
+  auto cmd = CommandEncoder::Encode(&unknown_cmd, args);
+  EXPECT_FALSE(cmd.has_value());
+}
+
+TEST_F(RaftNodeTest, ReplicatedCommandRoundTrip) {
+  ReplicatedCommand original;
+  original.type = CommandType::SET;
+  original.args = {"SET", "a", "1"};
+
+  std::string serialized = original.Serialize();
+  EXPECT_EQ("SET a 1", serialized);
+
+  ReplicatedCommand deserialized = ReplicatedCommand::Deserialize(serialized);
+  EXPECT_EQ(original.type, deserialized.type);
+  ASSERT_EQ(original.args.size(), deserialized.args.size());
+  EXPECT_EQ(original.args[0], deserialized.args[0]);
+  EXPECT_EQ(original.args[1], deserialized.args[1]);
+  EXPECT_EQ(original.args[2], deserialized.args[2]);
 }
 
 }  // namespace dfly

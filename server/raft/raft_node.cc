@@ -242,16 +242,22 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   return {term_, true, my_last};
 }
 
-void RaftNode::ReplicateLog() {
-  if (!log_storage_ || peers_.empty())
-    return;
+ApplyResult RaftNode::ReplicateLog() {
+  if (!log_storage_)
+    return {};
+
+  if (peers_.empty()) {
+    if (commit_index_ < log_storage_->LastIndex()) {
+      commit_index_ = log_storage_->LastIndex();
+    }
+    return ApplyCommittedLogs();
+  }
 
   AppendEntriesRequest req;
   req.term = term_;
   req.leader_id = node_id_;
   req.leader_commit = commit_index_;
 
-  // Send all entries from the beginning.
   size_t log_size = log_storage_->LogSize();
   if (log_size > 0) {
     req.entries = log_storage_->GetRange(1);
@@ -264,7 +270,7 @@ void RaftNode::ReplicateLog() {
   }
 
   AdvanceCommitIndex();
-  ApplyCommittedLogs();
+  return ApplyCommittedLogs();
 }
 
 void RaftNode::AdvanceCommitIndex() {
@@ -294,15 +300,17 @@ void RaftNode::AdvanceCommitIndex() {
   }
 }
 
-void RaftNode::ApplyCommittedLogs() {
+ApplyResult RaftNode::ApplyCommittedLogs() {
+  ApplyResult result;
   if (!state_machine_ || !log_storage_)
-    return;
+    return result;
 
   while (last_applied_ < commit_index_ && last_applied_ < log_storage_->LastIndex()) {
     last_applied_++;
     const LogEntry& entry = log_storage_->Get(last_applied_);
-    state_machine_->ApplyLogEntry(entry);
+    result = state_machine_->ApplyLogEntry(entry);
   }
+  return result;
 }
 
 }  // namespace dfly

@@ -289,7 +289,11 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
   for (unsigned i = 0; i < pcmd.argc; ++i) {
     cmd_vec.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
   }
-  engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
+  ApplyResult result = engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
+
+  if (result.op == ApplyOp::ERROR) {
+    return cntx->SendError("READONLY You can't write against a non-leader");
+  }
 
   cntx->SendStored();
 
@@ -333,6 +337,10 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
   }
   ApplyResult result = engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
 
+  if (result.op == ApplyOp::ERROR) {
+    return cntx->SendError("READONLY You can't write against a non-leader");
+  }
+
   cntx->SendLong(result.affected_rows);
 
   if (!replay_mode_) {
@@ -357,10 +365,18 @@ void Service::Expire(CmdArgList args, ConnectionContext* cntx) {
     return cntx->SendError("value is not an integer or out of range");
   }
 
-  uint64_t expire_at_ms = NowMs() + seconds * 1000;
-  bool found = engine_.Expire(0, key, expire_at_ms);
+  CmdArgVec cmd_vec;
+  cmd_vec.reserve(pcmd.argc);
+  for (unsigned i = 0; i < pcmd.argc; ++i) {
+    cmd_vec.emplace_back(pcmd.tokens[i], sdslen(pcmd.tokens[i]));
+  }
+  ApplyResult result = engine_.SubmitCommand(cntx->cid, CmdArgList{cmd_vec.data(), cmd_vec.size()});
 
-  cntx->SendLong(found ? 1 : 0);
+  if (result.op == ApplyOp::ERROR) {
+    return cntx->SendError("READONLY You can't write against a non-leader");
+  }
+
+  cntx->SendLong(result.affected_rows);
 }
 
 bool Service::CreateSnapshot() {

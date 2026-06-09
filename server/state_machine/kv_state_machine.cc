@@ -4,6 +4,7 @@
 
 #include "server/state_machine/kv_state_machine.h"
 
+#include <absl/strings/numbers.h>
 #include <absl/time/clock.h>
 
 #include "server/raft/raft_types.h"
@@ -100,6 +101,19 @@ ApplyResult KvStateMachine::ApplyLogEntry(const LogEntry& entry) {
   if (name == "DEL") {
     bool deleted = Del(0, cmd.substr(space1 + 1));
     return {ApplyOp::OK, deleted ? 1u : 0u};
+  }
+  if (name == "EXPIRE") {
+    auto space2 = cmd.find(' ', space1 + 1);
+    if (space2 == string_view::npos)
+      return {ApplyOp::ERROR, 0};
+    string_view key = cmd.substr(space1 + 1, space2 - space1 - 1);
+    string_view val = cmd.substr(space2 + 1);
+    int64_t seconds;
+    if (!absl::SimpleAtoi(val, &seconds) || seconds < 0)
+      return {ApplyOp::ERROR, 0};
+    uint64_t expire_at_ms = NowMs() + seconds * 1000;
+    bool found = Expire(0, key, expire_at_ms);
+    return {ApplyOp::OK, found ? 1u : 0u};
   }
   return {ApplyOp::ERROR, 0};
 }

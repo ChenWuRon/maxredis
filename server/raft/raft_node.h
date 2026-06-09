@@ -13,11 +13,10 @@
 #include "server/raft/log_storage.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/vote_rpc.h"
+#include "server/state_machine/state_machine.h"
 #include "util/fibers/fibers.h"
 
 namespace dfly {
-
-class IStateMachine;
 
 class RaftNode {
  public:
@@ -111,13 +110,15 @@ class RaftNode {
   AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
 
   // Leader-side: sends all log entries to every peer.
-  void ReplicateLog();
+  // Returns the ApplyResult of the last committed entry.
+  ApplyResult ReplicateLog();
 
   // Advances commit_index when a majority of peers have replicated an entry.
   void AdvanceCommitIndex();
 
   // Applies entries from last_applied+1 up to commit_index.
-  void ApplyCommittedLogs();
+  // Returns the ApplyResult of the last entry applied.
+  ApplyResult ApplyCommittedLogs();
 
  private:
   void HeartbeatLoop();
