@@ -27,10 +27,12 @@
 #include "server/raft/apply_progress.h"
 #include "server/raft/election_timer.h"
 #include "server/raft/heartbeat_rpc.h"
+#include "server/raft/install_snapshot_rpc.h"
 #include "server/raft/log_storage.h"
 #include "server/raft/peer_manager.h"
 #include "server/raft/raft_storage.h"
 #include "server/raft/raft_types.h"
+#include "server/raft/snapshot_receiver.h"
 #include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/state_machine/state_machine.h"
@@ -173,6 +175,10 @@ class RaftNode {
     log_storage_ = storage;
   }
 
+  void SetSnapshotReceiver(SnapshotReceiver* receiver) {
+    snapshot_receiver_ = receiver;
+  }
+
   // Associates a state machine for applying committed entries.
   void SetStateMachine(IStateMachine* sm) {
     state_machine_ = sm;
@@ -196,6 +202,9 @@ class RaftNode {
 
   // Follower-side: processes an incoming AppendEntries request.
   AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
+
+  // Follower-side: processes an incoming InstallSnapshot request.
+  InstallSnapshotResponse OnInstallSnapshot(const InstallSnapshotRequest& req);
 
   // Leader-side: sends all log entries to every peer.
   // Returns the ApplyResult of the last committed entry.
@@ -244,6 +253,7 @@ class RaftNode {
 
   ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;
+  SnapshotReceiver* snapshot_receiver_ = nullptr;
   LogIndex commit_index_ = 0;
   LogIndex last_applied_ = 0;
   LogIndex last_snapshot_index_ = 0;

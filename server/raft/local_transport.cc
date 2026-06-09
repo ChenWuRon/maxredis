@@ -36,4 +36,11 @@ AppendEntriesResponse LocalTransport::SendAppendEntries(const NodeId& peer_id,
   return it->second->OnAppendEntries(request);
 }
 
+InstallSnapshotResponse LocalTransport::SendInstallSnapshot(const NodeId& peer_id,
+                                                             const InstallSnapshotRequest& request) {
+  auto it = nodes_.find(peer_id);
+  DCHECK(it != nodes_.end()) << "Unknown peer: " << peer_id;
+  return it->second->OnInstallSnapshot(request);
+}
+
 }  // namespace dfly

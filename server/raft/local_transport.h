@@ -21,6 +21,9 @@ class LocalTransport : public Transport {
   AppendEntriesResponse SendAppendEntries(const NodeId& peer_id,
                                            const AppendEntriesRequest& request) override;
 
+  InstallSnapshotResponse SendInstallSnapshot(const NodeId& peer_id,
+                                               const InstallSnapshotRequest& request) override;
+
   bool HasNode(const NodeId& id) const;
 
  private:

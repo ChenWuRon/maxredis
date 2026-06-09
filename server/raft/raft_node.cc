@@ -399,6 +399,28 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
   return {storage_.current_term(), true, my_last};
 }
 
+InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest& req) {
+  Term cur_term = storage_.current_term();
+  if (req.term < cur_term) {
+    VLOG(2) << node_id_ << " rejects InstallSnapshot from " << req.leader_id
+            << ": stale term " << req.term << " < " << cur_term;
+    return {cur_term, false};
+  }
+
+  if (req.term >= cur_term) {
+    VLOG(1) << node_id_ << " accepts InstallSnapshot from leader " << req.leader_id
+            << " index=" << req.last_included_index;
+    BecomeFollower(req.term);
+  }
+
+  if (!snapshot_receiver_) {
+    LOG(WARNING) << node_id_ << " no SnapshotReceiver installed";
+    return {storage_.current_term(), false};
+  }
+
+  return snapshot_receiver_->HandleChunk(req);
+}
+
 ApplyResult RaftNode::ReplicateLog() {
   if (!log_storage_)
     return {};
