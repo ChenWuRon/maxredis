@@ -17,37 +17,69 @@ constexpr size_t kHeaderSize = sizeof(RecordHeader);
 
 }  // namespace
 
-FileLogStorage::FileLogStorage() = default;
+FileLogStorage::FileLogStorage()
+    : manifest_("") {
+}
 
 FileLogStorage::~FileLogStorage() {
-  if (read_file_) {
-    fclose(read_file_);
+  for (FILE* f : read_files_) {
+    if (f)
+      fclose(f);
   }
 }
 
-bool FileLogStorage::Open(const std::string& path) {
+bool FileLogStorage::Open(const std::string& dir) {
   if (writer_.IsOpen()) {
     LOG(WARNING) << "FileLogStorage already open";
     return false;
   }
 
-  if (path.empty())
-    return true;  // in-memory only (used for testing)
+  if (dir.empty())
+    return true;
 
-  path_ = path;
+  dir_ = dir;
+  manifest_ = ManifestManager(dir_);
 
-  if (!writer_.Open(path_))
+  if (!manifest_.Load())
     return false;
 
-  // Open the same file for reading.
-  read_file_ = fopen(path_.c_str(), "rb");
-  if (!read_file_) {
-    PLOG(WARNING) << "Failed to open " << path_ << " for reading";
-    writer_.Close();
+  current_segment_ = manifest_.current_segment();
+
+  std::string seg_path = SegmentPath(current_segment_);
+  if (!writer_.Open(seg_path))
     return false;
+
+  // Pre-allocate read file handles.
+  read_files_.resize(current_segment_ + 1, nullptr);
+
+  VLOG(1) << "FileLogStorage opened at " << dir_
+          << " segment=" << current_segment_;
+  return true;
+}
+
+bool FileLogStorage::Flush() {
+  return writer_.Flush();
+}
+
+void FileLogStorage::RollSegment() {
+  writer_.Flush();
+  writer_.Close();
+
+  current_segment_++;
+  manifest_.set_current_segment(current_segment_);
+  manifest_.Save();
+
+  std::string seg_path = SegmentPath(current_segment_);
+  if (!writer_.Open(seg_path)) {
+    LOG(FATAL) << "Failed to open new segment: " << seg_path;
   }
 
-  return true;
+  // Grow read file vector for the new segment.
+  if (current_segment_ >= read_files_.size()) {
+    read_files_.resize(current_segment_ + 1, nullptr);
+  }
+
+  VLOG(1) << "Rolled to segment " << current_segment_;
 }
 
 size_t FileLogStorage::LogSize() const {
@@ -70,21 +102,23 @@ const LogEntry* FileLogStorage::Get(LogIndex index) const {
   if (!loc)
     return nullptr;
 
-  // Ensure buffered data is on disk before reading.
   const_cast<FileLogStorage*>(this)->writer_.Flush();
 
-  cached_entry_ = ReadEntryAt(loc->offset);
+  cached_entry_ = ReadEntryAt(loc->segment_id, loc->offset);
   return &cached_entry_;
 }
 
 LogIndex FileLogStorage::Append(LogEntry entry) {
   entry.index = last_index_ + 1;
 
-  // Record the offset where this entry will be written (before appending to buffer).
-  uint64_t offset = writer_.next_write_offset();
+  // Auto-rotate if current segment exceeds limit.
+  if (writer_.file_size() >= kMaxSegmentSize) {
+    const_cast<FileLogStorage*>(this)->RollSegment();
+  }
 
+  uint64_t offset = writer_.next_write_offset();
   writer_.Append(entry);
-  index_.Add(entry.index, kSegmentId, offset);
+  index_.Add(entry.index, current_segment_, offset);
 
   last_index_ = entry.index;
   last_term_ = entry.term;
@@ -97,7 +131,6 @@ std::vector<LogEntry> FileLogStorage::GetRange(LogIndex start, size_t limit) con
   if (start > last_index_)
     return {};
 
-  // Ensure buffered data is on disk before reading.
   const_cast<FileLogStorage*>(this)->writer_.Flush();
 
   LogIndex end = (limit == 0) ? last_index_ : std::min(last_index_, start + limit - 1);
@@ -109,7 +142,7 @@ std::vector<LogEntry> FileLogStorage::GetRange(LogIndex start, size_t limit) con
     const EntryLocation* loc = index_.Find(i);
     if (!loc)
       break;
-    result.push_back(ReadEntryAt(loc->offset));
+    result.push_back(ReadEntryAt(loc->segment_id, loc->offset));
   }
 
   return result;
@@ -126,7 +159,7 @@ void FileLogStorage::TruncateFrom(LogIndex new_last) {
     last_term_ = 0;
   } else {
     const EntryLocation* loc = index_.Find(new_last);
-    last_term_ = loc ? ReadEntryAt(loc->offset).term : 0;
+    last_term_ = loc ? ReadEntryAt(loc->segment_id, loc->offset).term : 0;
   }
 }
 
@@ -137,23 +170,45 @@ void FileLogStorage::Clear() {
   index_.Clear();
 }
 
-bool FileLogStorage::Flush() {
-  return writer_.Flush();
+std::string FileLogStorage::SegmentPath(uint32_t segment_id) const {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s/segment_%08lu.log",
+           dir_.c_str(), static_cast<unsigned long>(segment_id));
+  return std::string(buf);
 }
 
-LogEntry FileLogStorage::ReadEntryAt(uint64_t offset) const {
-  DCHECK(read_file_) << "ReadEntryAt requires an open read_file_";
+FILE* FileLogStorage::GetReadFile(uint32_t segment_id) const {
+  if (segment_id >= read_files_.size())
+    return nullptr;
 
+  if (read_files_[segment_id] != nullptr)
+    return read_files_[segment_id];
+
+  std::string path = SegmentPath(segment_id);
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    PLOG(WARNING) << "Failed to open " << path << " for reading";
+    return nullptr;
+  }
+
+  read_files_[segment_id] = f;
+  return f;
+}
+
+LogEntry FileLogStorage::ReadEntryAt(uint32_t segment_id, uint64_t offset) const {
   LogEntry entry;
+  FILE* f = GetReadFile(segment_id);
+  if (!f)
+    return entry;
 
   RecordHeader hdr;
-  if (fseeko(read_file_, static_cast<off_t>(offset), SEEK_SET) != 0) {
-    PLOG(WARNING) << "fseeko to " << offset << " failed";
+  if (fseeko(f, static_cast<off_t>(offset), SEEK_SET) != 0) {
+    PLOG(WARNING) << "fseeko seg=" << segment_id << " offset=" << offset << " failed";
     return entry;
   }
 
-  if (fread(&hdr, 1, kHeaderSize, read_file_) != kHeaderSize) {
-    PLOG(WARNING) << "fread header at " << offset << " failed";
+  if (fread(&hdr, 1, kHeaderSize, f) != kHeaderSize) {
+    PLOG(WARNING) << "fread header seg=" << segment_id << " offset=" << offset << " failed";
     return entry;
   }
 
@@ -162,8 +217,8 @@ LogEntry FileLogStorage::ReadEntryAt(uint64_t offset) const {
 
   if (hdr.size > 0) {
     entry.command.resize(hdr.size);
-    if (fread(&entry.command[0], 1, hdr.size, read_file_) != hdr.size) {
-      PLOG(WARNING) << "fread command at " << offset + kHeaderSize << " failed";
+    if (fread(&entry.command[0], 1, hdr.size, f) != hdr.size) {
+      PLOG(WARNING) << "fread command seg=" << segment_id << " failed";
       entry.command.clear();
     }
   }

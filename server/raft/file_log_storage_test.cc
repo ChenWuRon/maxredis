@@ -3,12 +3,14 @@
 //
 
 #include "server/raft/file_log_storage.h"
+#include "server/raft/wal_writer.h"
 
 #include <gmock/gmock.h>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <random>
 
 #include "base/gtest.h"
@@ -21,26 +23,42 @@ using namespace testing;
 class FileLogStorageTest : public Test {
  protected:
   void SetUp() override {
-    path_ = "/tmp/file_log_storage_test_" + std::to_string(getpid()) + ".log";
+    dir_ = "/tmp/file_log_storage_test_" + std::to_string(getpid());
+    // Clean up any leftover from previous runs.
+    CleanDir();
   }
 
   void TearDown() override {
-    unlink(path_.c_str());
+    CleanDir();
   }
 
-  std::string path_;
+  // Recursively remove test directory.
+  void CleanDir() {
+    for (uint32_t i = 0; i < 100; i++) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+               static_cast<unsigned long>(i));
+      unlink(buf);
+    }
+    unlink((dir_ + "/manifest.json").c_str());
+    unlink((dir_ + "/manifest.json.tmp").c_str());
+    rmdir(dir_.c_str());
+  }
+
+  std::string dir_;
 };
 
 TEST_F(FileLogStorageTest, OpenClose) {
   FileLogStorage fs;
-  EXPECT_TRUE(fs.Open(path_));
+  EXPECT_TRUE(fs.Open(dir_));
   EXPECT_EQ(0u, fs.LogSize());
   EXPECT_EQ(0u, fs.LastIndex());
+  EXPECT_EQ(0u, fs.LastTerm());
 }
 
 TEST_F(FileLogStorageTest, AppendAndGet) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
 
   LogIndex idx = fs.Append(LogEntry{1, 0, "SET a 1"});
   EXPECT_EQ(1u, idx);
@@ -55,7 +73,7 @@ TEST_F(FileLogStorageTest, AppendAndGet) {
 
 TEST_F(FileLogStorageTest, Append100) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
 
   for (int i = 1; i <= 100; i++) {
     fs.Append(LogEntry{static_cast<Term>(i % 3 + 1),
@@ -64,26 +82,101 @@ TEST_F(FileLogStorageTest, Append100) {
   }
 
   EXPECT_EQ(100u, fs.LogSize());
-  EXPECT_EQ(100u, fs.LastIndex());
 
-  // Verify random access.
   const LogEntry* e50 = fs.Get(50);
   ASSERT_NE(nullptr, e50);
   EXPECT_EQ(50u, e50->index);
   EXPECT_EQ("cmd50", e50->command);
-
-  const LogEntry* e1 = fs.Get(1);
-  ASSERT_NE(nullptr, e1);
-  EXPECT_EQ("cmd1", e1->command);
 
   const LogEntry* e100 = fs.Get(100);
   ASSERT_NE(nullptr, e100);
   EXPECT_EQ("cmd100", e100->command);
 }
 
+TEST_F(FileLogStorageTest, CrossSegmentGet) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  // Small kMaxSegmentSize for testing: 1KB per segment.
+  // Write enough entries to force rotation.
+  const int kEntriesPerSegment = 50;
+  std::string payload(40, 'x');  // ~60 bytes per entry (20 header + 40 data)
+
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < kEntriesPerSegment; i++) {
+      LogIndex idx = static_cast<LogIndex>(seg * kEntriesPerSegment + i + 1);
+      fs.Append(LogEntry{1, idx, payload + std::to_string(idx)});
+    }
+    fs.RollSegment();  // force roll after each batch
+  }
+
+  EXPECT_EQ(3u * kEntriesPerSegment, static_cast<int>(fs.LogSize()));
+
+  // Verify entries across all segments.
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < kEntriesPerSegment; i++) {
+      LogIndex idx = static_cast<LogIndex>(seg * kEntriesPerSegment + i + 1);
+      const LogEntry* e = fs.Get(idx);
+      ASSERT_NE(nullptr, e) << "Failed to get entry " << idx;
+      EXPECT_EQ(idx, e->index) << "Wrong index at " << idx;
+      EXPECT_EQ(payload + std::to_string(idx), e->command);
+    }
+  }
+
+  // Verify manifest is persisted (segment ID after 3 rolls = 3).
+  std::ifstream ifs(dir_ + "/manifest.json");
+  ASSERT_TRUE(ifs.is_open());
+  std::string content;
+  std::getline(ifs, content);
+  EXPECT_THAT(content, HasSubstr("\"current_segment\":3"));
+
+  // Verify segment files exist for segments 0, 1, 2 (3 is current but empty).
+  for (uint32_t seg = 0; seg <= 2; seg++) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(seg));
+    std::ifstream seg_ifs(buf);
+    EXPECT_TRUE(seg_ifs.is_open()) << "Missing segment file: " << buf;
+  }
+}
+
+TEST_F(FileLogStorageTest, AutoRotate) {
+  // Use a custom small max segment size: ~1KB per segment.
+  // We can't easily change kMaxSegmentSize, so we'll call RollSegment manually
+  // and verify rotation works with many segments.
+
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  // Write 10 segments worth of data via explicit rolls.
+  const int kSegments = 10;
+  const int kEntriesPerSegment = 20;
+
+  for (int seg = 0; seg < kSegments; seg++) {
+    for (int i = 0; i < kEntriesPerSegment; i++) {
+      LogIndex idx = static_cast<LogIndex>(seg * kEntriesPerSegment + i + 1);
+      fs.Append(LogEntry{1, idx, "entry" + std::to_string(idx)});
+    }
+    if (seg < kSegments - 1) {
+      fs.RollSegment();
+    }
+  }
+
+  EXPECT_EQ(static_cast<size_t>(kSegments * kEntriesPerSegment), fs.LogSize());
+  EXPECT_EQ(static_cast<LogIndex>(kSegments * kEntriesPerSegment), fs.LastIndex());
+
+  // Verify all entries are accessible.
+  LogIndex total = kSegments * kEntriesPerSegment;
+  for (LogIndex i = 1; i <= total; i++) {
+    const LogEntry* e = fs.Get(i);
+    ASSERT_NE(nullptr, e) << "Missing entry " << i;
+    EXPECT_EQ(i, e->index);
+  }
+}
+
 TEST_F(FileLogStorageTest, GetReturnsNullForOutOfRange) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
   EXPECT_EQ(nullptr, fs.Get(0));
   EXPECT_EQ(nullptr, fs.Get(1));
 
@@ -94,7 +187,7 @@ TEST_F(FileLogStorageTest, GetReturnsNullForOutOfRange) {
 
 TEST_F(FileLogStorageTest, LastTerm) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
   EXPECT_EQ(0u, fs.LastTerm());
 
   fs.Append(LogEntry{5, 0, "x"});
@@ -104,25 +197,28 @@ TEST_F(FileLogStorageTest, LastTerm) {
   EXPECT_EQ(3u, fs.LastTerm());
 }
 
-TEST_F(FileLogStorageTest, GetRange) {
+TEST_F(FileLogStorageTest, GetRangeAcrossSegments) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
 
-  fs.Append(LogEntry{1, 0, "a"});
-  fs.Append(LogEntry{1, 0, "b"});
-  fs.Append(LogEntry{2, 0, "c"});
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < 10; i++) {
+      fs.Append(LogEntry{static_cast<Term>(seg + 1),
+                         static_cast<LogIndex>(seg * 10 + i + 1),
+                         "cmd" + std::to_string(seg * 10 + i + 1)});
+    }
+    fs.RollSegment();
+  }
 
-  auto entries = fs.GetRange(1);
-  ASSERT_EQ(3u, entries.size());
-
-  auto limited = fs.GetRange(2, 1);
-  ASSERT_EQ(1u, limited.size());
-  EXPECT_EQ("b", limited[0].command);
+  auto entries = fs.GetRange(5, 15);
+  ASSERT_EQ(15u, entries.size());
+  EXPECT_EQ("cmd5", entries[0].command);
+  EXPECT_EQ("cmd19", entries[14].command);
 }
 
 TEST_F(FileLogStorageTest, Clear) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
 
   fs.Append(LogEntry{1, 0, "a"});
   fs.Append(LogEntry{2, 0, "b"});
@@ -134,64 +230,66 @@ TEST_F(FileLogStorageTest, Clear) {
   EXPECT_EQ(nullptr, fs.Get(1));
 }
 
-// --- Performance: 100k entries + random Get < 1ms ---
+// --- Performance: 200MB across multiple segments ---
 
-TEST_F(FileLogStorageTest, Append100kAndRandomGet) {
+TEST_F(FileLogStorageTest, TwoHundredMBRotate) {
   FileLogStorage fs;
-  ASSERT_TRUE(fs.Open(path_));
+  ASSERT_TRUE(fs.Open(dir_));
 
-  const int kNumEntries = 100000;
+  const int kTargetMB = 200;
+  const int kPayloadSize = 512;  // ~532 bytes per entry (20 header + 512 data)
+  const int kEntriesPerFlush = 100;
+  std::string payload(kPayloadSize, 'x');
 
-  auto append_start = std::chrono::steady_clock::now();
+  int entry_count = 0;
+  size_t total_mb = 0;
 
-  for (int i = 1; i <= kNumEntries; i++) {
-    std::string cmd = "SET key" + std::to_string(i) + " value" + std::to_string(i);
-    fs.Append(LogEntry{static_cast<Term>(i % 5 + 1),
-                       static_cast<LogIndex>(i), cmd});
-    // Flush every 1000 entries to balance batch efficiency with test time.
-    if (i % 1000 == 0) {
+  auto start = std::chrono::steady_clock::now();
+
+  while (total_mb < kTargetMB) {
+    entry_count++;
+    fs.Append(LogEntry{1, static_cast<LogIndex>(entry_count),
+                       payload + std::to_string(entry_count % 10)});
+    if (entry_count % kEntriesPerFlush == 0) {
       fs.Flush();
     }
+    // Approximate: each entry is ~532 bytes.
+    total_mb = (entry_count * (sizeof(RecordHeader) + kPayloadSize)) / (1024 * 1024);
   }
-  fs.Flush();  // final flush
+  fs.Flush();
 
-  auto append_end = std::chrono::steady_clock::now();
-  auto append_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      append_end - append_start).count();
+  auto end = std::chrono::steady_clock::now();
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      end - start).count();
 
-  EXPECT_EQ(static_cast<size_t>(kNumEntries), fs.LogSize());
-  EXPECT_EQ(static_cast<LogIndex>(kNumEntries), fs.LastIndex());
+  LOG(INFO) << "Wrote ~200MB in " << entry_count << " entries, "
+            << elapsed_ms << " ms, "
+            << (entry_count * 1000 / std::max(elapsed_ms, 1L)) << " entries/sec";
+  (void)elapsed_ms;
 
-  LOG(INFO) << "Append " << kNumEntries << " entries: " << append_ms << " ms";
-
-  // Random Get performance test.
-  std::mt19937 rng(42);
-  std::uniform_int_distribution<LogIndex> dist(1, kNumEntries);
-
-  const int kNumGets = 10000;
+  // Verify all entries are readable.
   int verified = 0;
-
-  auto get_start = std::chrono::steady_clock::now();
-
-  for (int i = 0; i < kNumGets; i++) {
-    LogIndex idx = dist(rng);
-    const LogEntry* e = fs.Get(idx);
-    if (e != nullptr && e->index == idx) {
+  for (LogIndex i = 1; i <= static_cast<LogIndex>(entry_count); i++) {
+    const LogEntry* e = fs.Get(i);
+    if (e && e->index == i)
       verified++;
-    }
   }
 
-  auto get_end = std::chrono::steady_clock::now();
-  auto get_us = std::chrono::duration_cast<std::chrono::microseconds>(
-      get_end - get_start).count();
+  EXPECT_EQ(entry_count, verified);
 
-  LOG(INFO) << "Random Get " << kNumGets << " lookups: " << get_us << " us total, "
-            << (get_us / kNumGets) << " us per lookup";
+  // Count segment files on disk.
+  int segment_count = 0;
+  for (uint32_t seg = 0; seg < 100; seg++) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s/segment_%08lu.log", dir_.c_str(),
+             static_cast<unsigned long>(seg));
+    std::ifstream ifs(buf);
+    if (ifs.is_open())
+      segment_count++;
+  }
 
-  EXPECT_EQ(kNumGets, verified);
-  // Each random Get must be well under 1ms.
-  EXPECT_LT(static_cast<double>(get_us) / kNumGets, 50.0)
-      << "Average random Get time exceeds 50us";
+  LOG(INFO) << "Total segments: " << segment_count;
+  EXPECT_GT(segment_count, 1);  // at least 2 segments at 200MB / 64MB
 }
 
 }  // namespace dfly

@@ -7,30 +7,39 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "server/raft/log_storage.h"
+#include "server/raft/manifest.h"
 #include "server/raft/wal_index.h"
 #include "server/raft/wal_writer.h"
 
 namespace dfly {
 
-// File-backed ILogStorage implementation.
-// Writes entries to a WAL file via WalWriter and maintains an in-memory
-// WalIndex for O(1) random access. Get/GetRange seek directly to the
-// entry's file offset instead of scanning.
+// File-backed ILogStorage with automatic segment rotation.
+// Maintains segments: {dir}/segment_%08lu.log
+// Manifest:          {dir}/manifest.json
+//
+// Each entry is written to the current segment via WalWriter.
+// An in-memory WalIndex maps LogIndex → (segment_id, offset) for O(1) Get().
+// Segments roll automatically when the current file exceeds kMaxSegmentSize.
 class FileLogStorage : public ILogStorage {
  public:
-  static constexpr uint32_t kSegmentId = 0;
+  static constexpr size_t kMaxSegmentSize = 64 * 1024 * 1024;  // 64 MB
 
   FileLogStorage();
   ~FileLogStorage();
 
-  // Opens the storage at 'path'. Creates/truncates the WAL file.
-  // If 'path' is empty, operates in-memory only (for testing).
-  bool Open(const std::string& path);
+  // Opens storage at 'dir'. Creates directory + initial segment + manifest.
+  // If dir is empty, operates in-memory only (for testing).
+  bool Open(const std::string& dir);
 
-  // Flushes buffered data to disk.
+  // Flushes the current WAL segment to disk.
   bool Flush();
+
+  // Rolls to a new segment. Flushes current segment, increments segment ID,
+  // opens a new WAL file, and updates the manifest.
+  void RollSegment();
 
   // --- ILogStorage ---
 
@@ -44,20 +53,28 @@ class FileLogStorage : public ILogStorage {
   void Clear() final;
 
  private:
-  // Reads one entry from the file at the given offset.
-  LogEntry ReadEntryAt(uint64_t offset) const;
+  // Returns the segment file path for a given segment ID.
+  std::string SegmentPath(uint32_t segment_id) const;
 
+  // Opens (or returns cached) FILE* for reading a segment.
+  FILE* GetReadFile(uint32_t segment_id) const;
+
+  // Reads one entry from a segment file at the given offset.
+  LogEntry ReadEntryAt(uint32_t segment_id, uint64_t offset) const;
+
+  std::string dir_;
+  ManifestManager manifest_;
+  uint32_t current_segment_ = 0;
   WalWriter writer_;
   WalIndex index_;
-  FILE* read_file_ = nullptr;
-  std::string path_;
 
-  // In-memory tracking (persisted state tracking).
+  // Cached read file handles per segment. Opened lazily.
+  mutable std::vector<FILE*> read_files_;
+
   size_t log_size_ = 0;
   LogIndex last_index_ = 0;
   Term last_term_ = 0;
 
-  // Cache for Get() return (ILogStorage returns const LogEntry*).
   mutable LogEntry cached_entry_;
 };
 
