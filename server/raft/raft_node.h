@@ -35,6 +35,7 @@
 #include "server/raft/read_index_rpc.h"
 #include "server/raft/snapshot_receiver.h"
 #include "server/raft/snapshot_sender.h"
+#include "server/raft/timeout_now_rpc.h"
 #include "server/raft/transport.h"
 #include "server/raft/vote_rpc.h"
 #include "server/state_machine/state_machine.h"
@@ -167,6 +168,27 @@ class RaftNode {
   // Returns success=false if the request's term is stale.
   ReadIndexResponse OnReadIndex(const ReadIndexRequest& request);
 
+  // Processes an incoming TimeoutNow request from the current leader.
+  // Triggers an immediate election (must be called on follower).
+  TimeoutNowResponse OnTimeoutNow(const TimeoutNowRequest& request);
+
+  // Initiates graceful leader transfer to |target|.
+  // Returns true if transfer was initiated, false otherwise.
+  // Must be called on the leader.
+  // |target| must be a current voter (peer) in the cluster.
+  bool StartTransfer(const NodeId& target);
+
+  // Returns true if |target| can safely become the next leader
+  // (i.e., match_index >= last_index).
+  bool IsTransferReady(const NodeId& target) const;
+
+  // Cancels any ongoing transfer. Called automatically on timeout or role change.
+  void CancelTransfer();
+
+  const LeaderTransferContext& transfer_context() const {
+    return transfer_ctx_;
+  }
+
   // Leader-side: implements the ReadIndex protocol.
   // 1. Records commit_index_ as candidate read index.
   // 2. Sends ReadIndex RPC to all peers.
@@ -283,6 +305,12 @@ class RaftNode {
   uint64_t leader_lease_expire_ = 0;
   uint64_t lease_ms_ = 100;  // default lease duration
   uint64_t next_read_index_request_id_ = 0;
+
+  // Leader transfer state.
+  LeaderTransferContext transfer_ctx_;
+  uint64_t transfer_timeout_ms_ = 3000;  // 3 second default
+  void CheckTransferTimeout();
+  void SendTimeoutNowToTarget();
 
   JointConfig joint_config_;
   ClusterConfig cluster_config_;

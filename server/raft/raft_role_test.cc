@@ -19,6 +19,7 @@
 #include "server/raft/heartbeat_rpc.h"
 #include "server/raft/install_snapshot_rpc.h"
 #include "server/raft/read_index_rpc.h"
+#include "server/raft/timeout_now_rpc.h"
 
 namespace dfly {
 
@@ -57,6 +58,9 @@ class MockTransport : public Transport {
 
   MOCK_METHOD(ReadIndexResponse, SendReadIndex,
               (const NodeId& peer_id, const ReadIndexRequest& request), (override));
+
+  MOCK_METHOD(TimeoutNowResponse, SendTimeoutNow,
+              (const NodeId& peer_id, const TimeoutNowRequest& request), (override));
 };
 
 class RaftRoleTest : public Test {

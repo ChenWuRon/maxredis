@@ -78,6 +78,31 @@ enum class ReadConsistency : uint8_t {
   kLinearizable = 1, // Strong consistency via ReadIndex protocol
 };
 
+// Leader transfer state machine.
+enum class TransferState : uint8_t {
+  kNone = 0,
+  kRequested = 1,
+  kWaitingCatchUp = 2,
+  kWaitingElection = 3,
+};
+
+// Context for an active leader transfer.
+struct LeaderTransferContext {
+  NodeId target;
+  TransferState state = TransferState::kNone;
+  uint64_t start_ms = 0;
+
+  bool IsActive() const {
+    return state != TransferState::kNone;
+  }
+
+  void Reset() {
+    state = TransferState::kNone;
+    target.clear();
+    start_ms = 0;
+  }
+};
+
 // Snapshot anchor entry preserved after log compaction.
 // Allows AppendEntries consistency checks to reference
 // the last index/term covered by a snapshot.

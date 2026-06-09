@@ -140,6 +140,7 @@ void RaftNode::SetRole(RaftRole new_role) {
       leader_term_ = 0;
       storage_.set_voted_for("");
       vote_count_ = 0;
+      CancelTransfer();  // cancel any ongoing transfer on step-down
       if (!election_started_) {
         election_started_ = true;
         election_timer_.Start([this] { StartElection(); });
@@ -151,12 +152,14 @@ void RaftNode::SetRole(RaftRole new_role) {
       storage_.set_current_term(storage_.current_term() + 1);
       storage_.set_voted_for(node_id_);
       vote_count_ = 1;
+      CancelTransfer();
       election_timer_.Deactivate();
       StopHeartbeat();
       break;
     case RaftRole::Leader:
       leader_term_ = storage_.current_term();
       election_timer_.Deactivate();
+      CancelTransfer();  // clear any stale transfer context
       StopHeartbeat();
       StartHeartbeat(heartbeat_interval_ms_);
       break;
@@ -335,6 +338,26 @@ ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
   return resp;
 }
 
+TimeoutNowResponse RaftNode::OnTimeoutNow(const TimeoutNowRequest& request) {
+  TimeoutNowResponse resp;
+  resp.term = storage_.current_term();
+
+  if (request.term < storage_.current_term()) {
+    VLOG(1) << node_id_ << " rejects TimeoutNow from " << request.leader_id
+            << ": stale term " << request.term << " < " << resp.term;
+    resp.accepted = false;
+    return resp;
+  }
+
+  VLOG(1) << node_id_ << " TimeoutNow from leader " << request.leader_id
+          << " term=" << request.term << " — immediate election";
+  resp.accepted = true;
+
+  // Become a candidate immediately (no election timeout delay).
+  StartElection();
+  return resp;
+}
+
 void RaftNode::SendHeartbeatToPeers() {
   HeartbeatRequest req{storage_.current_term(), node_id_};
   for (const auto& peer_id : GetPeerIds()) {
@@ -361,6 +384,22 @@ void RaftNode::HeartbeatLoop() {
   while (!shutdown_.load(std::memory_order_acquire) && role_ == RaftRole::Leader) {
     SendHeartbeatToPeers();
     ExtendLeaderLease();
+
+    // Check leader transfer lifecycle.
+    if (transfer_ctx_.IsActive()) {
+      CheckTransferTimeout();
+
+      if (transfer_ctx_.state == TransferState::kWaitingCatchUp && role_ == RaftRole::Leader) {
+        // Replicate again to push entries to the target.
+        ReplicateLog();
+        if (IsTransferReady(transfer_ctx_.target)) {
+          VLOG(1) << node_id_ << " " << transfer_ctx_.target
+                  << " is now caught up, sending TimeoutNow";
+          SendTimeoutNowToTarget();
+        }
+      }
+    }
+
     util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
   }
 }
@@ -441,6 +480,104 @@ uint64_t RaftNode::NowMs() const {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+bool RaftNode::StartTransfer(const NodeId& target) {
+  if (role_ != RaftRole::Leader) {
+    LOG(WARNING) << node_id_ << " StartTransfer: not leader";
+    return false;
+  }
+
+  if (transfer_ctx_.IsActive()) {
+    LOG(WARNING) << node_id_ << " StartTransfer: transfer already in progress to "
+                 << transfer_ctx_.target;
+    return false;
+  }
+
+  // Verify target is a peer.
+  auto peers = GetPeerIds();
+  bool found = false;
+  for (const auto& p : peers) {
+    if (p == target) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    LOG(WARNING) << node_id_ << " StartTransfer: " << target << " is not a peer";
+    return false;
+  }
+
+  VLOG(1) << node_id_ << " StartTransfer: initiating transfer to " << target;
+  transfer_ctx_.target = target;
+  transfer_ctx_.state = TransferState::kRequested;
+  transfer_ctx_.start_ms = NowMs();
+
+  // Force replication to catch up the target.
+  ReplicateLog();
+
+  // Check if target is already caught up.
+  if (IsTransferReady(target)) {
+    VLOG(1) << node_id_ << " StartTransfer: " << target << " is ready, sending TimeoutNow";
+    transfer_ctx_.state = TransferState::kWaitingElection;
+    SendTimeoutNowToTarget();
+  } else {
+    VLOG(1) << node_id_ << " StartTransfer: waiting for " << target << " to catch up";
+    transfer_ctx_.state = TransferState::kWaitingCatchUp;
+  }
+
+  return true;
+}
+
+bool RaftNode::IsTransferReady(const NodeId& target) const {
+  if (!log_storage_)
+    return false;
+
+  LogIndex last_index = log_storage_->LastIndex();
+
+  // Find the target's match index in last_peer_ids_.
+  for (size_t i = 0; i < last_peer_ids_.size() && i < peer_last_log_index_.size(); i++) {
+    if (last_peer_ids_[i] == target) {
+      // The spec says match_index >= last_index (threshold=0 for strict).
+      return peer_last_log_index_[i] >= last_index;
+    }
+  }
+
+  return false;
+}
+
+void RaftNode::CancelTransfer() {
+  if (!transfer_ctx_.IsActive())
+    return;
+  VLOG(1) << node_id_ << " CancelTransfer: cancelling transfer to " << transfer_ctx_.target;
+  transfer_ctx_.Reset();
+}
+
+void RaftNode::CheckTransferTimeout() {
+  if (!transfer_ctx_.IsActive())
+    return;
+  if (NowMs() - transfer_ctx_.start_ms >= transfer_timeout_ms_) {
+    VLOG(1) << node_id_ << " Transfer timeout to " << transfer_ctx_.target
+            << " after " << transfer_timeout_ms_ << "ms — cancelling";
+    CancelTransfer();
+  }
+}
+
+void RaftNode::SendTimeoutNowToTarget() {
+  if (!transport_ || transfer_ctx_.target.empty())
+    return;
+
+  TimeoutNowRequest req;
+  req.term = storage_.current_term();
+  req.leader_id = node_id_;
+
+  VLOG(1) << node_id_ << " Sending TimeoutNow to " << transfer_ctx_.target;
+  transfer_ctx_.state = TransferState::kWaitingElection;
+  TimeoutNowResponse resp = transport_->SendTimeoutNow(transfer_ctx_.target, req);
+  if (!resp.accepted) {
+    VLOG(1) << node_id_ << " TimeoutNow rejected by " << transfer_ctx_.target;
+    CancelTransfer();
+  }
 }
 
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {

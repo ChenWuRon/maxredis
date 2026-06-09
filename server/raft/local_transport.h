@@ -27,6 +27,9 @@ class LocalTransport : public Transport {
   ReadIndexResponse SendReadIndex(const NodeId& peer_id,
                                    const ReadIndexRequest& request) override;
 
+  TimeoutNowResponse SendTimeoutNow(const NodeId& peer_id,
+                                     const TimeoutNowRequest& request) override;
+
   bool HasNode(const NodeId& id) const;
 
  private:

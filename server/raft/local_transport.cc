@@ -50,4 +50,11 @@ ReadIndexResponse LocalTransport::SendReadIndex(const NodeId& peer_id,
   return it->second->OnReadIndex(request);
 }
 
+TimeoutNowResponse LocalTransport::SendTimeoutNow(const NodeId& peer_id,
+                                                   const TimeoutNowRequest& request) {
+  auto it = nodes_.find(peer_id);
+  DCHECK(it != nodes_.end()) << "Unknown peer: " << peer_id;
+  return it->second->OnTimeoutNow(request);
+}
+
 }  // namespace dfly

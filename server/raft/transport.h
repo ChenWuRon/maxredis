@@ -5,6 +5,7 @@
 #include "server/raft/install_snapshot_rpc.h"
 #include "server/raft/raft_types.h"
 #include "server/raft/read_index_rpc.h"
+#include "server/raft/timeout_now_rpc.h"
 #include "server/raft/vote_rpc.h"
 
 namespace dfly {
@@ -27,6 +28,9 @@ class Transport {
 
   virtual ReadIndexResponse SendReadIndex(const NodeId& peer_id,
                                            const ReadIndexRequest& request) = 0;
+
+  virtual TimeoutNowResponse SendTimeoutNow(const NodeId& peer_id,
+                                             const TimeoutNowRequest& request) = 0;
 };
 
 }  // namespace dfly
