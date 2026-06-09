@@ -406,4 +406,79 @@ TEST_F(SegmentLogStorageRecoveryTest, RebuildIndexCrossSegment) {
   EXPECT_EQ(2u, e51->term);
 }
 
+// --- LastIndex / LastTerm recovery tests ---
+
+TEST_F(SegmentLogStorageRecoveryTest, RecoverLastTermMultiTerm) {
+  // Entry: index=1 term=1, 2 term=1, 3 term=2, 4 term=2
+  WriteSegmentWithIndices(1, {1, 2});
+  WriteSegment(2, 2, 2, 3);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(4u, seg.LastIndex());
+  EXPECT_EQ(2u, seg.LastTerm());
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RecoverLastTermCorruptedTail) {
+  // Write 1000 entries with term=5, then corrupted tail.
+  WriteSegmentWithCorruptedTail(1, 1000);
+
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(1000u, seg.LogSize());
+  EXPECT_EQ(1000u, seg.LastIndex());
+  EXPECT_EQ(1u, seg.LastTerm());  // WriteSegmentWithCorruptedTail uses term=1
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, RecoverLastTermEmptyDir) {
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(0u, seg.LastIndex());
+  EXPECT_EQ(0u, seg.LastTerm());
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, IntegrationCrashRecovery) {
+  // Simulate pre-crash state: write segments via WalWriter.
+  WriteSegment(1, 10000, 3, 1);
+
+  // Crash and restart.
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(10000u, seg.LastIndex());
+  EXPECT_EQ(3u, seg.LastTerm());
+
+  // Verify random read.
+  const LogEntry* e = seg.Get(10000);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(10000u, e->index);
+  EXPECT_EQ("cmd10000", e->command);
+
+  // Continue appending after recovery.
+  LogIndex idx = seg.Append(LogEntry{4, 0, "post-recovery"});
+  EXPECT_EQ(10001u, idx);
+  EXPECT_EQ(10001u, seg.LastIndex());
+  EXPECT_EQ(4u, seg.LastTerm());
+
+  const LogEntry* e2 = seg.Get(10001);
+  ASSERT_NE(nullptr, e2);
+  EXPECT_EQ("post-recovery", e2->command);
+}
+
+TEST_F(SegmentLogStorageRecoveryTest, IntegrationCrashRecoveryMultiSegment) {
+  // Two segments with different terms.
+  WriteSegment(1, 500, 1, 1);
+  WriteSegment(2, 500, 5, 501);
+
+  // Crash and restart.
+  SegmentLogStorage seg(dir_);
+  ASSERT_TRUE(seg.Open());
+  EXPECT_EQ(1000u, seg.LastIndex());
+  EXPECT_EQ(5u, seg.LastTerm());
+
+  // Continue appending.
+  seg.Append(LogEntry{6, 0, "after-recovery"});
+  EXPECT_EQ(1001u, seg.LastIndex());
+  EXPECT_EQ(6u, seg.LastTerm());
+}
+
 }  // namespace dfly

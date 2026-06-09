@@ -54,8 +54,10 @@ class SegmentLogStorage : public ILogStorage {
   // Also records each entry's disk location in index_ for O(1) random access.
   void ScanSegment(uint32_t segment_id);
 
-  // Called by ScanSegment for each validated record to build the index.
-  void RebuildIndex(LogIndex index, uint32_t segment_id, uint64_t offset);
+  // Called by ScanSegment for each validated record to build the index
+  // and track last_index_ / last_term_.
+  void RebuildIndex(LogIndex index, Term term, uint32_t segment_id,
+                    uint64_t offset);
 
   std::string dir_;
   ManifestManager manifest_;
@@ -63,9 +65,9 @@ class SegmentLogStorage : public ILogStorage {
   std::vector<LogEntry> entries_;
   // Index mapping LogIndex → on-disk location, rebuilt on startup.
   WalIndex index_;
-  // Highest index seen during recovery scan. Used by LastIndex() and LogSize().
-  // Updated during scan and on Append/TruncateFrom.
-  LogIndex last_recovered_index_ = 0;
+  // Highest index and term seen during recovery / Append / TruncateFrom.
+  LogIndex last_index_ = 0;
+  Term last_term_ = 0;
 };
 
 }  // namespace dfly
