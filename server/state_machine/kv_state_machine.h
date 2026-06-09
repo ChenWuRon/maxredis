@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "server/raft/snapshot_barrier.h"
 #include "server/state_machine/state_machine.h"
 #include "server/storage/engine_shard_set.h"
 #include "server/storage/op_status.h"
@@ -31,9 +32,16 @@ class KvStateMachine : public IStateMachine {
 
   bool SaveSnapshot(const std::string& path) override;
 
+  // Sets the snapshot barrier for write-freeze during snapshot.
+  // May be nullptr (no barrier).
+  void SetSnapshotBarrier(SnapshotBarrier* barrier) {
+    barrier_ = barrier;
+  }
+
  private:
   EngineShardSet* shard_set_;
   util::ProactorPool* pp_;
+  SnapshotBarrier* barrier_ = nullptr;
 
   ShardId Shard(std::string_view key) const;
 };

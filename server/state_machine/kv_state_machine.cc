@@ -45,28 +45,42 @@ ApplyResult KvStateMachine::Apply(const CommandId* cid, CmdArgList args) {
 }
 
 void KvStateMachine::Set(DbIndex db_ind, std::string_view key, std::string_view val) {
+  if (barrier_)
+    barrier_->BeginRead();
   ShardId sid = Shard(key);
   shard_set_->Await(sid, [db_ind, key, val] {
     EngineShard* es = EngineShard::tlocal();
     auto [it, res] = es->db_slice.AddOrFind(db_ind, key);
     it->second.value = val;
   });
+  if (barrier_)
+    barrier_->EndRead();
 }
 
 bool KvStateMachine::Del(DbIndex db_ind, std::string_view key) {
+  if (barrier_)
+    barrier_->BeginRead();
   ShardId sid = Shard(key);
-  return shard_set_->Await(sid, [db_ind, key] {
+  bool result = shard_set_->Await(sid, [db_ind, key] {
     EngineShard* es = EngineShard::tlocal();
     return es->db_slice.Del(db_ind, key);
   });
+  if (barrier_)
+    barrier_->EndRead();
+  return result;
 }
 
 bool KvStateMachine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {
+  if (barrier_)
+    barrier_->BeginRead();
   ShardId sid = Shard(key);
-  return shard_set_->Await(sid, [db_ind, key, expire_at_ms] {
+  bool result = shard_set_->Await(sid, [db_ind, key, expire_at_ms] {
     EngineShard* es = EngineShard::tlocal();
     return es->db_slice.SetExpire(db_ind, key, expire_at_ms) == OpStatus::OK;
   });
+  if (barrier_)
+    barrier_->EndRead();
+  return result;
 }
 
 OpResult<string> KvStateMachine::Get(DbIndex db_ind, std::string_view key) {
