@@ -292,4 +292,171 @@ TEST_F(FileLogStorageTest, TwoHundredMBRotate) {
   EXPECT_GT(segment_count, 1);  // at least 2 segments at 200MB / 64MB
 }
 
+// --- CRC verification tests ---
+
+TEST_F(FileLogStorageTest, CrcValidRead) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  fs.Append(LogEntry{1, 0, "SET a 1"});
+  fs.Flush();
+
+  const LogEntry* e = fs.Get(1);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ("SET a 1", e->command);
+}
+
+TEST_F(FileLogStorageTest, CrcTamperedEntry) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  fs.Append(LogEntry{1, 0, "SET a 1"});
+  fs.Flush();
+
+  // Corrupt the command data in the file.
+  std::string seg_path = dir_ + "/segment_00000000.log";
+  FILE* f = fopen(seg_path.c_str(), "r+b");
+  ASSERT_NE(nullptr, f);
+  fseeko(f, sizeof(RecordHeader) + 2, SEEK_SET);  // skip header + "SE"
+  fputc('X', f);  // change "SET" → "SEX" (after CRC was computed)
+  fclose(f);
+
+  // Read should detect CRC mismatch and return empty entry.
+  const LogEntry* e = fs.Get(1);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(0u, e->index);    // CRC failure resets index to 0
+  EXPECT_TRUE(e->command.empty());
+}
+
+TEST_F(FileLogStorageTest, CrcTamperedHeader) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  fs.Append(LogEntry{5, 42, "DEL x"});
+  fs.Flush();
+
+  // Corrupt the term field in the header.
+  std::string seg_path = dir_ + "/segment_00000000.log";
+  FILE* f = fopen(seg_path.c_str(), "r+b");
+  ASSERT_NE(nullptr, f);
+  fseeko(f, 8, SEEK_SET);  // offset of term field
+  uint64_t bad_term = 99;
+  fwrite(&bad_term, sizeof(bad_term), 1, f);
+  fclose(f);
+
+  // Read should detect CRC mismatch (CRC covers command, not header).
+  // Header corruption alone won't trigger CRC failure since CRC is only over command data.
+  // This is expected — the CRC protects the command payload.
+  const LogEntry* e = fs.Get(1);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(1u, e->index);     // still readable (header not CRC-protected)
+  EXPECT_EQ("DEL x", e->command);
+}
+
+// --- TruncateFrom tests ---
+
+TEST_F(FileLogStorageTest, TruncateFromInSegment) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  for (int i = 1; i <= 5; i++) {
+    fs.Append(LogEntry{1, static_cast<LogIndex>(i), "cmd" + std::to_string(i)});
+  }
+  fs.Flush();
+  EXPECT_EQ(5u, fs.LogSize());
+
+  fs.TruncateFrom(3);
+  EXPECT_EQ(3u, fs.LogSize());
+  EXPECT_EQ(3u, fs.LastIndex());
+
+  // Entries 1-3 should still be accessible.
+  for (LogIndex i = 1; i <= 3; i++) {
+    const LogEntry* e = fs.Get(i);
+    ASSERT_NE(nullptr, e) << "Missing entry " << i;
+    EXPECT_EQ("cmd" + std::to_string(i), e->command);
+  }
+
+  // Entry 4+ should be gone.
+  EXPECT_EQ(nullptr, fs.Get(4));
+  EXPECT_EQ(nullptr, fs.Get(5));
+}
+
+TEST_F(FileLogStorageTest, TruncateFromAcrossSegments) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  // Write entries across 3 segments.
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < 5; i++) {
+      LogIndex idx = static_cast<LogIndex>(seg * 5 + i + 1);
+      fs.Append(LogEntry{1, idx, "cmd" + std::to_string(idx)});
+    }
+    fs.RollSegment();
+  }
+  EXPECT_EQ(15u, fs.LogSize());
+
+  // Truncate to entry 7 (in segment 1).
+  fs.TruncateFrom(7);
+  EXPECT_EQ(7u, fs.LogSize());
+  EXPECT_EQ(7u, fs.LastIndex());
+
+  // Verify entries 1-7.
+  for (LogIndex i = 1; i <= 7; i++) {
+    const LogEntry* e = fs.Get(i);
+    ASSERT_NE(nullptr, e) << "Missing entry " << i;
+    EXPECT_EQ("cmd" + std::to_string(i), e->command);
+  }
+
+  // Entry 8+ should be gone.
+  for (LogIndex i = 8; i <= 15; i++) {
+    EXPECT_EQ(nullptr, fs.Get(i)) << "Entry " << i << " should be truncated";
+  }
+
+  // Segment 2 should be deleted from disk.
+  {
+    std::string seg_path = dir_ + "/segment_00000002.log";
+    std::ifstream ifs(seg_path);
+    EXPECT_FALSE(ifs.is_open()) << "Segment 2 should be deleted";
+  }
+
+  // Append after truncate should start at index 8.
+  fs.Append(LogEntry{2, 0, "new_cmd"});
+  const LogEntry* e = fs.Get(8);
+  ASSERT_NE(nullptr, e);
+  EXPECT_EQ(8u, e->index);
+  EXPECT_EQ("new_cmd", e->command);
+  EXPECT_EQ(2u, e->term);
+}
+
+TEST_F(FileLogStorageTest, TruncateFromThenAppend) {
+  FileLogStorage fs;
+  ASSERT_TRUE(fs.Open(dir_));
+
+  for (int i = 1; i <= 10; i++) {
+    fs.Append(LogEntry{1, static_cast<LogIndex>(i), "old_" + std::to_string(i)});
+  }
+  fs.Flush();
+  EXPECT_EQ(10u, fs.LogSize());
+
+  fs.TruncateFrom(5);
+  EXPECT_EQ(5u, fs.LogSize());
+  EXPECT_EQ(5u, fs.LastIndex());
+
+  // Append new entries after truncation.
+  fs.Append(LogEntry{2, 0, "new_a"});
+  fs.Append(LogEntry{2, 0, "new_b"});
+
+  EXPECT_EQ(7u, fs.LogSize());
+  EXPECT_EQ(7u, fs.LastIndex());
+
+  // Old entries preserved.
+  EXPECT_EQ("old_1", fs.Get(1)->command);
+  EXPECT_EQ("old_5", fs.Get(5)->command);
+
+  // New entries appended.
+  EXPECT_EQ("new_a", fs.Get(6)->command);
+  EXPECT_EQ("new_b", fs.Get(7)->command);
+  EXPECT_EQ(2u, fs.Get(7)->term);
+}
+
 }  // namespace dfly

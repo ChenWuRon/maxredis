@@ -38,6 +38,19 @@ class WalIndex {
     return map_.size();
   }
 
+  // Removes all entries with index > new_last.
+  // Used for Raft log conflict resolution (TruncateFrom).
+  void Truncate(LogIndex new_last) {
+    // Rebuild the map keeping only entries <= new_last.
+    // This is O(N) but truncation is rare (only on AppendEntries conflicts).
+    decltype(map_) keep;
+    for (auto& [idx, loc] : map_) {
+      if (idx <= new_last)
+        keep.insert({idx, loc});
+    }
+    map_.swap(keep);
+  }
+
   void Clear() {
     map_.clear();
   }

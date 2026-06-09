@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unistd.h>
 
 #include "base/logging.h"
+#include "server/raft/crc32.h"
 
 namespace dfly {
 
@@ -152,15 +154,65 @@ void FileLogStorage::TruncateFrom(LogIndex new_last) {
   if (new_last >= last_index_)
     return;
 
+  // Find the segment containing new_last and read its entry.
+  const EntryLocation* loc = index_.Find(new_last);
+  if (!loc) {
+    LOG(WARNING) << "TruncateFrom(" << new_last << "): entry not found in index";
+    return;
+  }
+
+  LogEntry last_entry = ReadEntryAt(loc->segment_id, loc->offset);
+  uint32_t keep_segment = loc->segment_id;
+  uint64_t truncate_offset = loc->offset + kHeaderSize + last_entry.command.size();
+
+  // Truncate the segment file at the offset after new_last.
+  std::string seg_path = SegmentPath(keep_segment);
+  FILE* f = GetReadFile(keep_segment);
+  if (f) {
+    fclose(f);
+    read_files_[keep_segment] = nullptr;
+  }
+
+  if (truncate(seg_path.c_str(), truncate_offset) != 0) {
+    PLOG(WARNING) << "truncate(" << seg_path << ", " << truncate_offset << ") failed";
+  }
+
+  // Delete all subsequent segment files.
+  for (uint32_t seg = keep_segment + 1; seg < read_files_.size(); seg++) {
+    if (read_files_[seg]) {
+      fclose(read_files_[seg]);
+      read_files_[seg] = nullptr;
+    }
+    std::string del_path = SegmentPath(seg);
+    unlink(del_path.c_str());
+  }
+
+  // Re-open the truncated segment for reading.
+  read_files_[keep_segment] = fopen(seg_path.c_str(), "rb");
+
+  // If the truncated file is from an older segment, roll back the writer.
+  if (keep_segment < current_segment_) {
+    writer_.Close();
+    current_segment_ = keep_segment;
+    if (!writer_.OpenAppend(seg_path)) {
+      LOG(FATAL) << "Failed to reopen segment " << seg_path << " after truncate";
+    }
+  }
+
+  // Update in-memory state.
   log_size_ = new_last;
   last_index_ = new_last;
+  last_term_ = last_entry.term;
+  index_.Truncate(new_last);
 
-  if (new_last == 0) {
-    last_term_ = 0;
-  } else {
-    const EntryLocation* loc = index_.Find(new_last);
-    last_term_ = loc ? ReadEntryAt(loc->segment_id, loc->offset).term : 0;
+  // Update manifest if we rolled back.
+  if (current_segment_ != manifest_.current_segment()) {
+    manifest_.set_current_segment(current_segment_);
+    manifest_.Save();
   }
+
+  VLOG(1) << "TruncateFrom(" << new_last << "): keep_seg=" << keep_segment
+          << " current_seg=" << current_segment_;
 }
 
 void FileLogStorage::Clear() {
@@ -221,6 +273,17 @@ LogEntry FileLogStorage::ReadEntryAt(uint32_t segment_id, uint64_t offset) const
       PLOG(WARNING) << "fread command seg=" << segment_id << " failed";
       entry.command.clear();
     }
+  }
+
+  // Verify CRC32C.
+  uint32_t computed = ComputeCrc32(entry.command.data(), entry.command.size());
+  if (computed != hdr.crc32) {
+    LOG(ERROR) << "CRC mismatch for entry " << entry.index
+               << " seg=" << segment_id << " offset=" << offset
+               << " expected=" << hdr.crc32 << " got=" << computed;
+    entry.index = 0;
+    entry.term = 0;
+    entry.command.clear();
   }
 
   return entry;

@@ -14,15 +14,16 @@ namespace dfly {
 
 // Binary WAL record header.
 // Each record on disk: [header][command_data]
-// Total overhead: 20 bytes per entry.
+// Total overhead: 24 bytes per entry.
 struct RecordHeader {
   uint64_t index;
   uint64_t term;
-  uint32_t size;  // command string byte length
+  uint32_t size;    // command string byte length
+  uint32_t crc32;   // CRC32C of command data (ComputeCrc32)
 } __attribute__((packed));
 
-static_assert(sizeof(RecordHeader) == 20,
-              "RecordHeader must be 20 bytes (no padding)");
+static_assert(sizeof(RecordHeader) == 24,
+              "RecordHeader must be 24 bytes (no padding)");
 
 // Append-only WAL file writer for Raft log segments.
 // Format: sequence of [RecordHeader][command_bytes] records.
@@ -38,6 +39,10 @@ class WalWriter {
   // Opens (or creates/truncates) a WAL file at path.
   // Returns true on success.
   bool Open(const std::string& path);
+
+  // Opens an existing WAL file for appending (does not truncate).
+  // Used after TruncateFrom to reopen a rolled-back segment.
+  bool OpenAppend(const std::string& path);
 
   // Appends one entry to the WAL. Writes to buffer (see Flush).
   void Append(const LogEntry& entry);

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "base/logging.h"
+#include "server/raft/crc32.h"
 
 namespace dfly {
 
@@ -24,6 +25,36 @@ WalWriter::~WalWriter() {
   if (file_) {
     Close();
   }
+}
+
+bool WalWriter::OpenAppend(const std::string& path) {
+  if (file_) {
+    LOG(WARNING) << "WalWriter already open";
+    return false;
+  }
+
+  // Ensure parent directory exists.
+  auto slash = path.rfind('/');
+  if (slash != std::string::npos) {
+    std::string dir = path.substr(0, slash);
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+      PLOG(WARNING) << "mkdir(" << dir << ") failed";
+      return false;
+    }
+  }
+
+  file_ = fopen(path.c_str(), "ab");
+  if (!file_) {
+    PLOG(WARNING) << "Failed to open " << path << " for appending";
+    return false;
+  }
+
+  // Get current file size.
+  fseeko(file_, 0, SEEK_END);
+  file_size_ = ftello(file_);
+  buf_.clear();
+  VLOG(1) << "WalWriter opened (append) " << path << " size=" << file_size_;
+  return true;
 }
 
 bool WalWriter::Open(const std::string& path) {
@@ -61,6 +92,7 @@ void WalWriter::Append(const LogEntry& entry) {
   header.index = entry.index;
   header.term = entry.term;
   header.size = static_cast<uint32_t>(entry.command.size());
+  header.crc32 = ComputeCrc32(entry.command.data(), entry.command.size());
 
   buf_.append(reinterpret_cast<const char*>(&header), kHeaderSize);
   buf_.append(entry.command.data(), entry.command.size());
