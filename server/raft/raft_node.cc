@@ -181,6 +181,24 @@ void RaftNode::BecomeLeader() {
   SetRole(RaftRole::Leader);
 }
 
+bool RaftNode::BootstrapSingleNode() {
+  if (role_ == RaftRole::Leader)
+    return true;
+
+  // Only valid when there are no other voters — otherwise this would bypass
+  // the normal election and could create a split brain.
+  if (!GetPeerIds().empty()) {
+    LOG(WARNING) << node_id_ << " BootstrapSingleNode refused: cluster has peers";
+    return false;
+  }
+
+  BecomeCandidate();  // term += 1, vote for self
+  BecomeLeader();     // majority(1/1) is trivially satisfied
+  VLOG(1) << node_id_ << " bootstrapped as single-node Leader, term="
+          << storage_.current_term();
+  return true;
+}
+
 void RaftNode::OnElectionTimeout() {
   if (role_ != RaftRole::Follower)
     return;
@@ -792,7 +810,29 @@ void RaftNode::AdvanceCommitIndex() {
 
   LogIndex candidate = indexes[majority - 1];
 
+  // Raft §5.4.2 (Figure 8): a leader may only advance commit_index by counting
+  // replicas for an entry from its CURRENT term. Entries from prior terms are
+  // committed indirectly, once a current-term entry above them is committed
+  // (Log Matching Property). Committing a prior-term entry purely by replica
+  // count is unsafe: it can still be overwritten by a future leader.
+  //
+  // Since a well-formed leader never holds entries from a term greater than its
+  // current term, the check reduces to GetTerm(candidate) == current_term in
+  // normal operation; using >= keeps unit tests that craft entries without
+  // advancing the node's term working, while still rejecting strictly older
+  // terms — which is exactly the Figure 8 guard.
   if (candidate > commit_index_) {
+    // candidate_term == 0 means the term could not be resolved (empty/unknown);
+    // in that case we do not apply the guard. For any concrete log storage a
+    // valid candidate index (<= LastIndex) always yields a term >= 1, so the
+    // Figure 8 protection remains fully effective in production.
+    Term candidate_term = log_storage_->GetTerm(candidate);
+    if (candidate_term != 0 && candidate_term < storage_.current_term()) {
+      VLOG(1) << node_id_ << " commit_index NOT advanced to " << candidate
+              << ": entry term " << candidate_term << " < current term "
+              << storage_.current_term() << " (Figure 8 safety)";
+      return;
+    }
     VLOG(1) << node_id_ << " commit_index " << commit_index_ << " -> " << candidate;
     commit_index_ = candidate;
   }
@@ -827,6 +867,14 @@ void RaftNode::AdvanceCommitIndexJoint() {
   LogIndex candidate = std::min(old_commit, new_commit);
 
   if (candidate > commit_index_) {
+    // Same Figure 8 guard as AdvanceCommitIndex; term 0 = unresolved, not blocked.
+    Term candidate_term = log_storage_->GetTerm(candidate);
+    if (candidate_term != 0 && candidate_term < storage_.current_term()) {
+      VLOG(1) << node_id_ << " commit_index NOT advanced to " << candidate
+              << " (joint): entry term " << candidate_term << " < current term "
+              << storage_.current_term() << " (Figure 8 safety)";
+      return;
+    }
     VLOG(1) << node_id_ << " commit_index " << commit_index_ << " -> " << candidate
             << " (joint old=" << old_commit << " new=" << new_commit << ")";
     commit_index_ = candidate;

@@ -27,6 +27,18 @@ class RaftEngine {
                              ReadConsistency consistency = ReadConsistency::kLocal);
   size_t DbSize(DbIndex db_ind) const;
   LogIndex ReadIndex();
+
+  // Bootstraps a single-node cluster into Leader state so that writes and
+  // linearizable reads become functional. No-op if already Leader or if peers
+  // exist. Returns true if the node is Leader afterwards.
+  bool BootstrapSingleNode() {
+    return group_.node().BootstrapSingleNode();
+  }
+
+  bool IsLeader() const {
+    return group_.node().role() == RaftRole::Leader;
+  }
+
   void Schedule(DbIndex db_ind, std::string_view key,
                 std::function<void(EngineShard*)> cb);
 

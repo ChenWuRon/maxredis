@@ -30,6 +30,10 @@ ABSL_FLAG(uint32_t, port, 6380, "Redis port");
 ABSL_FLAG(uint32_t, memcache_port, 0, "Memcached port");
 ABSL_FLAG(uint32_t, snapshot_time_sec, 0, "Snapshot interval in seconds (0 = disabled)");
 ABSL_FLAG(uint32_t, snapshot_cmd_count, 0, "Snapshot after N write commands (0 = disabled)");
+ABSL_FLAG(bool, linearizable_read, false,
+          "If true, GET performs a linearizable read via the Raft ReadIndex "
+          "protocol (confirms leadership before reading). If false, GET reads "
+          "the local state directly (may return stale data).");
 
 namespace dfly {
 
@@ -85,6 +89,25 @@ void Service::Init(util::AcceptServer* acceptor) {
   }
 
   persistence_manager_->Open("appendonly.aof");
+
+  // Bootstrap a single-node Raft cluster into Leader state BEFORE replaying the
+  // AOF: replayed writes go through SubmitCommand, which requires Leader. This
+  // is a no-op if peers are configured. It makes writes (SET/DEL/EXPIRE) and
+  // linearizable reads (ReadIndex requires Leader) functional in the default
+  // single-node setup.
+  pp_.AwaitBrief([&](uint32_t index, ProactorBase*) {
+    if (index == 0) {
+      if (engine_.BootstrapSingleNode()) {
+        LOG(INFO) << "Raft: node is Leader (single-node bootstrap)"
+                  << (absl::GetFlag(FLAGS_linearizable_read)
+                          ? "; linearizable reads enabled"
+                          : "");
+      } else {
+        LOG(WARNING) << "Raft: could not bootstrap Leader; writes and "
+                        "linearizable reads will fail until a Leader is elected";
+      }
+    }
+  });
 
   ReplayAof();
 }
@@ -311,6 +334,17 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
 void Service::Get(CmdArgList args, ConnectionContext* cntx) {
   const ParsedCommand& pcmd = *cntx->to_execute;
   string_view key = string_view(pcmd.tokens[1], sdslen(pcmd.tokens[1]));
+
+  // Linearizable read path: confirm leadership via the Raft ReadIndex protocol
+  // before serving the value. ReadIndex() blocks (on the current fiber) until
+  // last_applied has caught up to the confirmed read index, guaranteeing we
+  // observe every write that completed before this GET was issued.
+  if (absl::GetFlag(FLAGS_linearizable_read)) {
+    LogIndex ri = engine_.ReadIndex();
+    if (ri == 0) {
+      return cntx->SendError("READONLY Cannot serve linearizable read: not leader");
+    }
+  }
 
   CHECK(cntx->to_execute);
   cntx->to_execute->execute_async = 1;

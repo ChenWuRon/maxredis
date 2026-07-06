@@ -146,6 +146,13 @@ class RaftNode {
   void BecomeCandidate();
   void BecomeLeader();
 
+  // Bootstraps a single-node cluster (no peers) directly into Leader state.
+  // Safe only when this node is the sole voter: an election with no peers
+  // trivially wins majority (1/1). Used to make writes and linearizable reads
+  // functional in single-node deployments without waiting for the election
+  // timer. Returns true if the node became (or already was) Leader.
+  bool BootstrapSingleNode();
+
   // Called when the election timer fires.
   // Transitions Follower → Candidate if still in Follower state.
   void OnElectionTimeout();
