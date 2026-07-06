@@ -2,7 +2,7 @@
 // See LICENSE for licensing terms.
 //
 
-#include "server/service/test_utils.h"
+#include "server/test/test_utils.h"
 
 #include <absl/strings/match.h>
 #include <absl/strings/numbers.h>

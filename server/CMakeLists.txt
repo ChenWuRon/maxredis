@@ -16,36 +16,55 @@ add_library(dragonfly_lib
 cxx_link(dragonfly_lib 
          fibers2 strings_lib http_server_lib tls_lib redis_dict)
 
-add_library(dfly_test_lib service/test_utils.cc)
+add_library(dfly_test_lib test/test_utils.cc)
 cxx_link(dfly_test_lib dragonfly_lib gtest_main_ext)
 
-cxx_test(protocol/redis_parser_test dfly_test_lib LABELS DFLY)
-cxx_test(protocol/memcache_parser_test dfly_test_lib LABELS DFLY)
-cxx_test(service/command_serializer_test dragonfly_lib LABELS DFLY)
-cxx_test(command_log_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/log_storage_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/segment_log_storage_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/snapshot_meta_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/snapshot_writer_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_multi_group_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_snapshot_manager_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/snapshot_loader_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/append_entries_rpc_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/install_snapshot_rpc_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/snapshot_sender_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/snapshot_receiver_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/election_timer_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/heartbeat_rpc_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_apply_recovery_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_engine_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_integration_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/raft_role_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/vote_rpc_test dragonfly_lib LABELS DFLY)
-cxx_test(raft_group_test dragonfly_lib LABELS DFLY)
-cxx_test(raft_node_test dragonfly_lib LABELS DFLY)
-cxx_test(raft_storage_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/wal_writer_test dragonfly_lib LABELS DFLY)
-cxx_test(raft/file_log_storage_test dragonfly_lib LABELS DFLY)
-cxx_test(raft_types_test dragonfly_lib LABELS DFLY)
-cxx_test(state_serializer_test dragonfly_lib LABELS DFLY)
-cxx_test(state_machine/kv_state_machine_test dragonfly_lib LABELS DFLY)
+# ============================================
+# 测试文件分层目录结构
+# ============================================
+
+# --- 协议解析 ---
+cxx_test(test/protocol/redis_parser_test dfly_test_lib LABELS DFLY)
+cxx_test(test/protocol/memcache_parser_test dfly_test_lib LABELS DFLY)
+
+# --- 状态机/持久化 ---
+cxx_test(test/state_persistence/command_serializer_test dragonfly_lib LABELS DFLY)
+cxx_test(test/state_persistence/kv_state_machine_test dragonfly_lib LABELS DFLY)
+cxx_test(test/state_persistence/state_serializer_test dragonfly_lib LABELS DFLY)
+cxx_test(test/state_persistence/snapshot_manager_test persistence_lib dragonfly_lib LABELS DFLY)
+cxx_test(test/state_persistence/aof_writer_test persistence_lib dragonfly_lib LABELS DFLY)
+
+# --- Raft 核心 ---
+cxx_test(test/raft_core/raft_node_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_core/raft_role_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_core/raft_engine_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_core/election_timer_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_core/raft_group_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_core/raft_storage_test dragonfly_lib LABELS DFLY)
+
+# --- Raft RPC ---
+cxx_test(test/raft_rpc/vote_rpc_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_rpc/append_entries_rpc_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_rpc/heartbeat_rpc_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_rpc/install_snapshot_rpc_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_rpc/raft_types_test dragonfly_lib LABELS DFLY)
+
+# --- Raft 日志 ---
+cxx_test(test/raft_log/command_log_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_log/log_storage_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_log/file_log_storage_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_log/segment_log_storage_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_log/wal_writer_test dragonfly_lib LABELS DFLY)
+
+# --- Raft Snapshot ---
+cxx_test(test/raft_snapshot/snapshot_meta_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_snapshot/snapshot_writer_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_snapshot/snapshot_loader_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_snapshot/snapshot_sender_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_snapshot/snapshot_receiver_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_snapshot/raft_snapshot_manager_test dragonfly_lib LABELS DFLY)
+
+# --- Raft 集成 ---
+cxx_test(test/raft_integration/raft_integration_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_integration/raft_apply_recovery_test dragonfly_lib LABELS DFLY)
+cxx_test(test/raft_integration/raft_multi_group_test dragonfly_lib LABELS DFLY)

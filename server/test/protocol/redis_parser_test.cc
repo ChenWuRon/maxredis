@@ -10,7 +10,7 @@
 #include "absl/strings/str_cat.h"
 #include "base/gtest.h"
 #include "base/logging.h"
-#include "server/service/test_utils.h"
+#include "server/test/test_utils.h"
 
 using namespace testing;
 using namespace std;
