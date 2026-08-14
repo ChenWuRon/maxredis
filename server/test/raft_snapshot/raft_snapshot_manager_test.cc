@@ -75,6 +75,10 @@ class TestLogStorage : public ILogStorage {
   LogIndex LastIndex() const override { return last_index; }
   Term LastTerm() const override { return last_term; }
   const LogEntry* Get(LogIndex) const override { return nullptr; }
+  Term GetTerm(LogIndex index) const override {
+    // Synthetic log: every index up to last_index carries last_term.
+    return (index > 0 && index <= last_index) ? last_term : 0;
+  }
   LogIndex Append(LogEntry) override { return 0; }
   std::vector<LogEntry> GetRange(LogIndex, size_t) const override { return {}; }
   void TruncateFrom(LogIndex) override {}
@@ -275,6 +279,33 @@ TEST_F(RaftSnapshotManagerTest, MetadataSurvivesRestart) {
   RaftSnapshotManager mgr2(dir_, &sm, &log);
   EXPECT_EQ(500u, mgr2.meta().index);
   EXPECT_EQ(3u, mgr2.meta().term);
+}
+
+// The snapshot must never cover the uncommitted log tail: the bound index
+// (last_applied) is what gets recorded in snapshot.meta.
+TEST_F(RaftSnapshotManagerTest, CreateSnapshotBoundDoesNotExceedApplied) {
+  MockSnapshotSM sm;
+  TestLogStorage log;
+  log.last_index = 1000;  // log tail may contain uncommitted entries
+  log.last_term = 8;
+
+  RaftSnapshotManager mgr(dir_, &sm, &log);
+  ASSERT_TRUE(mgr.CreateSnapshot(600));
+  EXPECT_EQ(600u, mgr.meta().index);
+  EXPECT_EQ(8u, mgr.meta().term);
+}
+
+// A bound beyond the log tail clamps to the tail (defensive).
+TEST_F(RaftSnapshotManagerTest, CreateSnapshotBoundClampsToLogTail) {
+  MockSnapshotSM sm;
+  TestLogStorage log;
+  log.last_index = 1000;
+  log.last_term = 4;
+
+  RaftSnapshotManager mgr(dir_, &sm, &log);
+  ASSERT_TRUE(mgr.CreateSnapshot(2000));
+  EXPECT_EQ(1000u, mgr.meta().index);
+  EXPECT_EQ(4u, mgr.meta().term);
 }
 
 TEST_F(RaftSnapshotManagerTest, NoStateMachineNoCrash) {

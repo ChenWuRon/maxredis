@@ -51,6 +51,18 @@ class WalIndex {
     map_.swap(keep);
   }
 
+  // Removes all entries with index <= index.
+  // Used after log compaction: the surviving on-disk records are untouched,
+  // so their (segment_id, offset) locations remain valid.
+  void TrimUpTo(LogIndex index) {
+    decltype(map_) keep;
+    for (auto& [idx, loc] : map_) {
+      if (idx > index)
+        keep.insert({idx, loc});
+    }
+    map_.swap(keep);
+  }
+
   void Clear() {
     map_.clear();
   }

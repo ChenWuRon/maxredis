@@ -66,10 +66,11 @@ TEST(RaftEngineTest, FastCommitPathSingleNode) {
 
   ApplyResult result = engine.SubmitCommand(&set_cmd, args);
 
-  // Log entry appended
+  // Log entry appended (RESP-encoded, unambiguous serialization)
+  std::string expected = ReplicatedCommand{CommandType::SET, {"SET", "a", "1"}}.Serialize();
   EXPECT_EQ(1u, engine.log_storage()->LogSize());
   ASSERT_NE(nullptr, engine.log_storage()->Get(1));
-  EXPECT_EQ("SET a 1", engine.log_storage()->Get(1)->command);
+  EXPECT_EQ(expected, engine.log_storage()->Get(1)->command);
 
   // Commit index advanced to last log index
   EXPECT_EQ(1u, engine.group().node().commit_index());
@@ -77,7 +78,7 @@ TEST(RaftEngineTest, FastCommitPathSingleNode) {
 
   // State machine applied the entry
   ASSERT_EQ(1u, sm.applied.size());
-  EXPECT_EQ("SET a 1", sm.applied[0].command);
+  EXPECT_EQ(expected, sm.applied[0].command);
 
   // Result is OK
   EXPECT_EQ(ApplyOp::OK, result.op);

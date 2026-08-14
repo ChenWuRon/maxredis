@@ -31,6 +31,12 @@ class KvStateMachine : public IStateMachine {
   void Schedule(DbIndex db_ind, std::string_view key,
                 std::function<void(EngineShard*)> cb) override;
 
+  // Atomic conditional SET with expiry, executed inside a single shard task.
+  // Returns true when the value was applied (NX/XX conditions evaluated
+  // atomically with the insert).
+  bool ApplySet(DbIndex db_ind, std::string_view key, std::string_view val,
+                bool nx, bool xx, uint64_t expire_at_ms = 0);
+
   bool SaveSnapshot(const std::string& path) override;
   bool LoadSnapshot(const std::string& path) override;
 

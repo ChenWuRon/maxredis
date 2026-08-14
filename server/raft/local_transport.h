@@ -34,6 +34,10 @@ class LocalTransport : public Transport {
   // Messages for (group_id, node_id) pair will be routed to |node|.
   void RegisterNode(GroupId group_id, const NodeId& id, RaftNode* node);
 
+  // Removes a node from the routing table. Must be called before the node is
+  // destroyed, otherwise a concurrent RPC could dereference freed memory.
+  void UnregisterNode(GroupId group_id, const NodeId& node_id) override;
+
   VoteResponse SendVoteRequest(const NodeId& peer_id,
                                const VoteRequest& request) override;
 

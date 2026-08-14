@@ -125,6 +125,11 @@ void ApplyProgress::Update(LogIndex index) {
   Flush();
 }
 
+void ApplyProgress::Reset(LogIndex index) {
+  last_applied_ = index;
+  Flush();
+}
+
 std::string ApplyProgress::Serialize() const {
   return "{\"last_applied\":" + std::to_string(last_applied_) + "}\n";
 }

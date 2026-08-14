@@ -17,6 +17,15 @@ class Transport {
  public:
   virtual ~Transport() = default;
 
+  // Deregisters a node so no further RPCs are routed to it. Must be called
+  // before destroying a node that was registered with this transport,
+  // otherwise an in-flight RPC may dereference freed memory.
+  // Default: no-op (transports without a registry have nothing to remove).
+  virtual void UnregisterNode(GroupId group_id, const NodeId& node_id) {
+    (void)group_id;
+    (void)node_id;
+  }
+
   virtual VoteResponse SendVoteRequest(const NodeId& peer_id,
                                        const VoteRequest& request) = 0;
 

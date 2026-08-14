@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -12,10 +13,12 @@
 #include "server/raft/raft_node.h"
 #include "server/raft/raft_types.h"
 #include "server/state_machine/state_machine.h"
+#include "util/fibers/fibers.h"
 
 namespace dfly {
 
 class RaftSnapshotManager;
+class SegmentLogStorage;
 
 // RaftGroup holds all components of a single Raft consensus group:
 // the RaftNode, log storage, state machine, and snapshot manager.
@@ -75,8 +78,12 @@ class RaftGroup {
 
   // Initializes storage directory for this group.
   // Creates directories: base_path/raft/group_N/wal/, base_path/raft/group_N/snapshot/
+  // Replaces the in-memory CommandLog with a persistent SegmentLogStorage.
+  // |fsync_interval_ms|: 0 = fsync every WAL append (durable, slower);
+  // >0 = batch fsync every interval (page-cache writes + background fsync;
+  // survives kill -9, may lose the last interval on power failure).
   // Returns false if initialization fails.
-  bool InitStorage(const std::string& base_path);
+  bool InitStorage(const std::string& base_path, uint32_t fsync_interval_ms = 0);
 
   // Releases all resources. Stops snapshot manager, heartbeat, election timer.
   void Shutdown();
@@ -89,6 +96,10 @@ class RaftGroup {
   std::unique_ptr<RaftSnapshotManager> snapshot_manager_;
   std::string wal_dir_;
   std::string snapshot_dir_;
+  util::fb2::Fiber snapshot_fiber_;
+  std::atomic<bool> snapshot_shutdown_{false};
+  util::fb2::Fiber wal_flush_fiber_;
+  std::atomic<bool> wal_flush_shutdown_{false};
 };
 
 }  // namespace dfly

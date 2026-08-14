@@ -2,6 +2,7 @@
 build*/
 build-opt/
 build-dbg/
+Testing/
 
 # 依赖管理目录
 _deps/

@@ -16,6 +16,28 @@
 //   majority(old_config) AND majority(new_config)
 // simultaneously.
 //
+// CONCURRENCY MODEL
+// -----------------
+// RaftNode state is shared across proactor threads (connection fibers, the
+// heartbeat fiber, the election timer fiber and the snapshot driver). All
+// block-able state transitions and log mutations are serialized through
+// mutex_ (util::fb2::Mutex — a FIBER-friendly mutex that parks the calling
+// fiber instead of the OS thread, so same-thread fibers cannot deadlock the
+// proactor).
+//
+// Two rules prevent deadlocks and data races:
+//   1. Every public method that reads or mutates consensus state locks
+//      mutex_. Internal helpers use the *Locked() forms; public methods
+//      never call one another while holding the lock.
+//   2. Transport RPCs are NEVER issued while holding mutex_ — each RPC phase
+//      captures the request + peer list under the lock, sends outside the
+//      lock, then re-acquires the lock to process responses. Holding the
+//      lock across a synchronous in-process RPC would create an AB-BA
+//      deadlock between two nodes replicating to each other.
+//
+// Persistent hard state (term, voted_for, apply progress, WAL) is only ever
+// touched under mutex_, which makes every write path crash-safe and
+// race-free.
 
 #pragma once
 
@@ -40,8 +62,11 @@
 #include "server/raft/vote_rpc.h"
 #include "server/state_machine/state_machine.h"
 #include "util/fibers/fibers.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly {
+
+class RaftSnapshotManager;
 
 class RaftNode {
  public:
@@ -55,6 +80,8 @@ class RaftNode {
   void set_group_id(GroupId gid) {
     group_id_ = gid;
   }
+
+  void SetNodeId(NodeId id);
 
   // Set the persistence path for Raft metadata.
   // This also loads existing state from disk if available.
@@ -72,21 +99,10 @@ class RaftNode {
     return node_id_;
   }
 
-  RaftRole role() const {
-    return role_;
-  }
-
-  Term term() const {
-    return storage_.current_term();
-  }
-
-  const NodeId& voted_for() const {
-    return storage_.voted_for();
-  }
-
-  uint32_t vote_count() const {
-    return vote_count_;
-  }
+  RaftRole role() const;
+  Term term() const;
+  const NodeId voted_for() const;
+  uint32_t vote_count() const;
 
   // Unified role transition — all role changes must go through this.
   // Handles logging, timer management, and heartbeat lifecycle.
@@ -96,47 +112,19 @@ class RaftNode {
     transport_ = transport;
   }
 
-  const ClusterConfig& cluster_config() const {
-    return cluster_config_;
-  }
-
-  ConfigState config_state() const {
-    return config_state_;
-  }
-
-  void SetConfigState(ConfigState state) {
-    config_state_ = state;
-  }
-
-  void SetClusterConfig(ClusterConfig config) {
-    cluster_config_ = std::move(config);
-    peer_manager_.SetConfig(&cluster_config_);
-  }
-
-  void AddPeer(const NodeId& id) {
-    cluster_config_.voters.insert(id);
-  }
-
-  bool RemovePeer(const NodeId& id) {
-    return cluster_config_.voters.erase(id) > 0;
-  }
+  ClusterConfig cluster_config() const;
+  ConfigState config_state() const;
+  void SetConfigState(ConfigState state);
+  void SetClusterConfig(ClusterConfig config);
+  void AddPeer(const NodeId& id);
+  bool RemovePeer(const NodeId& id);
 
   // --- Joint Consensus ---
 
-  // Initiates a membership change via joint consensus.
-  // Must be called on the Leader. Appends a CONFIG_CHANGE log entry.
-  // When the entry is committed, state transitions occur:
-  //   Stable -> Joint (step 1) -> Stable with target (step 2).
-  // The second call (with the same target) finalizes the transition.
   bool BeginConfigChange(ClusterConfig target);
 
-  const JointConfig& joint_config() const {
-    return joint_config_;
-  }
-
-  bool IsJointConsensus() const {
-    return config_state_ == ConfigState::kJoint;
-  }
+  JointConfig joint_config() const;
+  bool IsJointConsensus() const;
 
   const PeerManager& peer_manager() const {
     return peer_manager_;
@@ -154,7 +142,6 @@ class RaftNode {
   bool BootstrapSingleNode();
 
   // Called when the election timer fires.
-  // Transitions Follower → Candidate if still in Follower state.
   void OnElectionTimeout();
 
   // Processes an incoming VoteRequest according to Raft rules.
@@ -165,55 +152,32 @@ class RaftNode {
   ElectionResult StartElection();
 
   // Checks if votes_received >= majority (N/2+1).
-  // If so, calls BecomeLeader() and returns true.
   bool TryBecomeLeader(const ElectionResult& result);
 
-  Term leader_term() const {
-    return leader_term_;
-  }
+  Term leader_term() const;
 
   const ElectionTimer& election_timer() const {
     return election_timer_;
   }
 
-  // Follower-side: processes an incoming Heartbeat from the leader.
   HeartbeatResponse OnHeartbeat(const HeartbeatRequest& request);
 
-  // Processes an incoming ReadIndex request from the leader.
-  // Returns success=false if the request's term is stale.
   ReadIndexResponse OnReadIndex(const ReadIndexRequest& request);
 
-  // Processes an incoming TimeoutNow request from the current leader.
-  // Triggers an immediate election (must be called on follower).
   TimeoutNowResponse OnTimeoutNow(const TimeoutNowRequest& request);
 
-  // Initiates graceful leader transfer to |target|.
-  // Returns true if transfer was initiated, false otherwise.
-  // Must be called on the leader.
-  // |target| must be a current voter (peer) in the cluster.
   bool StartTransfer(const NodeId& target);
-
-  // Returns true if |target| can safely become the next leader
-  // (i.e., match_index >= last_index).
   bool IsTransferReady(const NodeId& target) const;
-
-  // Cancels any ongoing transfer. Called automatically on timeout or role change.
   void CancelTransfer();
 
-  const LeaderTransferContext& transfer_context() const {
-    return transfer_ctx_;
-  }
+  const LeaderTransferContext transfer_context() const;
 
-  // Leader-side: implements the ReadIndex protocol.
-  // 1. Records commit_index_ as candidate read index.
-  // 2. Sends ReadIndex RPC to all peers.
-  // 3. Waits for quorum (majority success responses).
-  // 4. Waits for last_applied_ >= read_index.
-  // 5. Returns the confirmed read index.
-  // Uses leader lease optimization if enabled.
+  // Leader-side: implements the ReadIndex protocol with leader-lease fast path.
+  // Return value 0 means "leadership could not be confirmed".
   LogIndex ReadIndex();
 
-  // Blocks until last_applied_ >= target.
+  // Blocks until last_applied_ >= target. Locks internally; sleeps without
+  // the lock so replication/heartbeats can make progress.
   void WaitForApplied(LogIndex target);
 
   // Leader-side: sends Heartbeat to all peers immediately.
@@ -222,10 +186,20 @@ class RaftNode {
   // Leader-side: starts a fiber that sends heartbeats periodically.
   void StartHeartbeat(uint32_t interval_ms);
 
-  // Stops the heartbeat fiber.
+  // Requests the heartbeat fiber to stop. The fiber self-terminates at the
+  // next scheduling point; JoinHeartbeat() must be called WITHOUT holding
+  // mutex_ (e.g. from ~RaftNode) to reclaim it.
   void StopHeartbeat();
 
-  // Associates a log storage for log operations.
+  // Joins the heartbeat fiber if it is still running.
+  // Must NOT be called while holding mutex_.
+  void JoinHeartbeat();
+
+  // Gracefully stops all background consensus activity (heartbeat fiber and
+  // election timer). Idempotent; safe to call before destruction (e.g. when
+  // tearing down peers while a transport still holds references to this node).
+  void Shutdown();
+
   void SetLogStorage(ILogStorage* storage) {
     log_storage_ = storage;
   }
@@ -234,9 +208,14 @@ class RaftNode {
     snapshot_receiver_ = receiver;
   }
 
-  void SetSnapshotDir(std::string dir) {
-    snapshot_dir_ = std::move(dir);
+  // Associates the snapshot driver. The driver invokes
+  // CreateSnapshotIfNeeded() on the consensus thread to keep log compactions
+  // serialized with appends.
+  void SetSnapshotManager(RaftSnapshotManager* mgr) {
+    snapshot_manager_ = mgr;
   }
+
+  void SetSnapshotDir(std::string dir);
 
   const std::string& snapshot_dir() const {
     return snapshot_dir_;
@@ -248,57 +227,58 @@ class RaftNode {
     return snapshot_index > 0 && next_index <= snapshot_index;
   }
 
-  // Associates a state machine for applying committed entries.
   void SetStateMachine(IStateMachine* sm) {
     state_machine_ = sm;
   }
 
-  LogIndex commit_index() const {
-    return commit_index_;
-  }
+  LogIndex commit_index() const;
+  LogIndex last_applied() const;
 
-  LogIndex last_applied() const {
-    return last_applied_;
-  }
-
-  uint64_t leader_lease_expire() const {
-    return leader_lease_expire_;
-  }
+  uint64_t leader_lease_expire() const;
 
   // Test helper: forces commit_index to bypass replication.
-  void ForceCommitIndex(LogIndex ci) {
-    commit_index_ = ci;
-  }
+  void ForceCommitIndex(LogIndex ci);
 
-  LogIndex last_snapshot_index() const {
-    return last_snapshot_index_;
-  }
+  LogIndex last_snapshot_index() const;
+  Term last_snapshot_term() const;
 
-  Term last_snapshot_term() const {
-    return last_snapshot_term_;
-  }
-
-  // Follower-side: processes an incoming AppendEntries request.
   AppendEntriesResponse OnAppendEntries(const AppendEntriesRequest& req);
 
-  // Follower-side: processes an incoming InstallSnapshot request.
   InstallSnapshotResponse OnInstallSnapshot(const InstallSnapshotRequest& req);
 
-  // Leader-side: sends all log entries to every peer.
-  // Returns the ApplyResult of the last committed entry.
+  // Leader-side: replicates the log to all peers. Sends RPCs outside the
+  // consensus lock. Returns the ApplyResult of the last committed entry.
   ApplyResult ReplicateLog();
 
   // Advances commit_index when a majority of peers have replicated an entry.
+  // Applies the Figure 8 guard (§5.4.2): only entries from the CURRENT term
+  // may advance commit_index directly.
   void AdvanceCommitIndex();
 
   // Applies entries from last_applied+1 up to commit_index.
-  // Returns the ApplyResult of the last entry applied.
   ApplyResult ApplyCommittedLogs();
 
   // Replays unapplied log entries after recovery.
-  // Sets commit_index_ = LastIndex() and applies everything after last_applied_.
-  // Safe to call even without log_storage_ or state_machine_ (no-op).
+  // NOTE: does NOT advance commit_index — committing is exclusively the
+  // leader's job (via AppendEntries leader_commit). Bumping commit_index to
+  // LastIndex() on recovery would apply entries that were never committed,
+  // violating State Machine Safety.
   void ReplayUnappliedLogs();
+
+  // Startup hook: declares that the state machine has NO restored state
+  // (no snapshot was loaded), so replay must start from the beginning of the
+  // WAL. Resets both the in-memory and the on-disk apply progress.
+  // Safe: re-applying the local WAL is idempotent for the supported command
+  // set, and a follower in a multi-node cluster still never self-commits
+  // (ReplayUnappliedLogs refuses without a majority-confirmed commit index).
+  void ResetApplyProgress(LogIndex to);
+
+  // Batches apply.meta fsyncs: 0 = flush after every apply batch (default,
+  // safe for any WAL policy); >0 = flush at most once per interval, always
+  // AFTER flushing the WAL first — apply.meta can never become durable ahead
+  // of the log records it references, so recovery can only replay idempotent
+  // entries, never skip committed ones.
+  void SetApplyMetaFlushInterval(uint32_t interval_ms);
 
   ApplyProgress& apply_progress() {
     return apply_progress_;
@@ -308,29 +288,88 @@ class RaftNode {
     return apply_progress_;
   }
 
+  // Client write path: appends |entry| to the log (term is taken from the
+  // current leader state) and replicates it. Only valid on the Leader.
+  ApplyResult SubmitEntry(LogEntry entry);
+
+  // Runs a snapshot-creation pass under the consensus lock. Called by the
+  // snapshot driver fiber; keeps WAL compaction serialized with appends.
+  bool CreateSnapshotIfNeeded();
+
  private:
+  // ---- Locked helpers (callers must hold mutex_) ----
+
+  void SetRoleLocked(RaftRole new_role);
+  void BecomeFollowerLocked(Term term);
+  void BecomeCandidateLocked();
+  void TryBecomeLeaderLocked();
+  void BecomeLeaderLocked();
+  void BecomeLeaderInitPeersLocked();
+
+  std::vector<NodeId> GetPeerIdsLocked() const;
+  void AdvanceCommitIndexLocked();
+  void AdvanceCommitIndexJointLocked();
+  ApplyResult ApplyCommittedLogsLocked();
+  ApplyResult ReplicateLogLocked();
+  void MaybeAutoFinalizeJointLocked();
+
+  // Renews the leader lease. Must be called under mutex_ and ONLY after a
+  // majority of the current config has confirmed the leader (heartbeat ACK
+  // or ReadIndex quorum).
+  void ExtendLeaderLeaseLocked();
+
+  // Steps down to Follower when the leader lost its quorum (CheckQuorum).
+  // Keeps voted_for intact (same term — no vote reset).
+  void StepDownLocked();
+
+  void CheckTransferTimeoutLocked();
+  void SendTimeoutNowToTarget();
+  void CancelTransferLocked();
+  bool IsTransferReadyLocked(const NodeId& target) const;
+
+  // One heartbeat round: capture (locked) → send (unlocked) → process
+  // (locked). Returns true when the loop must stop (role change / epoch).
+  bool HeartbeatTickImpl(bool is_loop, uint64_t epoch);
+
+  uint64_t NowMs() const;
+
   void HeartbeatLoop();
 
-  std::vector<NodeId> GetPeerIds() const;
-  void AdvanceCommitIndexJoint();
-  uint64_t NowMs() const;
-  void ExtendLeaderLease();
+  // Per-peer replication progress (parallel to last_peer_ids_).
+  void ResizePeerArraysLocked(size_t n);
+
+  // ---- members ----
+
+  // Fiber-friendly consensus lock. All consensus state below is guarded by
+  // this mutex.
+  mutable util::fb2::Mutex mutex_;
 
   // Leader lease: allows skipping ReadIndex quorum within lease period.
+  // Only renewed on majority ACK; monotonic time source.
   uint64_t leader_lease_expire_ = 0;
   uint64_t lease_ms_ = 100;  // default lease duration
+  // Last time a majority of the config acknowledged this node as leader.
+  uint64_t last_majority_ack_ms_ = 0;
+  // Step down if no majority ACK within this window (≈ 2 election timeouts).
+  uint64_t check_quorum_ms_ = 600;
+  // Batched apply.meta flush (see SetApplyMetaFlushInterval).
+  uint32_t apply_meta_flush_interval_ms_ = 0;
+  uint64_t last_apply_meta_flush_ms_ = 0;
+
   uint64_t next_read_index_request_id_ = 0;
 
   // Leader transfer state.
   LeaderTransferContext transfer_ctx_;
   uint64_t transfer_timeout_ms_ = 3000;  // 3 second default
-  void CheckTransferTimeout();
-  void SendTimeoutNowToTarget();
 
   GroupId group_id_ = 0;
   JointConfig joint_config_;
   ClusterConfig cluster_config_;
   ConfigState config_state_ = ConfigState::kStable;
+  // Index of the joint (step 1) config entry, used to auto-append the
+  // step 2 (finalize) entry once it is committed.
+  LogIndex joint_entry_index_ = 0;
+  bool joint_finalize_appended_ = false;
   RaftStorage storage_;
   ApplyProgress apply_progress_;
   NodeId node_id_;
@@ -346,14 +385,19 @@ class RaftNode {
   ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;
   SnapshotReceiver* snapshot_receiver_ = nullptr;
+  RaftSnapshotManager* snapshot_manager_ = nullptr;
   LogIndex commit_index_ = 0;
   LogIndex last_applied_ = 0;
   LogIndex last_snapshot_index_ = 0;
   Term last_snapshot_term_ = 0;
   std::string snapshot_dir_;
   std::vector<NodeId> last_peer_ids_;
+  std::vector<LogIndex> peer_next_index_;
   std::vector<LogIndex> peer_last_log_index_;
   std::atomic<bool> shutdown_{false};
+  // Bumped on every StartHeartbeat so stale heartbeat fibers (from a
+  // previous leadership) self-terminate at their next scheduling point.
+  std::atomic<uint64_t> heartbeat_epoch_{0};
   util::fb2::Fiber heartbeat_fiber_;
   uint32_t heartbeat_interval_ms_ = 50;
   ElectionTimer election_timer_;

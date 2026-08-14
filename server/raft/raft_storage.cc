@@ -22,6 +22,11 @@ namespace {
 
 constexpr std::string_view kFieldCurrentTerm = "current_term";
 constexpr std::string_view kFieldVotedFor = "voted_for";
+constexpr std::string_view kFieldConfigState = "config_state";
+constexpr std::string_view kFieldJointOldVoters = "joint_old_voters";
+constexpr std::string_view kFieldJointNewVoters = "joint_new_voters";
+constexpr std::string_view kFieldJointOldVersion = "joint_old_version";
+constexpr std::string_view kFieldJointNewVersion = "joint_new_version";
 
 bool WriteAndFsync(const std::string& tmp_path, const std::string& content) {
   FILE* fp = fopen(tmp_path.c_str(), "w");
@@ -136,19 +141,53 @@ void RaftStorage::set_voted_for(NodeId node_id) {
   Flush();
 }
 
+void RaftStorage::SetState(Term term, const NodeId& voted_for) {
+  DCHECK_GE(term, current_term_);
+  current_term_ = term;
+  voted_for_ = voted_for;
+  // Single atomic tmp+fsync+rename: no crash window between "term durable"
+  // and "vote durable".
+  Flush();
+}
+
+void RaftStorage::SetJointConfigState(ConfigState state, const JointConfig& joint) {
+  config_state_ = state;
+  joint_config_ = joint;
+  Flush();
+}
+
 void RaftStorage::Clear() {
   current_term_ = 0;
   voted_for_.clear();
+  config_state_ = ConfigState::kStable;
+  joint_config_ = JointConfig{};
   Flush();
+}
+
+std::string RaftStorage::JoinToken(const std::unordered_set<NodeId>& set) {
+  std::string result;
+  for (const auto& id : set) {
+    if (!result.empty())
+      result += ',';
+    result += EscapeJson(id);
+  }
+  return result;
 }
 
 std::string RaftStorage::Serialize() const {
   return "{\"current_term\":" + std::to_string(current_term_) +
-         ",\"voted_for\":\"" + EscapeJson(voted_for_) + "\"}\n";
+         ",\"voted_for\":\"" + EscapeJson(voted_for_) + "\"" +
+         ",\"config_state\":" + std::to_string(static_cast<uint8_t>(config_state_)) +
+         ",\"joint_old_voters\":\"" + JoinToken(joint_config_.old_config.voters) + "\"" +
+         ",\"joint_new_voters\":\"" + JoinToken(joint_config_.new_config.voters) + "\"" +
+         ",\"joint_old_version\":" +
+         std::to_string(joint_config_.old_config.version) +
+         ",\"joint_new_version\":" +
+         std::to_string(joint_config_.new_config.version) + "}\n";
 }
 
 bool RaftStorage::Deserialize(const std::string& data) {
-  // Minimal JSON parser for: {"current_term":N,"voted_for":"..."}
+  // Minimal JSON parser for the fields we serialize.
   auto find_field = [&](const std::string& name) -> size_t {
     auto pos = data.find("\"" + name + "\"");
     if (pos == std::string::npos)
@@ -163,19 +202,23 @@ bool RaftStorage::Deserialize(const std::string& data) {
     return start;
   };
 
-  // Parse current_term
-  auto pos = find_field(std::string(kFieldCurrentTerm));
-  if (pos != std::string::npos) {
+  auto parse_uint = [&](const std::string& name, uint64_t* out) -> bool {
+    auto pos = find_field(name);
+    if (pos == std::string::npos)
+      return false;
     char* end = nullptr;
     uint64_t val = strtoull(data.c_str() + pos, &end, 10);
     if (end != data.c_str() + pos) {
-      current_term_ = val;
+      *out = val;
+      return true;
     }
-  }
+    return false;
+  };
 
-  // Parse voted_for (handle escaped quotes)
-  pos = find_field(std::string(kFieldVotedFor));
-  if (pos != std::string::npos && pos < data.size() && data[pos] == '"') {
+  auto parse_string = [&](const std::string& name, std::string* out) -> bool {
+    auto pos = find_field(name);
+    if (pos == std::string::npos || pos >= data.size() || data[pos] != '"')
+      return false;
     bool escaped = false;
     size_t end_quote = std::string::npos;
     for (size_t i = pos + 1; i < data.size(); i++) {
@@ -192,10 +235,45 @@ bool RaftStorage::Deserialize(const std::string& data) {
         break;
       }
     }
-    if (end_quote != std::string::npos && end_quote > pos + 1) {
-      voted_for_ = UnescapeJson(data.substr(pos + 1, end_quote - pos - 1));
+    if (end_quote == std::string::npos)
+      return false;
+    *out = UnescapeJson(data.substr(pos + 1, end_quote - pos - 1));
+    return true;
+  };
+
+  uint64_t v = 0;
+  if (parse_uint(std::string(kFieldCurrentTerm), &v))
+    current_term_ = v;
+
+  std::string s;
+  if (parse_string(std::string(kFieldVotedFor), &s))
+    voted_for_ = s;
+
+  if (parse_uint(std::string(kFieldConfigState), &v))
+    config_state_ = (v == 0) ? ConfigState::kStable : ConfigState::kJoint;
+
+  auto parse_voters = [&](const std::string& name, std::unordered_set<NodeId>* out) {
+    if (!parse_string(name, &s))
+      return;
+    size_t start = 0;
+    while (start < s.size()) {
+      size_t comma = s.find(',', start);
+      if (comma == std::string::npos) {
+        if (!s.substr(start).empty())
+          out->insert(UnescapeJson(s.substr(start)));
+        break;
+      }
+      if (comma > start)
+        out->insert(UnescapeJson(s.substr(start, comma - start)));
+      start = comma + 1;
     }
-  }
+  };
+  parse_voters(std::string(kFieldJointOldVoters), &joint_config_.old_config.voters);
+  parse_voters(std::string(kFieldJointNewVoters), &joint_config_.new_config.voters);
+  if (parse_uint(std::string(kFieldJointOldVersion), &v))
+    joint_config_.old_config.version = v;
+  if (parse_uint(std::string(kFieldJointNewVersion), &v))
+    joint_config_.new_config.version = v;
 
   return true;
 }

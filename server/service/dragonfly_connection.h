@@ -39,6 +39,11 @@ class Connection : public util::Connection {
   void Notify() {
     evc_.notify();
   }
+
+  // Number of live connections (for INFO). Thread-safe.
+  static uint64_t connection_count() {
+    return connection_count_.load(std::memory_order_relaxed);
+  }
  protected:
   void OnShutdown() override;
 
@@ -86,6 +91,8 @@ class Connection : public util::Connection {
     PARSE_INLINE,
     PARSE_MULTIBULK,
   } state_ = INIT;
+
+  static std::atomic<uint64_t> connection_count_;
 };
 
 }  // namespace dfly

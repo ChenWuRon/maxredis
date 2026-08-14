@@ -35,7 +35,7 @@ class FileLogStorage : public ILogStorage {
   bool Open(const std::string& dir);
 
   // Flushes the current WAL segment to disk.
-  bool Flush();
+  bool Flush() final;
 
   // Rolls to a new segment. Flushes current segment, increments segment ID,
   // opens a new WAL file, and updates the manifest.

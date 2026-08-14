@@ -58,7 +58,7 @@
 │                              │              │  (kLocal, fast path)    │
 │  ┌────────────────────────┐  │              └──────────────────────────┘
 │  │ CommandEncoder::Encode │  │
-│  │  → string "SET a 1"   │  │
+│  │  → RESP array (binary-safe log format) │  │
 │  └────────────────────────┘  │
 └───────────┬──────────────────┘
             │ LogEntry{term, index, command}
@@ -462,17 +462,113 @@ build-opt/midi-redis --snapshot_time_sec=60 --snapshot_cmd_count=1000
 AOF is enabled by default. All SET/DEL commands are recorded to `appendonly.aof`.
 On restart, data is restored from `snapshot.bin` (if exists) + `appendonly.aof`.
 
+### Durable Raft mode (WAL-backed consensus)
+
+When `--raft_dir` is set, Raft takes over durability and the AOF/server-snapshot
+path is disabled (they carry no Raft index binding and would conflict with WAL
+recovery):
+
+```
+build-opt/midi-redis --raft_dir=./data
+```
+
+The WAL fsync policy is configurable (analogue of Redis AOF `everysec`):
+
+```
+# fully durable: fsync every append (default, power-loss safe)
+build-opt/midi-redis --raft_dir=./data
+
+# batched: page-cache writes + background fsync every 1000ms.
+# kill -9 safe (page cache survives process crash); a power failure may
+# lose the last interval. apply.meta is flushed at the same cadence, always
+# AFTER the WAL, so recovery can only replay idempotent entries — never skip
+# committed ones.
+build-opt/midi-redis --raft_dir=./data --raft_fsync_interval_ms=1000
+```
+
+This creates the following layout, with **every** Raft state change fsynced
+before it is acknowledged:
+
+```
+data/raft/group_0/
+├── meta.json              # hard state: (term, voted_for) written as ONE atomic
+│                          #   tmp+fsync+rename record; also persists in-flight
+│                          #   joint-consensus configs
+├── apply.meta             # last_applied — flushed after each apply batch
+├── wal/
+│   ├── manifest.json      # current segment id
+│   └── segment_*.log      # segmented WAL (64MB), CRC32C per record,
+│                          #   fsync on every append (kill -9 safe)
+└── snapshot/
+    ├── snapshot.meta      # snapshot bound = last APPLIED index (never the
+    │                      #   uncommitted log tail)
+    └── snapshot.bin       # state machine snapshot
+```
+
+Recovery guarantees:
+
+- `term/voted_for` are a single atomic record — no double-vote window.
+- On restart the node **never self-commits**: `commit_index` is re-established
+  by the leader via AppendEntries. A single-node cluster (self-bootstrap)
+  replays its own WAL; a follower in a multi-node cluster waits for the leader.
+- No snapshot → the whole WAL is re-applied (idempotent for the supported
+  command set); with a snapshot → only entries after the snapshot index.
+- A torn tail record (partial header / CRC mismatch) stops the WAL scan —
+  the partial record is ignored, exactly the crash-recovery semantic Raft
+  requires.
+
 ---
 
 ## Threading Model
 
 - **Fiber-based concurrency**: uses `util::fb2::Fiber` (user-space cooperative fibers)
-- **No mutexes**: all Raft state mutations happen on a single fiber chain
+- **Single-writer consensus core**: every Raft state mutation (term, vote,
+  commit index, log, apply, lease, joint config) is serialized through one
+  fiber-friendly mutex (`util::fb2::Mutex`) on the RaftNode. The mutex parks
+  the calling *fiber* (never the OS thread), so consensus work from any
+  proactor thread is safely funneled into a single logical thread. Transport
+  RPCs are always issued **outside** the lock to avoid AB-BA deadlocks
+  between replicating peers.
 - **Cross-shard dispatch**: `EngineShardSet::Await()` schedules work on the correct Proactor thread
+- **Backpressure**: `FiberQueue` (128 slots per shard) blocks the producer
+  fiber when full — overload propagates back to the client connection instead
+  of dropping work or exhausting memory.
 - **Key fibers**:
-  - `heartbeat_fiber_` — sends heartbeats every 50ms (Leader only)
+  - `heartbeat_fiber_` — sends heartbeats every 50ms (Leader only); renews the
+    leader lease **only on a majority ACK** and steps down when quorum is lost
+    for `check_quorum_ms` (CheckQuorum — a partitioned leader can never keep
+    serving linearizable reads). All lease math uses `steady_clock`.
   - `election_timer_fiber_` — randomized election timeout [150, 300]ms (Follower only)
-  - `snapshot_fiber_` — automatic snapshot creation in background
+  - `snapshot_fiber_` — automatic snapshot creation in background, serialized
+    with log appends on the consensus lock
+
+---
+
+## Multi-node deployment
+
+The consensus core is fully covered by multi-node tests (3- and 5-node
+elections, replication, commit, partition/lease behavior) via the in-process
+`LocalTransport`. The transport layer is pluggable
+(`ITransport` in `server/raft/transport.h`) — a production deployment wires a
+TCP/gRPC transport implementing the 6 RPCs (RequestVote, AppendEntries,
+Heartbeat, InstallSnapshot, ReadIndex, TimeoutNow), plus a config source
+(initial peer list → `SetClusterConfig`) and `RaftGroupManager` for multi-group
+routing:
+
+```
+# single-node (default): self-bootstraps to Leader
+build-opt/midi-redis
+
+# linearizable GET (ReadIndex; fails over cleanly if leadership is lost)
+build-opt/midi-redis --linearizable_read=true
+
+# durable Raft state (WAL + hard state + apply progress + snapshots)
+build-opt/midi-redis --raft_dir=./data --linearizable_read=true
+```
+
+`INFO` exposes a `# Raft` section (term, voted_for, commit index, last
+applied, log index, snapshot index) and a real `role` field for observability
+and for configuring proxies to route writes to the leader.
 
 ---
 
@@ -492,60 +588,8 @@ On restart, data is restored from `snapshot.bin` (if exists) + `appendonly.aof`.
 ## References
 
 - [Raft Consensus Algorithm](https://raft.github.io/) — In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)
+- [etcd raft](https://github.com/etcd-io/raft) / [TiKV raft-rs](https://github.com/tikv/raft-rs) — production implementations used as reference for lease renewal, CheckQuorum, joint-consensus auto-finalize, and single-record hard-state persistence
 - [MIT 6.824 Distributed Systems](https://pdos.csail.mit.edu/6.824/) — Distributed Systems course
 - [Helio Framework](https://github.com/romange/helio) — Fiber-based event loop library
 - [Redis Protocol Specification](https://redis.io/topics/protocol) — RESP protocol
 - [Memcached Protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt) — ASCII protocol
-
-## Building from source
-
-I've tested the build on Ubuntu 21.04+.
-
-```
-git clone --recursive https://github.com/romange/midi-redis
-cd midi-redis && ./helio/blaze.sh -release
-cd build-opt && ninja midi-redis
-```
-
-Or with ninja generator for faster rebuilds:
-
-```
-./helio/blaze.sh -release -ninja
-ninja -C build-opt midi-redis
-```
-
-After modifying source files only (no dependency changes):
-
-```
-ninja -C build-opt midi-redis
-```
-
-If build files become stale after restructuring:
-
-```
-cmake -B build-opt -DCMAKE_BUILD_TYPE=Release -GNinja -DFETCHCONTENT_FULLY_DISCONNECTED=ON
-ninja -C build-opt midi-redis
-```
-
-## Running
-
-```
-build-opt/midi-redis --logtostderr
-```
-
-For more options, run `build-opt/midi-redis --help`.
-
-### Snapshot
-
-```
-redis-cli -p 6380 SAVE
-# Generates snapshot.bin
-
-# Automatic snapshots:
-build-opt/midi-redis --snapshot_time_sec=60 --snapshot_cmd_count=1000
-```
-
-### Persistence
-
-AOF is enabled by default. All SET/DEL commands are recorded to `appendonly.aof`.
-On restart, data is restored from `snapshot.bin` (if exists) + `appendonly.aof`.

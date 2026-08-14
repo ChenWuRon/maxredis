@@ -64,10 +64,16 @@ class RaftSnapshotManager {
 
   // Creates a snapshot immediately. Blocks until complete.
   // Uses the barrier to freeze writes during export.
-  bool CreateSnapshot();
+  // |bound_index| is the highest log index the snapshot is guaranteed to
+  // contain — it MUST be an index already applied to the state machine
+  // (usually last_applied_), NOT the raw log tail: the log may hold
+  // uncommitted entries that must not be baked into the snapshot. The meta
+  // file records |bound_index| so recovery truncates the WAL exactly there.
+  // 0 means "use the log tail" (unit tests that build synthetic logs).
+  bool CreateSnapshot(LogIndex bound_index = 0);
 
   // Checks the threshold and creates a snapshot if needed.
-  bool ScheduleCreateIfNeeded();
+  bool ScheduleCreateIfNeeded(LogIndex bound_index = 0);
 
  private:
   void SnapshotLoop();

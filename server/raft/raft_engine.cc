@@ -18,6 +18,15 @@ RaftEngine::RaftEngine(EngineShardSet* shard_set, util::ProactorPool* pp)
   group_.node().SetStateMachine(&kv_);
 }
 
+bool RaftEngine::InitRaftStorage(const std::string& base_path, uint32_t fsync_interval_ms) {
+  if (!group_.InitStorage(base_path, fsync_interval_ms))
+    return false;
+  // Wire the snapshot barrier into the KV state machine so that Raft
+  // snapshot export freezes concurrent writes across ALL shard threads.
+  kv_.SetSnapshotBarrier(&group_.snapshot_manager()->barrier());
+  return true;
+}
+
 ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
   auto cmd = CommandEncoder::Encode(cid, args);
 
@@ -25,31 +34,11 @@ ApplyResult RaftEngine::SubmitCommand(const CommandId* cid, CmdArgList args) {
     return kv_.Apply(cid, args);
   }
 
-  if (group_.node().role() != RaftRole::Leader) {
-    VLOG(1) << "SubmitCommand rejected: not leader (role=" << group_.node().role() << ")";
-    return {ApplyOp::ERROR, 0};
-  }
-
   VLOG(1) << "SubmitCommand: " << cmd->Serialize();
 
-  if (group_.node().peer_manager().PeerCount() == 0) {
-    return FastCommitPath(*cmd);
-  }
-
-  LogEntry entry(group_.node().term(), 0, cmd->Serialize());
-  group_.log_storage()->Append(entry);
-
-  return group_.node().ReplicateLog();
-}
-
-ApplyResult RaftEngine::FastCommitPath(const ReplicatedCommand& cmd) {
-  LogEntry entry(group_.node().term(), 0, cmd.Serialize());
-  group_.log_storage()->Append(entry);
-  VLOG(1) << "FastCommitPath: appended " << cmd.Serialize()
-          << " log_size=" << group_.log_storage()->LogSize();
-
-  group_.node().AdvanceCommitIndex();
-  return group_.node().ApplyCommittedLogs();
+  // All appends + replication go through the consensus-locked node path.
+  LogEntry entry(0, 0, cmd->Serialize());
+  return group_.node().SubmitEntry(std::move(entry));
 }
 
 bool RaftEngine::Expire(DbIndex db_ind, std::string_view key, uint64_t expire_at_ms) {

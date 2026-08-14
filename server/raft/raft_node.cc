@@ -16,24 +16,63 @@
 //   majority(old_config) AND majority(new_config)
 // simultaneously.
 //
+// CONCURRENCY: see raft_node.h — all consensus state is guarded by mutex_
+// (a fiber-friendly mutex). Transport RPCs are issued only OUTSIDE the lock.
 
 #include "server/raft/raft_node.h"
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 
 #include "base/logging.h"
 #include "server/raft/apply_progress.h"
 #include "server/raft/replicated_command.h"
 #include "server/raft/snapshot_loader.h"
+#include "server/raft/snapshot_manager.h"
 #include "server/state_machine/state_machine.h"
 
 namespace dfly {
 
+namespace {
+
+// Max entries carried in a single AppendEntries RPC.
+constexpr size_t kMaxAppendBatch = 128;
+
+// Upper bound on how long WaitForApplied may wait before giving up
+// (guards against an infinite hang when the node was partitioned away).
+constexpr uint64_t kWaitForAppliedTimeoutMs = 5000;
+
+}  // namespace
+
 RaftNode::RaftNode(NodeId node_id) : node_id_(std::move(node_id)) {
 }
 
+RaftNode::~RaftNode() {
+  Shutdown();
+}
+
+void RaftNode::Shutdown() {
+  // Definitive: set shutdown_ FIRST (under the lock) so any RPC that arrives
+  // afterwards cannot flip the role and restart the election timer / heartbeat
+  // (a restarted timer would RPC to peers that may already be destroyed).
+  {
+    std::lock_guard guard(mutex_);
+    shutdown_.store(true, std::memory_order_release);
+  }
+  StopHeartbeat();
+  JoinHeartbeat();
+  election_timer_.Stop();
+}
+
+void RaftNode::SetNodeId(NodeId id) {
+  std::lock_guard guard(mutex_);
+  node_id_ = std::move(id);
+}
+
 void RaftNode::SetStoragePath(std::string path) {
+  std::lock_guard guard(mutex_);
+
   // path is the directory for Raft metadata files (e.g. "data/raft").
   // Ensure trailing slash for consistent path construction.
   if (!path.empty() && path.back() != '/')
@@ -42,6 +81,16 @@ void RaftNode::SetStoragePath(std::string path) {
   snapshot_dir_ = path;
   storage_ = RaftStorage(path + "meta.json");
   storage_.Load();
+
+  // Restore a possibly in-flight joint membership change so that step 2 can
+  // be resumed (the joint config is hard state).
+  config_state_ = storage_.config_state();
+  joint_config_ = storage_.joint_config();
+  if (config_state_ == ConfigState::kJoint) {
+    LOG(INFO) << node_id_ << " recovered in-flight joint consensus (old voters="
+              << joint_config_.old_config.voters.size()
+              << " new voters=" << joint_config_.new_config.voters.size() << ")";
+  }
 
   apply_progress_ = ApplyProgress(path + "apply.meta");
   apply_progress_.Load();
@@ -65,20 +114,29 @@ void RaftNode::SetStoragePath(std::string path) {
         // returns the correct term for AppendEntries consistency checks.
         if (log_storage_) {
           log_storage_->SetSnapshotAnchor(last_snapshot_index_, last_snapshot_term_);
+          // Drop any WAL entries covered by the snapshot from memory and
+          // from the segment index (their disk records are still valid but
+          // redundant; ScanSegment prunes them on next Open via the anchor).
+          log_storage_->PruneCompacted();
         }
       }
     }
   }
+  // Note: apply.meta (and the KV layer's own snapshot/AOF restore, wired in
+  // main_service) is authoritative for last_applied_. ReplayUnappliedLogs()
+  // only replays entries strictly after last_applied_, so a node that
+  // restored its state machine from the KV persistence layer never re-applies
+  // entries that were already applied before the restart.
+
+  // commit_index_ is a volatile field in Raft: it is re-established by the
+  // elected leader via AppendEntries. Initialize it to last_applied_ so we
+  // never re-apply entries below it, and never self-commit beyond it.
+  commit_index_ = last_applied_;
 
   VLOG(1) << node_id_ << " SetStoragePath: last_applied=" << last_applied_;
 }
 
-RaftNode::~RaftNode() {
-  StopHeartbeat();
-  election_timer_.Stop();
-}
-
-std::vector<NodeId> RaftNode::GetPeerIds() const {
+std::vector<NodeId> RaftNode::GetPeerIdsLocked() const {
   if (config_state_ == ConfigState::kJoint) {
     std::unordered_set<NodeId> all;
     all.insert(joint_config_.old_config.voters.begin(),
@@ -98,7 +156,19 @@ std::vector<NodeId> RaftNode::GetPeerIds() const {
   return result;
 }
 
+void RaftNode::ResizePeerArraysLocked(size_t n) {
+  peer_next_index_.resize(n);
+  peer_last_log_index_.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    if (peer_next_index_[i] == 0) {
+      // Standard Raft: a freshly known peer starts at LastIndex+1.
+      peer_next_index_[i] = log_storage_ ? log_storage_->LastIndex() + 1 : 1;
+    }
+  }
+}
+
 bool RaftNode::BeginConfigChange(ClusterConfig target) {
+  std::lock_guard guard(mutex_);
   if (role_ != RaftRole::Leader || !log_storage_)
     return false;
 
@@ -110,7 +180,8 @@ bool RaftNode::BeginConfigChange(ClusterConfig target) {
       return false;
     }
     ConfigChangeCommand cmd{target};
-    log_storage_->Append(LogEntry(term(), 0, cmd.Serialize()));
+    log_storage_->Append(LogEntry(storage_.current_term(), 0, cmd.Serialize()));
+    joint_finalize_appended_ = true;
     VLOG(1) << node_id_ << " BeginConfigChange step 2: append final config version="
             << target.version;
     return true;
@@ -121,7 +192,7 @@ bool RaftNode::BeginConfigChange(ClusterConfig target) {
   joint_config_.new_config = target;
 
   ConfigChangeCommand cmd{target};
-  log_storage_->Append(LogEntry(term(), 0, cmd.Serialize()));
+  log_storage_->Append(LogEntry(storage_.current_term(), 0, cmd.Serialize()));
 
   VLOG(1) << node_id_ << " BeginConfigChange step 1: append joint config, target version="
           << target.version;
@@ -129,83 +200,162 @@ bool RaftNode::BeginConfigChange(ClusterConfig target) {
 }
 
 void RaftNode::SetRole(RaftRole new_role) {
+  std::lock_guard guard(mutex_);
+  if (new_role == role_)
+    return;  // idempotent
+  switch (new_role) {
+    case RaftRole::Follower:
+      // Public API (test-facing). Unlike BecomeFollowerLocked, this clears
+      // the current-term vote to match legacy SetRole semantics.
+      SetRoleLocked(RaftRole::Follower);
+      storage_.SetState(storage_.current_term(), "");
+      break;
+    case RaftRole::Candidate:
+      // Atomic (term+1, self-vote) persistence.
+      if (role_ != RaftRole::Candidate)
+        BecomeCandidateLocked();
+      break;
+    case RaftRole::Leader:
+      // Raw API: promote through the candidate path so the term and the
+      // self-vote are consistent (the DCHECK requires a Candidate).
+      if (role_ != RaftRole::Candidate)
+        BecomeCandidateLocked();
+      BecomeLeaderLocked();
+      break;
+  }
+}
+
+void RaftNode::SetRoleLocked(RaftRole new_role) {
   RaftRole old_role = role_;
   role_ = new_role;
 
   VLOG(1) << "RaftNode " << node_id_ << " term=" << storage_.current_term()
           << ": " << old_role << " -> " << new_role;
 
+  // After Shutdown() no background consensus activity may (re)start: a role
+  // change triggered by a late RPC must not resurrect the election timer or
+  // the heartbeat fiber.
+  const bool shutdown = shutdown_.load(std::memory_order_acquire);
+
   switch (new_role) {
     case RaftRole::Follower:
       leader_term_ = 0;
-      storage_.set_voted_for("");
       vote_count_ = 0;
-      CancelTransfer();  // cancel any ongoing transfer on step-down
-      if (!election_started_) {
-        election_started_ = true;
-        election_timer_.Start([this] { StartElection(); });
+      CancelTransferLocked();  // cancel any ongoing transfer on step-down
+      if (!shutdown) {
+        if (!election_started_) {
+          election_started_ = true;
+          election_timer_.Start([this] { StartElection(); });
+        }
+        election_timer_.Reset();
+      } else {
+        election_timer_.Stop();
       }
-      election_timer_.Reset();
       StopHeartbeat();
       break;
     case RaftRole::Candidate:
-      storage_.set_current_term(storage_.current_term() + 1);
-      storage_.set_voted_for(node_id_);
+      // NOTE: term increment + self-vote are persisted as ONE atomic write by
+      // BecomeCandidateLocked, not here.
       vote_count_ = 1;
-      CancelTransfer();
+      CancelTransferLocked();
       election_timer_.Deactivate();
       StopHeartbeat();
       break;
     case RaftRole::Leader:
       leader_term_ = storage_.current_term();
       election_timer_.Deactivate();
-      CancelTransfer();  // clear any stale transfer context
+      CancelTransferLocked();  // clear any stale transfer context
       StopHeartbeat();
-      StartHeartbeat(heartbeat_interval_ms_);
+      if (!shutdown)
+        StartHeartbeat(heartbeat_interval_ms_);
       break;
   }
 }
 
 void RaftNode::BecomeFollower(Term term) {
+  std::lock_guard guard(mutex_);
+  BecomeFollowerLocked(term);
+}
+
+void RaftNode::BecomeFollowerLocked(Term term) {
   DCHECK_GE(term, storage_.current_term());
-  storage_.set_current_term(term);
-  SetRole(RaftRole::Follower);
+  if (term > storage_.current_term()) {
+    // New term: persist (term, voted_for="") in a SINGLE atomic fsync so a
+    // crash can never observe a new term with a stale vote (Election Safety).
+    storage_.SetState(term, "");
+  }
+  // Same-term step-down keeps voted_for intact: clearing it could let this
+  // node grant a second vote within the same term.
+  SetRoleLocked(RaftRole::Follower);
 }
 
 void RaftNode::BecomeCandidate() {
-  SetRole(RaftRole::Candidate);
+  std::lock_guard guard(mutex_);
+  BecomeCandidateLocked();
+}
+
+void RaftNode::BecomeCandidateLocked() {
+  if (role_ == RaftRole::Candidate)
+    return;  // already campaigning in the current term
+  // Atomic (term+1, vote=self) persistence — one fsync, no crash window
+  // between "term durable" and "vote durable".
+  storage_.SetState(storage_.current_term() + 1, node_id_);
+  SetRoleLocked(RaftRole::Candidate);
 }
 
 void RaftNode::BecomeLeader() {
+  std::lock_guard guard(mutex_);
+  BecomeLeaderLocked();
+}
+
+void RaftNode::BecomeLeaderInitPeersLocked() {
+  auto peers = GetPeerIdsLocked();
+  last_peer_ids_ = peers;
+  peer_next_index_.assign(peers.size(), 0);
+  peer_last_log_index_.assign(peers.size(), 0);
+  if (log_storage_) {
+    LogIndex init_next = log_storage_->LastIndex() + 1;
+    std::fill(peer_next_index_.begin(), peer_next_index_.end(), init_next);
+  }
+}
+
+void RaftNode::BecomeLeaderLocked() {
   DCHECK_EQ(role_, RaftRole::Candidate);
-  SetRole(RaftRole::Leader);
+  SetRoleLocked(RaftRole::Leader);
+  BecomeLeaderInitPeersLocked();
+  // A fresh leader has no confirmed majority contact yet.
+  last_majority_ack_ms_ = NowMs();
+  // Replicate immediately so the leader's entries reach followers fast.
 }
 
 bool RaftNode::BootstrapSingleNode() {
+  std::lock_guard guard(mutex_);
   if (role_ == RaftRole::Leader)
     return true;
 
   // Only valid when there are no other voters — otherwise this would bypass
   // the normal election and could create a split brain.
-  if (!GetPeerIds().empty()) {
+  if (!GetPeerIdsLocked().empty()) {
     LOG(WARNING) << node_id_ << " BootstrapSingleNode refused: cluster has peers";
     return false;
   }
 
-  BecomeCandidate();  // term += 1, vote for self
-  BecomeLeader();     // majority(1/1) is trivially satisfied
+  BecomeCandidateLocked();  // term += 1, vote for self
+  BecomeLeaderLocked();     // majority(1/1) is trivially satisfied
   VLOG(1) << node_id_ << " bootstrapped as single-node Leader, term="
           << storage_.current_term();
   return true;
 }
 
 void RaftNode::OnElectionTimeout() {
+  std::lock_guard guard(mutex_);
   if (role_ != RaftRole::Follower)
     return;
-  BecomeCandidate();
+  BecomeCandidateLocked();
 }
 
 VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
+  std::lock_guard guard(mutex_);
   Term cur_term = storage_.current_term();
   if (request.term < cur_term) {
     VLOG(1) << node_id_ << " rejects VoteRequest from " << request.candidate_id
@@ -214,7 +364,7 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
   }
 
   if (request.term > cur_term) {
-    BecomeFollower(request.term);
+    BecomeFollowerLocked(request.term);
     cur_term = storage_.current_term();
   }
 
@@ -239,6 +389,8 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
     return {group_id_, storage_.current_term(), false};
   }
 
+  // The vote decision is fsynced (single field; the term is already durable)
+  // BEFORE the caller sees our grant.
   storage_.set_voted_for(request.candidate_id);
   VLOG(1) << node_id_ << " grants VoteRequest to " << request.candidate_id
           << " term=" << storage_.current_term();
@@ -246,53 +398,83 @@ VoteResponse RaftNode::OnRequestVote(const VoteRequest& request) {
 }
 
 ElectionResult RaftNode::StartElection() {
-  BecomeCandidate();
+  // Phase 1 (locked): transition to candidate and capture the request.
+  std::vector<NodeId> peers;
+  VoteRequest req;
+  {
+    std::lock_guard guard(mutex_);
+    if (role_ == RaftRole::Follower)
+      BecomeCandidateLocked();
+    if (role_ != RaftRole::Candidate) {
+      return {};  // we are a leader already or have been deposed
+    }
 
-  VoteRequest request;
-  request.group_id = group_id_;
-  request.term = storage_.current_term();
-  request.candidate_id = node_id_;
-  request.last_log_index = log_storage_ ? log_storage_->LastIndex() : 0;
-  request.last_log_term = log_storage_ ? log_storage_->LastTerm() : 0;
+    req.group_id = group_id_;
+    req.term = storage_.current_term();
+    req.candidate_id = node_id_;
+    req.last_log_index = log_storage_ ? log_storage_->LastIndex() : 0;
+    req.last_log_term = log_storage_ ? log_storage_->LastTerm() : 0;
+    peers = GetPeerIdsLocked();
 
-  VLOG(1) << node_id_ << " starts election term=" << storage_.current_term()
-          << " last_log=" << request.last_log_index << "/" << request.last_log_term;
-
-  ElectionResult result;
-  result.votes_received = vote_count_;
-
-  if (config_state_ == ConfigState::kJoint) {
-    old_config_votes_ = (joint_config_.old_config.voters.empty() ||
-                         joint_config_.old_config.voters.count(node_id_) > 0) ? 1 : 0;
-    new_config_votes_ = (joint_config_.new_config.voters.empty() ||
-                         joint_config_.new_config.voters.count(node_id_) > 0) ? 1 : 0;
+    VLOG(1) << node_id_ << " starts election term=" << storage_.current_term()
+            << " last_log=" << req.last_log_index << "/" << req.last_log_term;
   }
 
-  for (const auto& peer_id : GetPeerIds()) {
-    DCHECK(transport_) << "Transport not set for multi-node operation";
-    VoteResponse rsp = transport_->SendVoteRequest(peer_id, request);
+  // Phase 2: vote RPCs WITHOUT holding the consensus lock.
+  ElectionResult result;
+  result.votes_received = 1;
+  std::vector<NodeId> granters;
+  Term max_peer_term = req.term;
+  for (const auto& peer_id : peers) {
+    if (!transport_) {
+      LOG(DFATAL) << "Transport not set for multi-node operation";
+      break;
+    }
+    VoteResponse rsp = transport_->SendVoteRequest(peer_id, req);
     if (rsp.vote_granted) {
       result.votes_received++;
-      if (config_state_ == ConfigState::kJoint) {
-        if (joint_config_.old_config.voters.count(peer_id) > 0)
-          old_config_votes_++;
-        if (joint_config_.new_config.voters.count(peer_id) > 0)
-          new_config_votes_++;
-      }
+      granters.push_back(peer_id);
       VLOG(1) << node_id_ << " received VoteGranted from " << peer_id;
     } else {
       result.votes_rejected++;
       VLOG(1) << node_id_ << " received VoteRejected from " << peer_id
               << " (peer term=" << rsp.term << ")";
     }
+    if (rsp.term > max_peer_term)
+      max_peer_term = rsp.term;
   }
 
-  vote_count_ = result.votes_received;
-  TryBecomeLeader(result);
+  // Phase 3 (locked): process the tally.
+  {
+    std::lock_guard guard(mutex_);
+    if (max_peer_term > storage_.current_term()) {
+      BecomeFollowerLocked(max_peer_term);
+      return result;
+    }
+    // Only count the votes if we are still campaigning in the same term.
+    if (role_ != RaftRole::Candidate || storage_.current_term() != req.term)
+      return result;
+
+    vote_count_ = result.votes_received;
+
+    if (config_state_ == ConfigState::kJoint) {
+      old_config_votes_ = (joint_config_.old_config.voters.empty() ||
+                           joint_config_.old_config.voters.count(node_id_) > 0) ? 1 : 0;
+      new_config_votes_ = (joint_config_.new_config.voters.empty() ||
+                           joint_config_.new_config.voters.count(node_id_) > 0) ? 1 : 0;
+      for (const auto& g : granters) {
+        if (joint_config_.old_config.voters.count(g) > 0)
+          old_config_votes_++;
+        if (joint_config_.new_config.voters.count(g) > 0)
+          new_config_votes_++;
+      }
+    }
+    TryBecomeLeaderLocked();
+  }
   return result;
 }
 
-bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
+void RaftNode::TryBecomeLeaderLocked() {
   if (config_state_ == ConfigState::kJoint) {
     size_t old_total = joint_config_.old_config.voters.size() + 1;
     size_t new_total = joint_config_.new_config.voters.size() + 1;
@@ -305,29 +487,36 @@ bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
 
     if (old_config_votes_ >= old_majority && new_config_votes_ >= new_majority) {
       VLOG(1) << node_id_ << " election won (joint) term=" << storage_.current_term();
-      BecomeLeader();
-      return true;
+      BecomeLeaderLocked();
+      return;
     }
-    VLOG(1) << node_id_ << " election not won (joint): " << result.votes_received;
-    return false;
+    VLOG(1) << node_id_ << " election not won (joint): " << vote_count_;
+    return;
   }
 
   size_t total_nodes = cluster_config_.voters.size() + 1;
   size_t majority = total_nodes / 2 + 1;
 
-  VLOG(1) << node_id_ << " TryBecomeLeader: votes=" << result.votes_received
+  VLOG(1) << node_id_ << " TryBecomeLeader: votes=" << vote_count_
           << " majority=" << majority << " total=" << total_nodes;
 
-  if (result.votes_received >= majority) {
+  if (vote_count_ >= majority) {
     VLOG(1) << node_id_ << " election won term=" << storage_.current_term();
-    BecomeLeader();
-    return true;
+    BecomeLeaderLocked();
+    return;
   }
-  VLOG(1) << node_id_ << " election not won: " << result.votes_received << "/" << majority;
-  return false;
+  VLOG(1) << node_id_ << " election not won: " << vote_count_ << "/" << majority;
+}
+
+bool RaftNode::TryBecomeLeader(const ElectionResult& result) {
+  std::lock_guard guard(mutex_);
+  vote_count_ = result.votes_received;
+  TryBecomeLeaderLocked();
+  return role_ == RaftRole::Leader;
 }
 
 HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
+  std::lock_guard guard(mutex_);
   Term cur_term = storage_.current_term();
   if (request.term < cur_term) {
     VLOG(2) << node_id_ << " rejects Heartbeat from " << request.leader_id
@@ -335,10 +524,14 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
     return {group_id_, cur_term, false};
   }
 
-  if (request.term >= cur_term) {
+  if (request.term > cur_term || role_ != RaftRole::Leader) {
     VLOG(1) << node_id_ << " accepts Heartbeat from leader " << request.leader_id
             << " term=" << request.term;
-    BecomeFollower(request.term);
+    BecomeFollowerLocked(request.term);
+  } else {
+    // Same term and we are the leader (split-brain recovery): stay.
+    election_timer_.Reset();
+    return {group_id_, storage_.current_term(), true};
   }
 
   election_timer_.Reset();
@@ -347,6 +540,7 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
 }
 
 ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
+  std::lock_guard guard(mutex_);
   ReadIndexResponse resp;
   resp.term = storage_.current_term();
   resp.success = (request.term >= storage_.current_term() &&
@@ -358,253 +552,398 @@ ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
 }
 
 TimeoutNowResponse RaftNode::OnTimeoutNow(const TimeoutNowRequest& request) {
-  TimeoutNowResponse resp;
-  resp.term = storage_.current_term();
+  bool start_election = false;
+  {
+    std::lock_guard guard(mutex_);
+    if (request.term < storage_.current_term()) {
+      VLOG(1) << node_id_ << " rejects TimeoutNow from " << request.leader_id
+              << ": stale term " << request.term;
+      return {group_id_, storage_.current_term(), false};
+    }
+    if (request.term > storage_.current_term())
+      BecomeFollowerLocked(request.term);
 
-  if (request.term < storage_.current_term()) {
-    VLOG(1) << node_id_ << " rejects TimeoutNow from " << request.leader_id
-            << ": stale term " << request.term << " < " << resp.term;
-    resp.accepted = false;
-    return resp;
+    VLOG(1) << node_id_ << " TimeoutNow from leader " << request.leader_id
+            << " term=" << request.term << " — immediate election";
+    if (role_ != RaftRole::Leader)
+      start_election = true;
   }
 
-  VLOG(1) << node_id_ << " TimeoutNow from leader " << request.leader_id
-          << " term=" << request.term << " — immediate election";
-  resp.accepted = true;
+  // Kick off an immediate election OUTSIDE the lock.
+  if (start_election)
+    StartElection();
+  return {group_id_, request.term, true};
+}
 
-  // Become a candidate immediately (no election timeout delay).
-  StartElection();
-  return resp;
+// Returns true if the tick must stop the heartbeat loop (role change or
+// epoch change).
+bool RaftNode::HeartbeatTickImpl(bool is_loop, uint64_t epoch) {
+  // --- Phase 1 (locked): capture peers and current term. ---
+  std::vector<NodeId> peers;
+  HeartbeatRequest req;
+  {
+    std::lock_guard guard(mutex_);
+    if (is_loop && heartbeat_epoch_.load(std::memory_order_acquire) != epoch)
+      return true;
+    if (role_ != RaftRole::Leader)
+      return true;
+    req.group_id = group_id_;
+    req.term = storage_.current_term();
+    req.leader_id = node_id_;
+    peers = GetPeerIdsLocked();
+  }
+
+  // --- Phase 2: RPCs WITHOUT the lock. ---
+  size_t ack_count = 1;  // self
+  Term max_peer_term = req.term;
+  for (const auto& peer_id : peers) {
+    if (!transport_)
+      break;
+    HeartbeatResponse rsp = transport_->SendHeartbeat(peer_id, req);
+    if (rsp.success && rsp.term == req.term)
+      ack_count++;
+    if (rsp.term > max_peer_term)
+      max_peer_term = rsp.term;
+  }
+
+  // --- Phase 3 (locked): process ACKs, lease, quorum and transfer. ---
+  bool send_timeout_now = false;
+  bool need_replicate = false;
+  {
+    std::lock_guard guard(mutex_);
+    if (is_loop && heartbeat_epoch_.load(std::memory_order_acquire) != epoch)
+      return true;
+    if (role_ != RaftRole::Leader)
+      return true;
+
+    if (max_peer_term > storage_.current_term()) {
+      VLOG(1) << node_id_ << " heartbeat: peer has higher term " << max_peer_term
+              << ", stepping down";
+      BecomeFollowerLocked(max_peer_term);
+      return true;
+    }
+
+    size_t majority;
+    if (config_state_ == ConfigState::kJoint) {
+      size_t old_total = joint_config_.old_config.voters.size() + 1;
+      size_t new_total = joint_config_.new_config.voters.size() + 1;
+      majority = std::max(old_total / 2 + 1, new_total / 2 + 1);
+    } else {
+      majority = cluster_config_.voters.size() / 2 + 1;
+    }
+
+    uint64_t now = NowMs();
+    if (ack_count >= majority) {
+      last_majority_ack_ms_ = now;
+      // C2 fix: the lease is renewed ONLY on a real majority ACK, so a
+      // partitioned leader can never serve stale linearizable reads.
+      ExtendLeaderLeaseLocked();
+    } else if (now - last_majority_ack_ms_ > check_quorum_ms_) {
+      LOG(WARNING) << node_id_ << " CheckQuorum: lost majority for "
+                   << (now - last_majority_ack_ms_) << "ms, stepping down";
+      StepDownLocked();
+      return true;
+    }
+
+    // Leader transfer lifecycle.
+    if (transfer_ctx_.IsActive()) {
+      CheckTransferTimeoutLocked();
+      if (transfer_ctx_.state == TransferState::kWaitingCatchUp &&
+          role_ == RaftRole::Leader) {
+        if (IsTransferReadyLocked(transfer_ctx_.target)) {
+          VLOG(1) << node_id_ << " " << transfer_ctx_.target
+                  << " is now caught up, sending TimeoutNow";
+          transfer_ctx_.state = TransferState::kWaitingElection;
+          send_timeout_now = true;
+        } else {
+          need_replicate = true;  // push entries to the target
+        }
+      }
+    }
+  }
+
+  if (send_timeout_now)
+    SendTimeoutNowToTarget();
+  if (need_replicate)
+    ReplicateLog();
+  return false;
+}
+
+void RaftNode::HeartbeatLoop() {
+  uint64_t epoch = heartbeat_epoch_.load(std::memory_order_acquire);
+  while (!shutdown_.load(std::memory_order_acquire)) {
+    bool stop = HeartbeatTickImpl(true, epoch);
+    if (stop)
+      break;
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
+  }
+  VLOG(2) << node_id_ << " heartbeat fiber exiting";
 }
 
 void RaftNode::SendHeartbeatToPeers() {
-  HeartbeatRequest req;
-  req.group_id = group_id_;
-  req.term = storage_.current_term();
-  req.leader_id = node_id_;
-  for (const auto& peer_id : GetPeerIds()) {
-    DCHECK(transport_) << "Transport not set for multi-node operation";
-    transport_->SendHeartbeat(peer_id, req);
-  }
+  HeartbeatTickImpl(false, 0);
 }
 
 void RaftNode::StartHeartbeat(uint32_t interval_ms) {
   heartbeat_interval_ms_ = interval_ms;
-  if (heartbeat_fiber_.IsJoinable())
-    return;
   shutdown_.store(false, std::memory_order_release);
+  heartbeat_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  if (heartbeat_fiber_.IsJoinable()) {
+    // A previous leader's fiber may still be winding down. Detach it — it
+    // self-terminates on the next epoch/shutdown check. (Join would deadlock
+    // here: this is called with mutex_ held.)
+    heartbeat_fiber_.Detach();
+  }
   heartbeat_fiber_ = util::fb2::Fiber("heartbeat", [this] { HeartbeatLoop(); });
 }
 
 void RaftNode::StopHeartbeat() {
   shutdown_.store(true, std::memory_order_release);
+}
+
+void RaftNode::JoinHeartbeat() {
   if (heartbeat_fiber_.IsJoinable())
     heartbeat_fiber_.Join();
 }
 
-void RaftNode::HeartbeatLoop() {
-  while (!shutdown_.load(std::memory_order_acquire) && role_ == RaftRole::Leader) {
-    SendHeartbeatToPeers();
-    ExtendLeaderLease();
-
-    // Check leader transfer lifecycle.
-    if (transfer_ctx_.IsActive()) {
-      CheckTransferTimeout();
-
-      if (transfer_ctx_.state == TransferState::kWaitingCatchUp && role_ == RaftRole::Leader) {
-        // Replicate again to push entries to the target.
-        ReplicateLog();
-        if (IsTransferReady(transfer_ctx_.target)) {
-          VLOG(1) << node_id_ << " " << transfer_ctx_.target
-                  << " is now caught up, sending TimeoutNow";
-          SendTimeoutNowToTarget();
-        }
-      }
-    }
-
-    util::ThisFiber::SleepFor(std::chrono::milliseconds(heartbeat_interval_ms_));
-  }
-}
-
 LogIndex RaftNode::ReadIndex() {
-  if (role_ != RaftRole::Leader) {
-    LOG(WARNING) << node_id_ << " ReadIndex: not leader, role=" << role_;
-    return 0;
-  }
+  LogIndex read_index = 0;
+  uint64_t current_term = 0;
+  uint64_t request_id = 0;
+  bool slow_path = false;
+  std::vector<NodeId> peers;
 
-  // Fast path: leader lease is still valid.
-  if (NowMs() < leader_lease_expire_) {
-    LogIndex read_index = commit_index_;
-    VLOG(2) << node_id_ << " ReadIndex fast path: lease valid, read_index=" << read_index;
-    WaitForApplied(read_index);
-    return read_index;
-  }
-
-  // Slow path: send ReadIndex RPC to all peers to confirm quorum.
-  LogIndex read_index = commit_index_;
-  Term current_term = storage_.current_term();
-
-  ReadIndexRequest req;
-  req.group_id = group_id_;
-  req.term = current_term;
-  req.leader_id = node_id_;
-  req.request_id = ++next_read_index_request_id_;
-
-  size_t success_count = 1;  // Self counts as success
-  size_t total = cluster_config_.voters.size() + 1;
-  size_t majority = total / 2 + 1;
-
-  for (const auto& peer_id : GetPeerIds()) {
-    if (!transport_)
-      break;
-    ReadIndexResponse resp = transport_->SendReadIndex(peer_id, req);
-    if (resp.success && resp.term == current_term) {
-      success_count++;
-    } else if (resp.term > current_term) {
-      // A peer has a higher term -- we are no longer leader.
-      VLOG(1) << node_id_ << " ReadIndex: peer " << peer_id
-              << " has higher term " << resp.term;
-      BecomeFollower(resp.term);
+  // --- Phase 1 (locked): fast path via the leader lease. ---
+  {
+    std::lock_guard guard(mutex_);
+    if (role_ != RaftRole::Leader) {
+      LOG(WARNING) << node_id_ << " ReadIndex: not leader, role=" << role_;
       return 0;
     }
+    if (NowMs() < leader_lease_expire_) {
+      // Fast path: lease valid → no quorum RPCs, zero RTT overhead.
+      read_index = commit_index_;
+      VLOG(2) << node_id_ << " ReadIndex fast path: lease valid, read_index=" << read_index;
+    } else {
+      slow_path = true;
+      current_term = storage_.current_term();
+      request_id = ++next_read_index_request_id_;
+      peers = GetPeerIdsLocked();
+    }
   }
 
-  if (success_count < majority) {
-    VLOG(1) << node_id_ << " ReadIndex: only " << success_count
-            << "/" << majority << " acks, cannot confirm leadership";
-    return 0;
+  if (slow_path) {
+    // --- Phase 2: ReadIndex RPCs WITHOUT the lock. ---
+    size_t success_count = 1;  // Self counts as success
+    Term max_peer_term = current_term;
+    ReadIndexRequest req;
+    req.group_id = group_id_;
+    req.term = current_term;
+    req.leader_id = node_id_;
+    req.request_id = request_id;
+    for (const auto& peer_id : peers) {
+      if (!transport_)
+        break;
+      ReadIndexResponse resp = transport_->SendReadIndex(peer_id, req);
+      if (resp.success && resp.term == current_term) {
+        success_count++;
+      }
+      if (resp.term > max_peer_term)
+        max_peer_term = resp.term;
+    }
+
+    // --- Phase 3 (locked): confirm quorum. ---
+    std::lock_guard guard(mutex_);
+    if (max_peer_term > storage_.current_term()) {
+      VLOG(1) << node_id_ << " ReadIndex: peer has higher term " << max_peer_term;
+      BecomeFollowerLocked(max_peer_term);
+      return 0;
+    }
+    if (role_ != RaftRole::Leader || storage_.current_term() != current_term)
+      return 0;
+
+    size_t total = cluster_config_.voters.size() + 1;
+    size_t majority = total / 2 + 1;
+    if (success_count < majority) {
+      VLOG(1) << node_id_ << " ReadIndex: only " << success_count
+              << "/" << majority << " acks, cannot confirm leadership";
+      return 0;
+    }
+    read_index = commit_index_;
+    VLOG(2) << node_id_ << " ReadIndex: quorum confirmed (" << success_count
+            << "/" << majority << "), read_index=" << read_index;
+
+    // Lease is renewed ONLY on a confirmed quorum (fast-path lease is
+    // therefore always backed by a real majority contact).
+    last_majority_ack_ms_ = NowMs();
+    ExtendLeaderLeaseLocked();
   }
 
-  VLOG(2) << node_id_ << " ReadIndex: quorum confirmed (" << success_count
-          << "/" << majority << "), read_index=" << read_index;
-
-  // Extend leader lease on successful quorum.
-  ExtendLeaderLease();
-
-  WaitForApplied(read_index);
+  if (read_index > 0)
+    WaitForApplied(read_index);
   return read_index;
 }
 
 void RaftNode::WaitForApplied(LogIndex target) {
-  while (last_applied_ < target) {
-    ApplyCommittedLogs();
-    if (last_applied_ >= target)
-      break;
-    // Yield to allow log replication / commit advancement to make progress.
-    util::ThisFiber::Yield();
+  uint64_t deadline_ms = NowMs() + kWaitForAppliedTimeoutMs;
+  while (true) {
+    {
+      std::lock_guard guard(mutex_);
+      ApplyCommittedLogsLocked();
+      if (last_applied_ >= target)
+        return;
+    }
+    // Yield WITHOUT the lock so the heartbeat fiber can replicate and advance
+    // commit_index_ (or a new leader can push us entries via AppendEntries).
+    if (NowMs() > deadline_ms) {
+      LOG(WARNING) << node_id_ << " WaitForApplied: timed out waiting for index "
+                   << target << " (last_applied=" << last_applied_ << ")";
+      return;
+    }
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(1));
   }
 }
 
-void RaftNode::ExtendLeaderLease() {
+void RaftNode::ExtendLeaderLeaseLocked() {
   leader_lease_expire_ = NowMs() + lease_ms_;
 }
 
+void RaftNode::StepDownLocked() {
+  if (role_ != RaftRole::Leader)
+    return;
+  LOG(WARNING) << node_id_ << " stepping down: leader lease/quorum lost";
+  BecomeFollowerLocked(storage_.current_term());  // same term → vote preserved
+}
+
 uint64_t RaftNode::NowMs() const {
+  // Monotonic clock: immune to wall-clock jumps (NTP) which could otherwise
+  // extend or shorten the leader lease arbitrarily.
   return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
+             std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
 bool RaftNode::StartTransfer(const NodeId& target) {
-  if (role_ != RaftRole::Leader) {
-    LOG(WARNING) << node_id_ << " StartTransfer: not leader";
-    return false;
-  }
-
-  if (transfer_ctx_.IsActive()) {
-    LOG(WARNING) << node_id_ << " StartTransfer: transfer already in progress to "
-                 << transfer_ctx_.target;
-    return false;
-  }
-
-  // Verify target is a peer.
-  auto peers = GetPeerIds();
-  bool found = false;
-  for (const auto& p : peers) {
-    if (p == target) {
-      found = true;
-      break;
+  bool initiated = false;
+  {
+    std::lock_guard guard(mutex_);
+    if (role_ != RaftRole::Leader) {
+      LOG(WARNING) << node_id_ << " StartTransfer: not leader";
+      return false;
     }
-  }
-  if (!found) {
-    LOG(WARNING) << node_id_ << " StartTransfer: " << target << " is not a peer";
-    return false;
+    if (transfer_ctx_.IsActive()) {
+      LOG(WARNING) << node_id_ << " StartTransfer: transfer already in progress to "
+                   << transfer_ctx_.target;
+      return false;
+    }
+
+    auto peers = GetPeerIdsLocked();
+    bool found = false;
+    for (const auto& p : peers) {
+      if (p == target) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      LOG(WARNING) << node_id_ << " StartTransfer: " << target << " is not a peer";
+      return false;
+    }
+
+    VLOG(1) << node_id_ << " StartTransfer: initiating transfer to " << target;
+    transfer_ctx_.target = target;
+    transfer_ctx_.state = TransferState::kRequested;
+    transfer_ctx_.start_ms = NowMs();
+    initiated = true;
   }
 
-  VLOG(1) << node_id_ << " StartTransfer: initiating transfer to " << target;
-  transfer_ctx_.target = target;
-  transfer_ctx_.state = TransferState::kRequested;
-  transfer_ctx_.start_ms = NowMs();
-
-  // Force replication to catch up the target.
+  // Push entries to the target (RPCs happen outside the lock).
   ReplicateLog();
 
-  // Check if target is already caught up.
-  if (IsTransferReady(target)) {
-    VLOG(1) << node_id_ << " StartTransfer: " << target << " is ready, sending TimeoutNow";
-    transfer_ctx_.state = TransferState::kWaitingElection;
-    SendTimeoutNowToTarget();
-  } else {
-    VLOG(1) << node_id_ << " StartTransfer: waiting for " << target << " to catch up";
-    transfer_ctx_.state = TransferState::kWaitingCatchUp;
+  bool send_now = false;
+  {
+    std::lock_guard guard(mutex_);
+    if (role_ != RaftRole::Leader || !transfer_ctx_.IsActive())
+      return false;
+    if (IsTransferReadyLocked(target)) {
+      VLOG(1) << node_id_ << " StartTransfer: " << target << " is ready, sending TimeoutNow";
+      transfer_ctx_.state = TransferState::kWaitingElection;
+      send_now = true;
+    } else {
+      VLOG(1) << node_id_ << " StartTransfer: waiting for " << target << " to catch up";
+      transfer_ctx_.state = TransferState::kWaitingCatchUp;
+    }
   }
-
+  if (send_now)
+    SendTimeoutNowToTarget();
   return true;
 }
 
 bool RaftNode::IsTransferReady(const NodeId& target) const {
+  std::lock_guard guard(mutex_);
+  return IsTransferReadyLocked(target);
+}
+
+bool RaftNode::IsTransferReadyLocked(const NodeId& target) const {
   if (!log_storage_)
     return false;
 
   LogIndex last_index = log_storage_->LastIndex();
-
-  // Find the target's match index in last_peer_ids_.
   for (size_t i = 0; i < last_peer_ids_.size() && i < peer_last_log_index_.size(); i++) {
     if (last_peer_ids_[i] == target) {
-      // The spec says match_index >= last_index (threshold=0 for strict).
       return peer_last_log_index_[i] >= last_index;
     }
   }
-
   return false;
 }
 
 void RaftNode::CancelTransfer() {
+  std::lock_guard guard(mutex_);
+  CancelTransferLocked();
+}
+
+void RaftNode::CancelTransferLocked() {
   if (!transfer_ctx_.IsActive())
     return;
   VLOG(1) << node_id_ << " CancelTransfer: cancelling transfer to " << transfer_ctx_.target;
   transfer_ctx_.Reset();
 }
 
-void RaftNode::CheckTransferTimeout() {
+void RaftNode::CheckTransferTimeoutLocked() {
   if (!transfer_ctx_.IsActive())
     return;
   if (NowMs() - transfer_ctx_.start_ms >= transfer_timeout_ms_) {
     VLOG(1) << node_id_ << " Transfer timeout to " << transfer_ctx_.target
             << " after " << transfer_timeout_ms_ << "ms — cancelling";
-    CancelTransfer();
+    CancelTransferLocked();
   }
 }
 
 void RaftNode::SendTimeoutNowToTarget() {
-  if (!transport_ || transfer_ctx_.target.empty())
-    return;
-
   TimeoutNowRequest req;
-  req.group_id = group_id_;
-  req.term = storage_.current_term();
-  req.leader_id = node_id_;
+  {
+    std::lock_guard guard(mutex_);
+    if (!transport_ || transfer_ctx_.target.empty() || role_ != RaftRole::Leader)
+      return;
+    req.group_id = group_id_;
+    req.term = storage_.current_term();
+    req.leader_id = node_id_;
+  }
 
-  VLOG(1) << node_id_ << " Sending TimeoutNow to " << transfer_ctx_.target;
-  transfer_ctx_.state = TransferState::kWaitingElection;
+  VLOG(1) << node_id_ << " Sending TimeoutNow to " << req.leader_id;
   TimeoutNowResponse resp = transport_->SendTimeoutNow(transfer_ctx_.target, req);
+
+  std::lock_guard guard(mutex_);
+  if (role_ != RaftRole::Leader)
+    return;
   if (!resp.accepted) {
     VLOG(1) << node_id_ << " TimeoutNow rejected by " << transfer_ctx_.target;
-    CancelTransfer();
+    CancelTransferLocked();
   }
 }
 
 AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req) {
+  std::lock_guard guard(mutex_);
   Term cur_term = storage_.current_term();
   if (req.term < cur_term) {
     VLOG(2) << node_id_ << " rejects AppendEntries from " << req.leader_id
@@ -613,52 +952,77 @@ AppendEntriesResponse RaftNode::OnAppendEntries(const AppendEntriesRequest& req)
     return {group_id_, cur_term, false, my_last};
   }
 
-  if (req.term >= cur_term) {
+  if (req.term > cur_term) {
     VLOG(1) << node_id_ << " accepts AppendEntries from leader " << req.leader_id
             << " term=" << req.term << " entries=" << req.entries.size();
-    BecomeFollower(req.term);
+    BecomeFollowerLocked(req.term);
+  } else if (role_ != RaftRole::Leader) {
+    // Same-term message from the legitimate leader.
+    election_timer_.Reset();
   }
 
-  if (log_storage_) {
-    if (req.prev_log_index > log_storage_->LastIndex()) {
-      VLOG(2) << node_id_ << " rejects AppendEntries: gap at prev_log=" << req.prev_log_index;
+  if (!log_storage_)
+    return {group_id_, storage_.current_term(), true, 0};
+
+  LogIndex my_last = log_storage_->LastIndex();
+
+  // Log consistency check against prev_log_index/term. GetTerm() covers both
+  // live entries and the snapshot anchor (compacted prefix).
+  if (req.prev_log_index > my_last) {
+    VLOG(2) << node_id_ << " rejects AppendEntries: gap at prev_log=" << req.prev_log_index;
+    return {group_id_, storage_.current_term(), false, my_last};
+  }
+  if (req.prev_log_index > 0 &&
+      log_storage_->GetTerm(req.prev_log_index) != req.prev_log_term) {
+    VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
+    return {group_id_, storage_.current_term(), false, req.prev_log_index - 1};
+  }
+
+  // Conflict resolution: truncate at the FIRST conflicting entry and delete
+  // everything after it, then append. (Fixes the bug where the un-sent tail
+  // survived truncation.)
+  size_t max_entries = std::min(req.entries.size(), kMaxAppendBatch);
+  for (size_t i = 0; i < max_entries; i++) {
+    const LogEntry& entry = req.entries[i];
+    if (entry.index <= log_storage_->LastIndex()) {
+      const LogEntry* existing = log_storage_->Get(entry.index);
+      if (existing && existing->term == entry.term)
+        continue;  // identical entry — keep going
+      VLOG(1) << node_id_ << " truncate from " << (entry.index - 1);
+      log_storage_->TruncateFrom(entry.index - 1);
+      log_storage_->Append(entry);
+    } else if (entry.index == log_storage_->LastIndex() + 1) {
+      log_storage_->Append(entry);
+    } else {
+      // Gap — cannot happen after the prev_log consistency check.
       return {group_id_, storage_.current_term(), false, log_storage_->LastIndex()};
     }
-    if (req.prev_log_index > 0) {
-      const LogEntry* prev = log_storage_->Get(req.prev_log_index);
-      if (!prev || prev->term != req.prev_log_term) {
-        VLOG(2) << node_id_ << " rejects AppendEntries: conflict at " << req.prev_log_index;
-        return {group_id_, storage_.current_term(), false, req.prev_log_index - 1};
-      }
-    }
-
-    for (const auto& entry : req.entries) {
-      if (entry.index <= log_storage_->LastIndex()) {
-        const LogEntry* existing = log_storage_->Get(entry.index);
-        if (!existing || existing->term != entry.term) {
-          VLOG(1) << node_id_ << " truncate from " << (entry.index - 1);
-          log_storage_->TruncateFrom(entry.index - 1);
-          log_storage_->Append(entry);
-        }
-      } else if (entry.index == log_storage_->LastIndex() + 1) {
-        log_storage_->Append(entry);
-      }
-    }
   }
 
-  LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
+  // Truncate any local tail the leader did not send: those entries are
+  // uncommitted junk from a previous leadership and must not survive.
+  // Only applies when the request CARRIES entries — an empty AppendEntries is
+  // a progress/heartbeat message and must never truncate the follower's log.
+  if (!req.entries.empty()) {
+    LogIndex leader_tail = req.entries.back().index;
+    if (log_storage_->LastIndex() > leader_tail)
+      log_storage_->TruncateFrom(leader_tail);
+  }
+
+  my_last = log_storage_->LastIndex();
 
   if (req.leader_commit > commit_index_) {
     VLOG(1) << node_id_ << " commit_index " << commit_index_
             << " -> " << std::min(req.leader_commit, my_last) << " (from leader)";
     commit_index_ = std::min(req.leader_commit, my_last);
-    ApplyCommittedLogs();
+    ApplyCommittedLogsLocked();
   }
 
   return {group_id_, storage_.current_term(), true, my_last};
 }
 
 InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest& req) {
+  std::lock_guard guard(mutex_);
   Term cur_term = storage_.current_term();
   if (req.term < cur_term) {
     VLOG(2) << node_id_ << " rejects InstallSnapshot from " << req.leader_id
@@ -666,10 +1030,10 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
     return {group_id_, cur_term, false};
   }
 
-  if (req.term >= cur_term) {
+  if (req.term > cur_term) {
     VLOG(1) << node_id_ << " accepts InstallSnapshot from leader " << req.leader_id
             << " index=" << req.last_included_index;
-    BecomeFollower(req.term);
+    BecomeFollowerLocked(req.term);
   }
 
   if (!snapshot_receiver_) {
@@ -683,7 +1047,6 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
     VLOG(1) << node_id_ << " snapshot complete: index=" << req.last_included_index
             << " term=" << req.last_included_term;
 
-    // Load snapshot into state machine.
     if (state_machine_) {
       if (!state_machine_->LoadSnapshot(snapshot_receiver_->bin_path())) {
         LOG(WARNING) << node_id_ << " failed to load snapshot from "
@@ -693,17 +1056,15 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
       }
     }
 
-    // Update Raft state.
     last_applied_ = req.last_included_index;
     commit_index_ = std::max(commit_index_, req.last_included_index);
     last_snapshot_index_ = req.last_included_index;
     last_snapshot_term_ = req.last_included_term;
     apply_progress_.Update(last_applied_);
 
-    // The snapshot covers all entries up to last_included_index.
-    // Clear the log since those entries are now superseded.
     if (log_storage_) {
       log_storage_->Clear();
+      log_storage_->SetSnapshotAnchor(last_snapshot_index_, last_snapshot_term_);
     }
 
     VLOG(1) << node_id_ << " state restored: last_applied=" << last_applied_
@@ -714,81 +1075,195 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
   return rsp;
 }
 
-ApplyResult RaftNode::ReplicateLog() {
-  if (!log_storage_)
-    return {};
-
-  size_t log_size = log_storage_->LogSize();
-  auto peer_ids = GetPeerIds();
-  VLOG(1) << node_id_ << " ReplicateLog: " << log_size << " entries, "
-          << peer_ids.size() << " peers"
-          << (IsJointConsensus() ? " (joint)" : "");
-
-  if (peer_ids.empty()) {
-    if (commit_index_ < log_storage_->LastIndex()) {
-      commit_index_ = log_storage_->LastIndex();
-      VLOG(1) << node_id_ << " fast commit: commit_index=" << commit_index_;
+ApplyResult RaftNode::SubmitEntry(LogEntry entry) {
+  {
+    std::lock_guard guard(mutex_);
+    if (!log_storage_)
+      return {ApplyOp::ERROR, 0};
+    if (role_ != RaftRole::Leader) {
+      VLOG(1) << "SubmitEntry rejected: not leader (role=" << role_ << ")";
+      return {ApplyOp::ERROR, 0};
     }
-    return ApplyCommittedLogs();
+    entry.term = storage_.current_term();
+    entry.index = 0;  // the log assigns the index
+    log_storage_->Append(std::move(entry));
   }
+  return ReplicateLog();
+}
 
-  Term current_term = storage_.current_term();
+ApplyResult RaftNode::ReplicateLog() {
+  struct PeerReq {
+    NodeId id;
+    LogIndex next = 0;
+    LogEntry prev;
+    bool need_snapshot = false;
+    LogIndex snapshot_index = 0;
+    Term snapshot_term = 0;
+    std::vector<LogEntry> entries;
+  };
 
-  // Check if any peers need a snapshot before sending AppendEntries.
-  bool any_snapshot_sent = false;
-  if (last_snapshot_index_ > 0) {
-    peer_last_log_index_.resize(peer_ids.size());
-    for (size_t i = 0; i < peer_ids.size(); i++) {
-      LogIndex next_index = peer_last_log_index_[i] + 1;
-      if (ShouldInstallSnapshot(next_index, last_snapshot_index_)) {
-        VLOG(1) << node_id_ << " sending snapshot to " << peer_ids[i]
-                << " next_index=" << next_index
-                << " snapshot_index=" << last_snapshot_index_;
-        std::string snapshot_path = snapshot_dir_ + "snapshot.bin";
-        SnapshotSender sender(snapshot_path, transport_);
-        bool ok = sender.SendSnapshot(peer_ids[i], group_id_, current_term, node_id_,
-                                       last_snapshot_index_, last_snapshot_term_);
-        if (ok) {
-          peer_last_log_index_[i] = last_snapshot_index_;
+  ApplyResult result;
+
+  // Bounded retry loop: after a rejection, nextIndex has been backed off, so
+  // retry immediately in the same call — converges followers fast instead of
+  // waiting for the next heartbeat. Cap prevents pathological spinning.
+  for (int round = 0; round < 8; round++) {
+    // --- Phase 1 (locked): capture peers + build requests. ---
+    Term current_term = 0;
+    std::vector<PeerReq> preq;
+    bool retry_needed = false;
+    {
+      std::lock_guard guard(mutex_);
+      if (!log_storage_)
+        return result;
+      if (role_ != RaftRole::Leader)
+        return result;
+      current_term = storage_.current_term();
+      auto peer_ids = GetPeerIdsLocked();
+      ResizePeerArraysLocked(peer_ids.size());
+      last_peer_ids_ = peer_ids;
+
+      for (size_t i = 0; i < peer_ids.size(); i++) {
+        PeerReq r;
+        r.id = peer_ids[i];
+        r.next = peer_next_index_[i];
+        if (r.next <= 1)
+          r.next = 1;
+
+        if (ShouldInstallSnapshot(r.next, last_snapshot_index_)) {
+          r.need_snapshot = true;
+          r.snapshot_index = last_snapshot_index_;
+          r.snapshot_term = last_snapshot_term_;
+        } else {
+          if (r.next > 1) {
+            const LogEntry* prev = log_storage_->Get(r.next - 1);
+            if (prev) {
+              r.prev = *prev;
+            } else {
+              // r.next-1 may be covered by the snapshot anchor (compacted).
+              r.prev.index = r.next - 1;
+              r.prev.term = log_storage_->GetTerm(r.next - 1);
+            }
+          }
+          // Copy the entry range under the lock: the caller reads it outside
+          // the lock, so it must not alias the mutable in-memory log.
+          r.entries = log_storage_->GetRange(r.next, kMaxAppendBatch);
         }
-        any_snapshot_sent = true;
+        preq.push_back(std::move(r));
       }
     }
-  }
 
-  // Send AppendEntries to all peers.
-  AppendEntriesRequest req;
-  req.group_id = group_id_;
-  req.term = current_term;
-  req.leader_id = node_id_;
-  req.leader_commit = commit_index_;
-
-  if (log_size > 0) {
-    LogIndex first = log_storage_->FirstIndex();
-    if (first > 0)
-      req.entries = log_storage_->GetRange(first);
-  }
-
-  last_peer_ids_ = peer_ids;
-  peer_last_log_index_.resize(peer_ids.size());
-  for (size_t i = 0; i < peer_ids.size(); i++) {
-    DCHECK(transport_) << "Transport not set for multi-node operation";
-    AppendEntriesResponse rsp = transport_->SendAppendEntries(peer_ids[i], req);
-    if (!any_snapshot_sent || rsp.last_log_index > peer_last_log_index_[i]) {
-      peer_last_log_index_[i] = rsp.last_log_index;
+    if (preq.empty()) {
+      // Single-node leader: no peers, but majority(1/1) is trivially
+      // satisfied — commit and apply immediately.
+      std::lock_guard guard(mutex_);
+      if (role_ != RaftRole::Leader)
+        return result;
+      AdvanceCommitIndexLocked();
+      MaybeAutoFinalizeJointLocked();
+      return ApplyCommittedLogsLocked();
     }
-  }
 
-  AdvanceCommitIndex();
-  return ApplyCommittedLogs();
+    // --- Phase 2: RPCs WITHOUT the lock. ---
+    std::vector<LogIndex> rsp_match(preq.size(), 0);
+    std::vector<bool> rsp_ok(preq.size(), false);
+    std::vector<Term> rsp_term(preq.size(), 0);
+    for (size_t i = 0; i < preq.size(); i++) {
+      if (!transport_)
+        break;
+      const PeerReq& r = preq[i];
+      if (r.need_snapshot) {
+        std::string snapshot_path = snapshot_dir_ + "snapshot.bin";
+        SnapshotSender sender(snapshot_path, transport_);
+        bool ok = sender.SendSnapshot(r.id, group_id_, current_term, node_id_,
+                                      r.snapshot_index, r.snapshot_term);
+        if (ok) {
+          rsp_match[i] = r.snapshot_index;
+          rsp_ok[i] = true;
+        }
+        continue;
+      }
+
+      AppendEntriesRequest req;
+      req.group_id = group_id_;
+      req.term = current_term;
+      req.leader_id = node_id_;
+      req.leader_commit = commit_index_;  // captured under the lock in phase 1
+      req.prev_log_index = r.prev.index;
+      req.prev_log_term = r.prev.term;
+      req.entries = r.entries;
+
+      AppendEntriesResponse resp = transport_->SendAppendEntries(r.id, req);
+      rsp_term[i] = resp.term;
+      if (resp.success) {
+        rsp_ok[i] = true;
+        rsp_match[i] = r.prev.index + r.entries.size();
+      } else {
+        rsp_match[i] = 0;
+      }
+      if (!resp.success && resp.last_log_index < r.next - 1)
+        rsp_match[i] = resp.last_log_index;  // backoff hint
+    }
+
+    // --- Phase 3 (locked): process responses, advance commit, apply. ---
+    {
+      std::lock_guard guard(mutex_);
+      Term cur = storage_.current_term();
+      Term max_term = current_term;
+      for (Term t : rsp_term)
+        max_term = std::max(max_term, t);
+      if (max_term > cur) {
+        VLOG(1) << node_id_ << " ReplicateLog: peer has higher term " << max_term;
+        BecomeFollowerLocked(max_term);
+        return result;
+      }
+      if (role_ != RaftRole::Leader || storage_.current_term() != current_term)
+        return result;
+
+      for (size_t i = 0; i < preq.size(); i++) {
+        if (rsp_ok[i]) {
+          peer_last_log_index_[i] = rsp_match[i];
+          peer_next_index_[i] = rsp_match[i] + 1;
+        } else {
+          // nextIndex backoff: drop to min(next-1, follower_last+1) so
+          // conflicts converge exponentially instead of resending everything.
+          LogIndex hint = rsp_match[i] + 1;
+          LogIndex backoff = std::min(peer_next_index_[i] - 1, hint);
+          if (backoff < 1)
+            backoff = 1;
+          peer_next_index_[i] = backoff;
+          retry_needed = true;
+          if (backoff <= last_snapshot_index_)
+            peer_last_log_index_[i] = last_snapshot_index_;  // force snapshot path
+        }
+      }
+
+      if (role_ == RaftRole::Leader) {
+        AdvanceCommitIndexLocked();
+        MaybeAutoFinalizeJointLocked();
+      }
+      result = ApplyCommittedLogsLocked();
+    }
+
+    if (!retry_needed)
+      break;
+  }
+  return result;
 }
 
 void RaftNode::AdvanceCommitIndex() {
+  std::lock_guard guard(mutex_);
+  if (role_ != RaftRole::Leader)
+    return;
+  AdvanceCommitIndexLocked();
+}
+
+void RaftNode::AdvanceCommitIndexLocked() {
   if (!log_storage_)
     return;
 
   if (config_state_ == ConfigState::kJoint) {
-    AdvanceCommitIndexJoint();
+    AdvanceCommitIndexJointLocked();
     return;
   }
 
@@ -815,17 +1290,7 @@ void RaftNode::AdvanceCommitIndex() {
   // committed indirectly, once a current-term entry above them is committed
   // (Log Matching Property). Committing a prior-term entry purely by replica
   // count is unsafe: it can still be overwritten by a future leader.
-  //
-  // Since a well-formed leader never holds entries from a term greater than its
-  // current term, the check reduces to GetTerm(candidate) == current_term in
-  // normal operation; using >= keeps unit tests that craft entries without
-  // advancing the node's term working, while still rejecting strictly older
-  // terms — which is exactly the Figure 8 guard.
   if (candidate > commit_index_) {
-    // candidate_term == 0 means the term could not be resolved (empty/unknown);
-    // in that case we do not apply the guard. For any concrete log storage a
-    // valid candidate index (<= LastIndex) always yields a term >= 1, so the
-    // Figure 8 protection remains fully effective in production.
     Term candidate_term = log_storage_->GetTerm(candidate);
     if (candidate_term != 0 && candidate_term < storage_.current_term()) {
       VLOG(1) << node_id_ << " commit_index NOT advanced to " << candidate
@@ -838,7 +1303,7 @@ void RaftNode::AdvanceCommitIndex() {
   }
 }
 
-void RaftNode::AdvanceCommitIndexJoint() {
+void RaftNode::AdvanceCommitIndexJointLocked() {
   auto calc_config_commit = [&](const ClusterConfig& config) -> LogIndex {
     std::vector<LogIndex> indexes;
     indexes.push_back(log_storage_->LastIndex());
@@ -867,7 +1332,6 @@ void RaftNode::AdvanceCommitIndexJoint() {
   LogIndex candidate = std::min(old_commit, new_commit);
 
   if (candidate > commit_index_) {
-    // Same Figure 8 guard as AdvanceCommitIndex; term 0 = unresolved, not blocked.
     Term candidate_term = log_storage_->GetTerm(candidate);
     if (candidate_term != 0 && candidate_term < storage_.current_term()) {
       VLOG(1) << node_id_ << " commit_index NOT advanced to " << candidate
@@ -882,6 +1346,7 @@ void RaftNode::AdvanceCommitIndexJoint() {
 }
 
 void RaftNode::ReplayUnappliedLogs() {
+  std::lock_guard guard(mutex_);
   if (!log_storage_ || !state_machine_)
     return;
   LogIndex last = log_storage_->LastIndex();
@@ -890,13 +1355,38 @@ void RaftNode::ReplayUnappliedLogs() {
             << last_applied_ << " last_index=" << last << ")";
     return;
   }
-  VLOG(1) << node_id_ << " ReplayUnappliedLogs: last_applied=" << last_applied_
-          << " last_index=" << last;
+  // H3 fix: a restarting node must NOT self-commit as a Follower in a
+  // multi-node cluster — only the elected leader may advance commit_index.
+  // A single-node cluster (no peers) is the exception: this node is the only
+  // voter, so replaying up to the last log index is the leader-equivalent
+  // recovery path (BootstrapSingleNode makes the same assumption).
+  if (role_ != RaftRole::Leader && !GetPeerIdsLocked().empty()) {
+    VLOG(1) << node_id_ << " ReplayUnappliedLogs: not leader, "
+            << (last - last_applied_)
+            << " entries pending — waiting for the leader to decide";
+    return;
+  }
   commit_index_ = last;
-  ApplyCommittedLogs();
+  ApplyCommittedLogsLocked();
+}
+
+void RaftNode::ResetApplyProgress(LogIndex to) {
+  std::lock_guard guard(mutex_);
+  last_applied_ = to;
+  apply_progress_.Reset(to);
+}
+
+void RaftNode::SetApplyMetaFlushInterval(uint32_t interval_ms) {
+  std::lock_guard guard(mutex_);
+  apply_meta_flush_interval_ms_ = interval_ms;
 }
 
 ApplyResult RaftNode::ApplyCommittedLogs() {
+  std::lock_guard guard(mutex_);
+  return ApplyCommittedLogsLocked();
+}
+
+ApplyResult RaftNode::ApplyCommittedLogsLocked() {
   ApplyResult result;
   if (!state_machine_ || !log_storage_)
     return result;
@@ -920,15 +1410,21 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
           // Step 2: finalize — transition to stable with new config
           cluster_config_ = cmd.target;
           joint_config_ = JointConfig{};
+          joint_entry_index_ = 0;
+          joint_finalize_appended_ = false;
           config_state_ = ConfigState::kStable;
           peer_manager_.SetConfig(&cluster_config_);
+          storage_.SetJointConfigState(config_state_, JointConfig{});
           VLOG(1) << node_id_ << " config change step 2: entering Stable, config version="
                   << cluster_config_.version << " voters=" << cluster_config_.voters.size();
         } else {
           // Step 1: enter joint consensus
           joint_config_.old_config = cluster_config_;
           joint_config_.new_config = cmd.target;
+          joint_entry_index_ = entry.index;
+          joint_finalize_appended_ = false;
           config_state_ = ConfigState::kJoint;
+          storage_.SetJointConfigState(config_state_, joint_config_);
           VLOG(1) << node_id_ << " config change step 1: entering Joint, old voters="
                   << joint_config_.old_config.voters.size()
                   << " new voters=" << joint_config_.new_config.voters.size();
@@ -940,10 +1436,170 @@ ApplyResult RaftNode::ApplyCommittedLogs() {
       last_applied_ = entry.index;
     }
 
-    apply_progress_.Update(last_applied_);
+    // Apply-progress durability. In-memory value always tracks last_applied_;
+    // the disk flush is either per batch (default) or batched per interval.
+    // With batching, the WAL is flushed FIRST so apply.meta can never become
+    // durable ahead of the records it references (a stale apply.meta only
+    // causes idempotent re-apply after recovery — never a skipped commit).
+    apply_progress_.UpdateMemoryOnly(last_applied_);
+    uint64_t now = NowMs();
+    if (apply_meta_flush_interval_ms_ == 0 ||
+        now - last_apply_meta_flush_ms_ >= apply_meta_flush_interval_ms_) {
+      if (apply_meta_flush_interval_ms_ > 0 && log_storage_)
+        log_storage_->Flush();
+      apply_progress_.Flush();
+      last_apply_meta_flush_ms_ = now;
+    }
   }
 
   return result;
+}
+
+void RaftNode::MaybeAutoFinalizeJointLocked() {
+  // When the joint (step 1) config entry is committed, the leader appends the
+  // step 2 (finalize) entry automatically, as etcd does.
+  if (config_state_ != ConfigState::kJoint || role_ != RaftRole::Leader ||
+      !log_storage_ || joint_finalize_appended_)
+    return;
+  if (joint_entry_index_ == 0 || joint_entry_index_ > commit_index_)
+    return;
+  if (log_storage_->GetTerm(joint_entry_index_) != storage_.current_term())
+    return;
+
+  VLOG(1) << node_id_ << " auto-finalizing joint consensus, target version="
+          << joint_config_.new_config.version;
+  ConfigChangeCommand cmd{joint_config_.new_config};
+  log_storage_->Append(LogEntry(storage_.current_term(), 0, cmd.Serialize()));
+  joint_finalize_appended_ = true;
+}
+
+bool RaftNode::CreateSnapshotIfNeeded() {
+  std::lock_guard guard(mutex_);
+  if (!snapshot_manager_)
+    return false;
+  // Pass last_applied_ as the snapshot bound: the snapshot may only cover
+  // entries already applied to the state machine, never the uncommitted log
+  // tail. The manager records the bound in snapshot.meta and compacts the
+  // WAL exactly up to it.
+  bool ok = snapshot_manager_->ScheduleCreateIfNeeded(last_applied_);
+  if (ok) {
+    // Mirror the new snapshot bound into the node so AppendEntries correctly
+    // prefers InstallSnapshot for lagging followers.
+    const SnapshotMeta& m = snapshot_manager_->meta();
+    if (m.index > last_snapshot_index_) {
+      last_snapshot_index_ = m.index;
+      last_snapshot_term_ = m.term;
+    }
+  }
+  return ok;
+}
+
+// ---- Value getters (locked) ----
+
+RaftRole RaftNode::role() const {
+  std::lock_guard guard(mutex_);
+  return role_;
+}
+
+Term RaftNode::term() const {
+  std::lock_guard guard(mutex_);
+  return storage_.current_term();
+}
+
+const NodeId RaftNode::voted_for() const {
+  std::lock_guard guard(mutex_);
+  return storage_.voted_for();
+}
+
+uint32_t RaftNode::vote_count() const {
+  std::lock_guard guard(mutex_);
+  return vote_count_;
+}
+
+ClusterConfig RaftNode::cluster_config() const {
+  std::lock_guard guard(mutex_);
+  return cluster_config_;
+}
+
+ConfigState RaftNode::config_state() const {
+  std::lock_guard guard(mutex_);
+  return config_state_;
+}
+
+void RaftNode::SetConfigState(ConfigState state) {
+  std::lock_guard guard(mutex_);
+  config_state_ = state;
+}
+
+void RaftNode::SetClusterConfig(ClusterConfig config) {
+  std::lock_guard guard(mutex_);
+  cluster_config_ = std::move(config);
+  peer_manager_.SetConfig(&cluster_config_);
+}
+
+void RaftNode::AddPeer(const NodeId& id) {
+  std::lock_guard guard(mutex_);
+  cluster_config_.voters.insert(id);
+}
+
+bool RaftNode::RemovePeer(const NodeId& id) {
+  std::lock_guard guard(mutex_);
+  return cluster_config_.voters.erase(id) > 0;
+}
+
+JointConfig RaftNode::joint_config() const {
+  std::lock_guard guard(mutex_);
+  return joint_config_;
+}
+
+bool RaftNode::IsJointConsensus() const {
+  std::lock_guard guard(mutex_);
+  return config_state_ == ConfigState::kJoint;
+}
+
+Term RaftNode::leader_term() const {
+  std::lock_guard guard(mutex_);
+  return leader_term_;
+}
+
+LogIndex RaftNode::commit_index() const {
+  std::lock_guard guard(mutex_);
+  return commit_index_;
+}
+
+LogIndex RaftNode::last_applied() const {
+  std::lock_guard guard(mutex_);
+  return last_applied_;
+}
+
+uint64_t RaftNode::leader_lease_expire() const {
+  std::lock_guard guard(mutex_);
+  return leader_lease_expire_;
+}
+
+void RaftNode::ForceCommitIndex(LogIndex ci) {
+  std::lock_guard guard(mutex_);
+  commit_index_ = ci;
+}
+
+LogIndex RaftNode::last_snapshot_index() const {
+  std::lock_guard guard(mutex_);
+  return last_snapshot_index_;
+}
+
+Term RaftNode::last_snapshot_term() const {
+  std::lock_guard guard(mutex_);
+  return last_snapshot_term_;
+}
+
+void RaftNode::SetSnapshotDir(std::string dir) {
+  std::lock_guard guard(mutex_);
+  snapshot_dir_ = std::move(dir);
+}
+
+const LeaderTransferContext RaftNode::transfer_context() const {
+  std::lock_guard guard(mutex_);
+  return transfer_ctx_;
 }
 
 }  // namespace dfly

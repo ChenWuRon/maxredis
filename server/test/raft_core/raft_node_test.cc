@@ -407,13 +407,15 @@ TEST_F(RaftNodeTest, StaleTermPeerRejects) {
 
   ElectionResult result = n1.StartElection();
 
-  // n1's term starts at 0, becomes 1 after StartElection
-  // n2 has term 5 > 1, so n2 rejects n1's vote request
+  // n1's term starts at 0, becomes 1 after StartElection.
+  // n2 has term 5 > 1, so n2 rejects n1's vote request with its term.
+  // Correct Raft behavior: the candidate LEARNS of the higher term and
+  // steps down (logical clock monotonicity) instead of winning at a stale term.
   EXPECT_EQ(1u, result.votes_received);  // only self
   EXPECT_EQ(1u, result.votes_rejected);
-  EXPECT_EQ(1u, n1.term());
+  EXPECT_EQ(5u, n1.term());  // adopted the higher term on step-down
   EXPECT_EQ(5u, n2.term());
-  EXPECT_EQ(RaftRole::Candidate, n1.role());
+  EXPECT_EQ(RaftRole::Follower, n1.role());
 }
 
 // --- TryBecomeLeader tests ---
@@ -575,7 +577,9 @@ TEST_F(RaftNodeTest, HeartbeatFromCandidateStepsDown) {
 
   EXPECT_TRUE(rsp.success);
   EXPECT_EQ(RaftRole::Follower, n1.role());
-  EXPECT_TRUE(n1.voted_for().empty());
+  // Election Safety: the step-down does NOT clear the self-vote — n1 already
+  // voted in this term and must never be able to grant a second vote.
+  EXPECT_EQ("N1", n1.voted_for());
 }
 
 TEST_F(RaftNodeTest, HeartbeatKeepsLeaderStable) {
@@ -621,6 +625,8 @@ TEST_F(RaftNodeTest, AppendEntriesReplicatesLog) {
   transport.RegisterNode(0, "F1", &follower);
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
+  leader.BecomeCandidate();
+  leader.BecomeLeader();
 
   leader_storage.Append(LogEntry{1, 0, "cmd1"});
   leader_storage.Append(LogEntry{1, 0, "cmd2"});
@@ -648,6 +654,8 @@ TEST_F(RaftNodeTest, AppendEntriesFillsGaps) {
   transport.RegisterNode(0, "F1", &follower);
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
+  leader.BecomeCandidate();
+  leader.BecomeLeader();
 
   leader_storage.Append(LogEntry{1, 0, "a"});
   leader_storage.Append(LogEntry{1, 0, "b"});
@@ -832,6 +840,8 @@ TEST_F(RaftNodeTest, CommitAdvancesWithMajority) {
   leader.SetTransport(&transport);
   leader.AddPeer("F1");
   leader.AddPeer("F2");
+  leader.BecomeCandidate();
+  leader.BecomeLeader();
 
   leader_storage.Append(LogEntry{1, 0, "SET a 1"});
   leader_storage.Append(LogEntry{1, 0, "SET b 2"});
@@ -951,16 +961,22 @@ TEST_F(RaftNodeTest, RaftNodeUsesLogStorageInterface) {
   node.AddPeer("F1");
   node.AddPeer("F2");
 
-  EXPECT_CALL(mock_storage, FirstIndex())
-      .WillOnce(Return(1));
-
   EXPECT_CALL(mock_storage, LastIndex())
-      .WillOnce(Return(5));
+      .WillRepeatedly(Return(5));
 
-  EXPECT_CALL(mock_storage, GetRange(1, 0))
-      .WillOnce(Return(std::vector<LogEntry>{
-          LogEntry{1, 1, "a"}, LogEntry{1, 2, "b"}, LogEntry{1, 3, "c"},
-          LogEntry{2, 4, "d"}, LogEntry{2, 5, "e"}}));
+  EXPECT_CALL(mock_storage, GetRange(testing::_, testing::_))
+      .WillRepeatedly(testing::Invoke([](LogIndex start, size_t) {
+        if (start == 1) {
+          return std::vector<LogEntry>{
+              LogEntry{1, 1, "a"}, LogEntry{1, 2, "b"}, LogEntry{1, 3, "c"},
+              LogEntry{2, 4, "d"}, LogEntry{2, 5, "e"}};
+        }
+        return std::vector<LogEntry>{};
+      }));
+
+  // prev-log lookups during replication backoff fall back to GetTerm.
+  EXPECT_CALL(mock_storage, GetTerm(testing::_))
+      .WillRepeatedly(Return(0));
 
   EXPECT_CALL(mock_storage, LogSize())
       .WillRepeatedly(Return(5));
@@ -1007,6 +1023,9 @@ TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
 
   EXPECT_CALL(mock_storage, LastIndex())
       .WillRepeatedly(Return(3));
+
+  EXPECT_CALL(mock_storage, GetTerm(2))
+      .WillRepeatedly(Return(2));  // prev-log term check
 
   EXPECT_CALL(mock_storage, Get(1))
       .WillRepeatedly(Return(&entry1));
@@ -1084,12 +1103,16 @@ TEST_F(RaftNodeTest, SingleNodeCommitFollowerRole) {
   RaftNode node("N1");
   node.SetLogStorage(&storage);
   node.SetStateMachine(&sm);
+  // Single-node deployment: the node is bootstrapped to Leader before any
+  // traffic (see Service::Init / BootstrapSingleNode).
+  node.BecomeCandidate();
+  node.BecomeLeader();
 
   storage.Append(LogEntry{1, 0, "SET a 1"});
 
   node.ReplicateLog();
 
-  // Single-node with no peers should commit regardless of role.
+  // Single-node with no peers: majority(1/1) is trivially satisfied.
   EXPECT_EQ(1u, node.commit_index());
   EXPECT_EQ(1u, node.last_applied());
 }
@@ -1201,7 +1224,7 @@ TEST_F(RaftNodeTest, CommandEncoderEncodesSET) {
   EXPECT_EQ("SET", cmd->args[0]);
   EXPECT_EQ("a", cmd->args[1]);
   EXPECT_EQ("1", cmd->args[2]);
-  EXPECT_EQ("SET a 1", cmd->Serialize());
+  EXPECT_EQ("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n", cmd->Serialize());
 }
 
 TEST_F(RaftNodeTest, CommandEncoderEncodesDEL) {
@@ -1215,7 +1238,7 @@ TEST_F(RaftNodeTest, CommandEncoderEncodesDEL) {
   ASSERT_EQ(2u, cmd->args.size());
   EXPECT_EQ("DEL", cmd->args[0]);
   EXPECT_EQ("mykey", cmd->args[1]);
-  EXPECT_EQ("DEL mykey", cmd->Serialize());
+  EXPECT_EQ("*2\r\n$3\r\nDEL\r\n$5\r\nmykey\r\n", cmd->Serialize());
 }
 
 TEST_F(RaftNodeTest, CommandEncoderEncodesEXPIRE) {
@@ -1230,7 +1253,7 @@ TEST_F(RaftNodeTest, CommandEncoderEncodesEXPIRE) {
   EXPECT_EQ("EXPIRE", cmd->args[0]);
   EXPECT_EQ("a", cmd->args[1]);
   EXPECT_EQ("10", cmd->args[2]);
-  EXPECT_EQ("EXPIRE a 10", cmd->Serialize());
+  EXPECT_EQ("*3\r\n$6\r\nEXPIRE\r\n$1\r\na\r\n$2\r\n10\r\n", cmd->Serialize());
 }
 
 TEST_F(RaftNodeTest, CommandEncoderRejectsReadOnly) {
@@ -1257,14 +1280,15 @@ TEST_F(RaftNodeTest, ReplicatedCommandRoundTrip) {
   original.args = {"SET", "a", "1"};
 
   std::string serialized = original.Serialize();
-  EXPECT_EQ("SET a 1", serialized);
+  EXPECT_EQ("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n", serialized);
 
-  ReplicatedCommand deserialized = ReplicatedCommand::Deserialize(serialized);
-  EXPECT_EQ(original.type, deserialized.type);
-  ASSERT_EQ(original.args.size(), deserialized.args.size());
-  EXPECT_EQ(original.args[0], deserialized.args[0]);
-  EXPECT_EQ(original.args[1], deserialized.args[1]);
-  EXPECT_EQ(original.args[2], deserialized.args[2]);
+  // Legacy space-joined format is still parsed (backward compatibility).
+  ReplicatedCommand legacy = ReplicatedCommand::Deserialize("SET a 1");
+  EXPECT_EQ(original.type, legacy.type);
+  ASSERT_EQ(original.args.size(), legacy.args.size());
+  EXPECT_EQ(original.args[0], legacy.args[0]);
+  EXPECT_EQ(original.args[1], legacy.args[1]);
+  EXPECT_EQ(original.args[2], legacy.args[2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,10 +1471,11 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLogReplication) {
 TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
   LocalTransport transport;
   CommandLog l1_storage, l2_storage, l3_storage;
-  TestStateMachine sm2, sm3;
+  TestStateMachine sm1, sm2, sm3;
 
   RaftNode n1("N1"), n2("N2"), n3("N3");
   n1.SetLogStorage(&l1_storage);
+  n1.SetStateMachine(&sm1);
   n2.SetLogStorage(&l2_storage);
   n2.SetStateMachine(&sm2);
   n3.SetLogStorage(&l3_storage);
@@ -1482,36 +1507,40 @@ TEST_F(RaftNodeTest, ThreeNodeClusterLeaderTransition) {
   EXPECT_EQ(RaftRole::Follower, n1.role());
   EXPECT_EQ(5u, n1.term());
 
-  // Step 3: N2 starts election (term 2)
-  // N1 (term 5) rejects, N3 (term 1) grants
+  // Step 3: N2 starts election (term 2).
+  // N1 (term 5) rejects with its higher term; N3 (term 1) grants.
+  // Correct Raft behavior: N2 LEARNS of term 5 and steps down instead of
+  // winning at a stale term — a leader at term 2 would violate logical clock
+  // monotonicity and could commit entries a term-5 leader will overwrite.
   ElectionResult e2 = n2.StartElection();
-  EXPECT_EQ(RaftRole::Leader, n2.role());
-  EXPECT_EQ(2u, n2.term());  // N2's own term
-  EXPECT_EQ(5u, n1.term());  // N1 unchanged (higher term)
-  EXPECT_EQ(2u, n3.term());  // N3 updated by vote request
-  EXPECT_EQ(2u, e2.votes_received);  // self + N3
-  EXPECT_EQ(1u, e2.votes_rejected);  // N1
+  EXPECT_EQ(RaftRole::Follower, n2.role());  // stepped down on higher term
+  EXPECT_EQ(5u, n2.term());                  // adopted the higher term
+  EXPECT_EQ(5u, n1.term());                  // unchanged (higher term)
+  EXPECT_EQ(2u, n3.term());                  // N3 updated by vote request
+  EXPECT_EQ(2u, e2.votes_received);          // self + N3
+  EXPECT_EQ(1u, e2.votes_rejected);          // N1
 
-  // N1 and N3 are followers
+  // All nodes converge on term 5 as followers.
   EXPECT_EQ(RaftRole::Follower, n1.role());
   EXPECT_EQ(RaftRole::Follower, n3.role());
 
-  // Step 5: New leader replicates log entry
-  // N3 accepts, N1 rejects (higher term 5 > 2)
-  l2_storage.Append(LogEntry{2, 1, "SET x 1"});
-  n2.ReplicateLog();
+  // Step 4: With every candidate forced to step down when it sees term 5,
+  // no node may safely lead at a lower term. N1 (term 5) is promoted via the
+  // raw API (candidate path → term 6) and replicates a term-6 entry to N3.
+  n1.SetRole(RaftRole::Leader);
+  l1_storage.Append(LogEntry{6, 1, "SET x 1"});
+  n1.ReplicateLog();
 
-  // N3 received the entry via transport
+  // N3 accepted the entry via transport
   EXPECT_EQ(1u, l3_storage.LogSize());
   ASSERT_NE(nullptr, l3_storage.Get(1));
   EXPECT_EQ("SET x 1", l3_storage.Get(1)->command);
 
-  // N1 rejected (higher term)
-  EXPECT_EQ(0u, l1_storage.LogSize());
-
-  // Majority (N2 + N3 = 2/3) reached → commit_index advances
-  EXPECT_EQ(1u, n2.commit_index());
-  EXPECT_EQ(1u, n2.last_applied());
+  // Majority (N1 + N3 = 2/3) reached → commit_index advances.
+  EXPECT_EQ(1u, n1.commit_index());
+  EXPECT_EQ(1u, n1.last_applied());
+  ASSERT_EQ(1u, sm1.applied.size());
+  EXPECT_EQ("SET x 1", sm1.applied[0].command);
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,7 +1965,11 @@ TEST_F(RaftNodeTest, IntegrationCrashRecoveryJoint) {
   // Restore pre-crash cluster config (what the node knew before crash)
   recovered.SetClusterConfig(initial);
 
-  // ReplayUnappliedLogs sets commit_index_ = LastIndex() and applies
+  // The node was the leader pre-crash; a restarting node must win an election
+  // before it may commit (H3: a Follower with peers never self-commits).
+  // Simulate that election locally, then replay.
+  recovered.BecomeCandidate();
+  recovered.BecomeLeader();
   recovered.ReplayUnappliedLogs();
 
   // After replay, the node should be in Joint consensus

@@ -21,7 +21,8 @@ using namespace testing;
 using namespace std;
 
 // In-memory KV store implementing IStateMachine for integration testing.
-// Parses serialized log entries (e.g. "SET a 1") and applies to a local map.
+// Parses serialized log entries (RESP array, with legacy space-joined
+// fallback) and applies to a local map.
 class InMemoryKV : public IStateMachine {
  public:
   ApplyResult Apply(const CommandId*, CmdArgList) override {
@@ -29,23 +30,34 @@ class InMemoryKV : public IStateMachine {
   }
 
   ApplyResult ApplyLogEntry(const LogEntry& entry) override {
-    string_view cmd = entry.command;
-    auto space1 = cmd.find(' ');
-    if (space1 == string_view::npos)
+    std::vector<std::string> args;
+    if (ParseRespArray(entry.command, &args) && args.empty())
+      return {ApplyOp::ERROR, 0};
+    if (args.empty()) {
+      string_view cmd = entry.command;
+      size_t pos = 0;
+      while (pos < cmd.size()) {
+        size_t end = cmd.find(' ', pos);
+        if (end == string_view::npos) {
+          args.emplace_back(cmd.substr(pos));
+          break;
+        }
+        args.emplace_back(cmd.substr(pos, end - pos));
+        pos = end + 1;
+      }
+    }
+    if (args.size() < 2)
       return {ApplyOp::ERROR, 0};
 
-    string_view name = cmd.substr(0, space1);
+    string_view name = args[0];
     if (name == "SET") {
-      auto space2 = cmd.find(' ', space1 + 1);
-      if (space2 == string_view::npos)
+      if (args.size() < 3)
         return {ApplyOp::ERROR, 0};
-      string_view key = cmd.substr(space1 + 1, space2 - space1 - 1);
-      string_view val = cmd.substr(space2 + 1);
-      Set(0, key, val);
+      Set(0, args[1], args[2]);
       return {ApplyOp::OK, 1};
     }
     if (name == "DEL") {
-      bool deleted = Del(0, cmd.substr(space1 + 1));
+      bool deleted = Del(0, args[1]);
       return {ApplyOp::OK, deleted ? 1u : 0u};
     }
     return {ApplyOp::ERROR, 0};
@@ -106,7 +118,9 @@ TEST_F(RaftIntegrationTest, SetCommandApply) {
 
   auto encoded = CommandEncoder::Encode(&set_cmd, args);
   ASSERT_TRUE(encoded.has_value());
-  EXPECT_EQ("SET a 1", encoded->Serialize());
+  EXPECT_EQ(
+      "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+      encoded->Serialize());
 
   LogEntry entry(node.term(), 0, encoded->Serialize());
   log.Append(entry);

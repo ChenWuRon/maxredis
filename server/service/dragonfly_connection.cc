@@ -32,15 +32,32 @@ using namespace util;
 using namespace std;
 
 namespace dfly {
+
+std::atomic<uint64_t> Connection::connection_count_{0};
+
 namespace {
 
 void SendProtocolError(RedisParser::Result pres, FiberSocketBase* peer) {
+  // Malformed client input must never take the server down: report the
+  // specific protocol error instead of asserting (a CHECK here turns a
+  // protocol violation into a process abort — a trivial DoS vector).
   string res("-ERR Protocol error: ");
-  if (pres == RedisParser::BAD_BULKLEN) {
-    res.append("invalid bulk length\r\n");
-  } else {
-    CHECK_EQ(RedisParser::BAD_ARRAYLEN, pres);
-    res.append("invalid multibulk length\r\n");
+  switch (pres) {
+    case RedisParser::BAD_BULKLEN:
+      res.append("invalid bulk length\r\n");
+      break;
+    case RedisParser::BAD_ARRAYLEN:
+      res.append("invalid multibulk length\r\n");
+      break;
+    case RedisParser::BAD_STRING:
+      res.append("invalid string\r\n");
+      break;
+    case RedisParser::BAD_INT:
+      res.append("invalid integer\r\n");
+      break;
+    default:
+      res.append("malformed request\r\n");
+      break;
   }
 
   error_code size_res = peer->Write(::io::Buffer(res));
@@ -67,6 +84,7 @@ constexpr size_t kMaxReadBufferSize = 65536;
 Connection::Connection(Protocol protocol, Service* service, SSL_CTX* ctx)
     : service_(service), ctx_(ctx) {
   protocol_ = protocol;
+  connection_count_.fetch_add(1, std::memory_order_relaxed);
 
   switch (protocol) {
     case Protocol::REDIS:
@@ -79,6 +97,7 @@ Connection::Connection(Protocol protocol, Service* service, SSL_CTX* ctx)
 }
 
 Connection::~Connection() {
+  connection_count_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void Connection::OnShutdown() {

@@ -11,6 +11,10 @@ void LocalTransport::RegisterNode(GroupId group_id, const NodeId& id, RaftNode* 
   nodes_[{group_id, id}] = node;
 }
 
+void LocalTransport::UnregisterNode(GroupId group_id, const NodeId& node_id) {
+  nodes_.erase({group_id, node_id});
+}
+
 bool LocalTransport::HasNode(GroupId group_id, const NodeId& id) const {
   return nodes_.contains({group_id, id});
 }

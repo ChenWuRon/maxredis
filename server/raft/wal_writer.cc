@@ -126,6 +126,29 @@ bool WalWriter::Flush() {
   return true;
 }
 
+bool WalWriter::WriteNoSync() {
+  if (!file_)
+    return false;
+  if (buf_.empty())
+    return true;
+
+  size_t written = fwrite(buf_.data(), 1, buf_.size(), file_);
+  if (written != buf_.size()) {
+    PLOG(WARNING) << "fwrite failed: wrote " << written << " of " << buf_.size();
+    return false;
+  }
+
+  file_size_ += written;
+
+  if (fflush(file_) != 0) {
+    PLOG(WARNING) << "fflush failed";
+    return false;
+  }
+
+  buf_.clear();
+  return true;
+}
+
 void WalWriter::Close() {
   if (!file_)
     return;

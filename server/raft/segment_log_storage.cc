@@ -4,6 +4,9 @@
 
 #include "server/raft/segment_log_storage.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cstring>
 #include <dirent.h>
@@ -30,9 +33,19 @@ SegmentLogStorage::SegmentLogStorage(std::string dir)
   entries_.emplace_back(0, 0, "");
 }
 
+SegmentLogStorage::~SegmentLogStorage() {
+  writer_.reset();
+}
+
 bool SegmentLogStorage::Open() {
   if (dir_.empty())
     return true;
+
+  // Ensure the directory exists.
+  if (mkdir(dir_.c_str(), 0755) != 0 && errno != EEXIST) {
+    PLOG(WARNING) << "mkdir(" << dir_ << ") failed";
+    return false;
+  }
 
   if (!manifest_.Load())
     return false;
@@ -45,6 +58,21 @@ bool SegmentLogStorage::Open() {
   if (entries_.size() > 1 && base_index_ == 0 && entries_[1].index > 1) {
     base_index_ = entries_[1].index - 1;
   }
+
+  // Open the writer in append mode on the LAST segment so new entries
+  // continue the on-disk sequence.
+  auto segments = DiscoverSegments();
+  if (!segments.empty()) {
+    current_segment_id_ = segments.back();
+    std::string path = SegmentPath(current_segment_id_);
+    writer_ = std::make_unique<WalWriter>();
+    if (!writer_->OpenAppend(path)) {
+      LOG(WARNING) << "SegmentLogStorage: failed to open " << path << " for append";
+      writer_.reset();
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -167,6 +195,31 @@ void SegmentLogStorage::RebuildIndex(LogIndex index, Term term,
   last_term_ = term;
 }
 
+bool SegmentLogStorage::EnsureWriter() {
+  if (writer_ && writer_->IsOpen())
+    return true;
+
+  std::string path = SegmentPath(current_segment_id_);
+  writer_ = std::make_unique<WalWriter>();
+  if (!writer_->OpenAppend(path)) {
+    LOG(WARNING) << "SegmentLogStorage: failed to open " << path << " for append";
+    writer_.reset();
+    return false;
+  }
+  return true;
+}
+
+bool SegmentLogStorage::RollSegment() {
+  if (writer_) {
+    writer_->Close();
+    writer_.reset();
+  }
+  current_segment_id_++;
+  manifest_.set_current_segment(current_segment_id_);
+  manifest_.Save();
+  return EnsureWriter();
+}
+
 size_t SegmentLogStorage::LogSize() const {
   if (entries_.size() <= 1)
     return 0;
@@ -216,10 +269,44 @@ const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
 }
 
 LogIndex SegmentLogStorage::Append(LogEntry entry) {
+  if (dir_.empty()) {
+    // In-memory mode (no persistence directory configured).
+    entry.index = last_index_ + 1;
+    last_index_ = entry.index;
+    last_term_ = entry.term;
+    entries_.push_back(std::move(entry));
+    return entry.index;
+  }
+
+  if (last_index_ == 0 && !writer_) {
+    // First-ever append: create segment 0.
+    if (!EnsureWriter()) {
+      LOG(ERROR) << "SegmentLogStorage: cannot create WAL segment";
+      return 0;
+    }
+  }
+
   entry.index = last_index_ + 1;
   last_index_ = entry.index;
   last_term_ = entry.term;
-  entries_.push_back(std::move(entry));
+  entries_.push_back(entry);
+
+  uint64_t offset = writer_->next_write_offset();
+  writer_->Append(entry);
+
+  // Durability policy: fsync per append (default, kill -9 + power-loss safe)
+  // or page-cache write (everysec mode — a background fiber fsyncs).
+  bool write_ok = fsync_per_append_ ? writer_->Flush() : writer_->WriteNoSync();
+  if (!write_ok) {
+    LOG(ERROR) << "SegmentLogStorage: WAL write failed at index " << entry.index;
+  }
+
+  index_.Add(entry.index, current_segment_id_, offset);
+
+  // Roll over to a new segment when the current one grows too large.
+  if (writer_->file_size() >= kMaxSegmentBytes)
+    RollSegment();
+
   return entry.index;
 }
 
@@ -241,18 +328,62 @@ std::vector<LogEntry> SegmentLogStorage::GetRange(LogIndex start, size_t limit) 
 
 void SegmentLogStorage::TruncateFrom(LogIndex new_last) {
   if (new_last <= base_index_) {
-    index_.Clear();
-    last_index_ = 0;
-    last_term_ = 0;
-    entries_.resize(1);
+    // Nothing can be kept — wipe everything (equivalent to Clear()).
+    Clear();
     return;
   }
+
   size_t physical = new_last - base_index_;
   DCHECK_LT(physical, entries_.size());
+
+  // 1. In-memory trim.
   index_.Truncate(new_last);
   last_index_ = new_last;
   last_term_ = entries_[physical].term;
   entries_.resize(physical + 1);
+
+  // 2. On-disk trim: truncate the segment file containing new_last to the
+  //    end of that record, and delete every later segment file.
+  const EntryLocation* loc = index_.Find(new_last);
+  if (!loc || !writer_) {
+    // No disk backing (memory-only tests) — nothing more to do.
+    return;
+  }
+
+  uint32_t keep_segment = loc->segment_id;
+  const LogEntry& keep = entries_[physical];
+  uint64_t keep_end = loc->offset + kHeaderSize + keep.command.size();
+
+  // Truncate the keep segment file to exactly the end of the kept record.
+  int fd = open(SegmentPath(keep_segment).c_str(), O_WRONLY);
+  if (fd >= 0) {
+    if (ftruncate(fd, static_cast<off_t>(keep_end)) != 0) {
+      PLOG(WARNING) << "ftruncate failed on " << SegmentPath(keep_segment);
+    }
+    close(fd);
+  } else {
+    PLOG(WARNING) << "open(" << SegmentPath(keep_segment) << ") failed for truncation";
+  }
+
+  // Delete all segments after the keep segment.
+  for (uint32_t seg_id : DiscoverSegments()) {
+    if (seg_id > keep_segment) {
+      std::string path = SegmentPath(seg_id);
+      if (unlink(path.c_str()) == 0) {
+        VLOG(1) << "Deleted WAL segment after truncation: " << path;
+      }
+    }
+  }
+
+  // 3. Reopen the writer in append mode at the new tail.
+  if (writer_) {
+    writer_->Close();
+    writer_.reset();
+  }
+  current_segment_id_ = keep_segment;
+  manifest_.set_current_segment(keep_segment);
+  manifest_.Save();
+  EnsureWriter();
 }
 
 bool SegmentLogStorage::CompactUpTo(LogIndex index) {
@@ -278,10 +409,11 @@ bool SegmentLogStorage::CompactUpTo(LogIndex index) {
     entries_.resize(1);
   }
   base_index_ = index;
-  // Update WalIndex: remove entries up to index.
-  // Since we shift entries, the WalIndex would be stale.
-  // For simplicity, clear and rely on lazy rebuild.
-  index_.Clear();
+  // The surviving on-disk records are untouched (only segment FILES below
+  // keep_segment are deleted by CompactSegments), so trim the on-disk index
+  // instead of clearing it: TruncateFrom still needs the locations of
+  // entries above the snapshot index.
+  index_.TrimUpTo(index);
   return true;
 }
 
@@ -292,12 +424,66 @@ void SegmentLogStorage::CompactLogs(LogIndex snapshot_index, Term snapshot_term)
   CompactUpTo(snapshot_index);
 }
 
+bool SegmentLogStorage::Flush() {
+  if (writer_ && writer_->IsOpen())
+    return writer_->Flush();
+  return true;
+}
+
+void SegmentLogStorage::PruneCompacted() {
+  // Drop in-memory entries covered by the snapshot anchor (loaded from disk
+  // during recovery even though their segment was kept).
+  if (anchor_.index == 0 || entries_.size() <= 1)
+    return;
+
+  size_t keep_from = entries_.size();
+  for (size_t i = 1; i < entries_.size(); i++) {
+    if (entries_[i].index > anchor_.index) {
+      keep_from = i;
+      break;
+    }
+  }
+  if (keep_from == entries_.size()) {
+    // Everything is covered by the snapshot.
+    base_index_ = anchor_.index;
+    entries_.resize(1);
+    return;
+  }
+  if (keep_from > 1) {
+    std::move(entries_.begin() + keep_from, entries_.end(),
+              entries_.begin() + 1);
+    entries_.resize(entries_.size() - keep_from + 1);
+    base_index_ = anchor_.index;
+  }
+}
+
 void SegmentLogStorage::Clear() {
   base_index_ = 0;
   index_.Clear();
   last_index_ = 0;
   last_term_ = 0;
   entries_.resize(1);
+  anchor_.index = 0;
+  anchor_.term = 0;
+
+  if (writer_) {
+    writer_->Close();
+    writer_.reset();
+  }
+  DeleteAllSegments();
+}
+
+void SegmentLogStorage::DeleteAllSegments() {
+  if (dir_.empty())
+    return;
+  for (uint32_t seg_id : DiscoverSegments()) {
+    std::string path = SegmentPath(seg_id);
+    if (unlink(path.c_str()) == 0) {
+      VLOG(1) << "Deleted WAL segment: " << path;
+    }
+  }
+  manifest_.set_current_segment(0);
+  manifest_.Save();
 }
 
 void SegmentLogStorage::CompactSegments(LogIndex snapshot_index) {
@@ -308,14 +494,9 @@ void SegmentLogStorage::CompactSegments(LogIndex snapshot_index) {
   const EntryLocation* loc = index_.Find(snapshot_index);
   if (!loc) {
     // Snapshot index not found in index — it may have been cleared.
-    // Fall back: scan segments to find the first one with entries > snapshot_index.
-    auto segments = DiscoverSegments();
-    for (uint32_t seg_id : segments) {
-      // Check if this segment has any entries by looking at the index.
-      // If index is cleared, we conservatively skip compaction.
-      VLOG(1) << "CompactSegments: snapshot_index " << snapshot_index
-              << " not in index, skipping";
-    }
+    // Conservatively skip compaction.
+    VLOG(1) << "CompactSegments: snapshot_index " << snapshot_index
+            << " not in index, skipping";
     return;
   }
 
@@ -329,6 +510,12 @@ void SegmentLogStorage::CompactSegments(LogIndex snapshot_index) {
     if (unlink(seg_path.c_str()) == 0) {
       VLOG(1) << "Deleted WAL segment: " << seg_path;
     }
+  }
+
+  // Keep the manifest consistent with the surviving segments.
+  if (manifest_.current_segment() < keep_segment) {
+    manifest_.set_current_segment(keep_segment);
+    manifest_.Save();
   }
 }
 

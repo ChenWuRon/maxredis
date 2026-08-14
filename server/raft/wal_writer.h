@@ -50,6 +50,12 @@ class WalWriter {
   // Flushes buffered data to disk with fwrite + fdatasync.
   bool Flush();
 
+  // Writes buffered data to the OS (fwrite + fflush) WITHOUT fsync.
+  // The record survives a process crash (kill -9) because it is in the
+  // page cache, but may be lost on power failure — used by the "everysec"
+  // batch-fsync policy together with a periodic background Flush().
+  bool WriteNoSync();
+
   // Flushes and closes the file.
   void Close();
 

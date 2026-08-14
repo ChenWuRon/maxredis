@@ -38,14 +38,23 @@ void RaftSnapshotManager::Stop() {
     snapshot_fiber_.Join();
 }
 
-bool RaftSnapshotManager::CreateSnapshot() {
+bool RaftSnapshotManager::CreateSnapshot(LogIndex bound_index) {
   if (!state_machine_ || !log_storage_)
     return false;
 
-  LogIndex last_index = log_storage_->LastIndex();
+  // The snapshot is only allowed to cover entries already applied to the
+  // state machine (bound_index). Baking the raw log tail into the snapshot
+  // would persist UNCOMMITTED entries: a follower/restart that loads the
+  // snapshot would skip them and could diverge from the committed state.
+  LogIndex log_last = log_storage_->LastIndex();
+  LogIndex bound = (bound_index > 0) ? std::min(bound_index, log_last) : log_last;
+  // Empty log → an empty snapshot (index 0) is still valid.
+  Term bound_term = (bound == log_last) ? log_storage_->LastTerm()
+                                        : log_storage_->GetTerm(bound);
+
   LogIndex snapshot_index = meta_storage_.meta().index;
 
-  VLOG(1) << "CreateSnapshot: last_index=" << last_index
+  VLOG(1) << "CreateSnapshot: log_last=" << log_last << " bound=" << bound
           << " snapshot_index=" << snapshot_index;
 
   // Ensure snapshot directory exists.
@@ -58,12 +67,13 @@ bool RaftSnapshotManager::CreateSnapshot() {
 
   // Update metadata after successful export.
   if (ok) {
-    Term last_term = log_storage_->LastTerm();
-    meta_storage_.SetMeta({last_index, last_term, NowMs()});
-    VLOG(1) << "CreateSnapshot: OK index=" << last_index << " term=" << last_term;
+    // The meta records the BOUND (applied) index — this is the barrier point
+    // the snapshot actually reflects, not the possibly-uncommitted log tail.
+    meta_storage_.SetMeta({bound, bound_term, NowMs()});
+    VLOG(1) << "CreateSnapshot: OK index=" << bound << " term=" << bound_term;
 
     // Auto-compact the log now that a snapshot is safely persisted.
-    log_storage_->CompactLogs(last_index, last_term);
+    log_storage_->CompactLogs(bound, bound_term);
   } else {
     LOG(WARNING) << "CreateSnapshot: SaveSnapshot failed";
   }
@@ -73,19 +83,19 @@ bool RaftSnapshotManager::CreateSnapshot() {
   return ok;
 }
 
-bool RaftSnapshotManager::ScheduleCreateIfNeeded() {
+bool RaftSnapshotManager::ScheduleCreateIfNeeded(LogIndex bound_index) {
   if (!log_storage_ || !state_machine_)
     return false;
 
-  LogIndex last_index = log_storage_->LastIndex();
+  LogIndex log_last = log_storage_->LastIndex();
   LogIndex snapshot_index = meta_storage_.meta().index;
 
-  if (last_index < snapshot_index + log_gap_)
+  if (log_last < snapshot_index + log_gap_)
     return false;
 
-  VLOG(1) << "ScheduleCreateIfNeeded: gap=" << (last_index - snapshot_index)
+  VLOG(1) << "ScheduleCreateIfNeeded: gap=" << (log_last - snapshot_index)
           << " threshold=" << log_gap_;
-  return CreateSnapshot();
+  return CreateSnapshot(bound_index);
 }
 
 void RaftSnapshotManager::SnapshotLoop() {

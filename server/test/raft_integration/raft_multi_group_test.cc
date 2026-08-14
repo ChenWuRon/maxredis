@@ -297,16 +297,19 @@ TEST_F(RaftMultiGroupTest, ManagerWithMultipleGroups) {
     groups.push_back(std::move(group));
   }
 
+  fprintf(stderr, "PHASE followers\n");
   // All groups start as followers.
   for (auto& g : groups) {
     EXPECT_EQ(RaftRole::Follower, g->node().role());
   }
 
+  fprintf(stderr, "PHASE start-elections\n");
   // Trigger elections in all groups.
   for (auto& g : groups) {
     g->node().StartElection();
   }
 
+  fprintf(stderr, "PHASE leaders-check\n");
   // Every group should have elected its own leader (node A in each).
   for (auto& g : groups) {
     EXPECT_EQ(RaftRole::Leader, g->node().role())
@@ -314,9 +317,22 @@ TEST_F(RaftMultiGroupTest, ManagerWithMultipleGroups) {
   }
 
   // Clean up.
+  // Stop every node's background fibers BEFORE destroying any node: the
+  // leader heartbeat fibers still reference peers through the transport, and
+  // deleting a peer first would let a heartbeat hit freed memory.
+  fprintf(stderr, "PHASE shutdown-a\n");
+  for (auto& g : groups) {
+    g->node().Shutdown();
+  }
+  fprintf(stderr, "PHASE shutdown-bc\n");
+  for (auto* n : all_nodes) {
+    n->Shutdown();
+  }
+  fprintf(stderr, "PHASE delete-bc\n");
   for (auto* n : all_nodes) {
     delete n;
   }
+  fprintf(stderr, "PHASE done\n");
 }
 
 // ---------------------------------------------------------------------------

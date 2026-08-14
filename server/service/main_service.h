@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+
 #include "base/varz_value.h"
 #include "server/service/command_registry.h"
 #include "server/storage/engine_shard_set.h"
@@ -77,6 +80,12 @@ class Service {
   bool replay_mode_ = false;
   SnapshotFiber snapshot_fiber_{this};
   RaftEngine engine_;
+
+  // Real INFO statistics (atomic: written from connection fibers on any
+  // proactor thread, read by the INFO handler).
+  std::atomic<uint64_t> commands_processed_{0};
+  std::atomic<uint64_t> keyspace_hits_{0};
+  std::atomic<uint64_t> keyspace_misses_{0};
 };
 
 }  // namespace dfly

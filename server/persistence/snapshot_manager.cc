@@ -116,7 +116,9 @@ bool SnapshotManager::Save(std::string_view path, const SnapshotData& data) {
 bool SnapshotManager::Load(std::string_view path, SnapshotData* data) {
   FILE* file = fopen(path.data(), "rb");
   if (!file) {
-    LOG(ERROR) << "Failed to open snapshot file for reading: " << path;
+    // Absence of a snapshot is a normal first-boot condition, not an error.
+    if (errno != ENOENT)
+      LOG(ERROR) << "Failed to open snapshot file for reading: " << path;
     return false;
   }
 

@@ -69,6 +69,20 @@ class ILogStorage {
   // Removes all entries. Retains only the sentinel.
   virtual void Clear() = 0;
 
+  // Drops in-memory entries covered by the snapshot anchor (index <=
+  // anchor_.index) after recovery. On-disk records may still contain them;
+  // they are simply ignored. Default: no-op.
+  virtual void PruneCompacted() {
+  }
+
+  // Flushes any buffered records to durable storage (fsync). Called during
+  // graceful shutdown so every acknowledged write survives a crash right
+  // after the process exits. Returns false if the flush failed.
+  // Default: no-op success.
+  virtual bool Flush() {
+    return true;
+  }
+
   // Returns the snapshot anchor preserved after compaction.
   const SnapshotAnchor& snapshot_anchor() const {
     return anchor_;

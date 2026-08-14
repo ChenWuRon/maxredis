@@ -4,30 +4,106 @@
 
 namespace dfly {
 
-std::string ReplicatedCommand::Serialize() const {
+namespace {
+
+// Encodes args as a RESP array of bulk strings:
+//   *N\r\n$len\r\n<arg>\r\n...
+// This is the durable, unambiguous log format (space-joined strings cannot
+// represent keys/values containing spaces).
+std::string EncodeRespArray(const std::vector<std::string>& args) {
   std::string result;
-  for (size_t i = 0; i < args.size(); i++) {
-    if (i > 0)
-      result += ' ';
-    result += args[i];
+  result += '*';
+  result += std::to_string(args.size());
+  result += "\r\n";
+  for (const auto& arg : args) {
+    result += '$';
+    result += std::to_string(arg.size());
+    result += "\r\n";
+    result += arg;
+    result += "\r\n";
   }
   return result;
+}
+
+}  // namespace
+
+std::string ReplicatedCommand::Serialize() const {
+  return EncodeRespArray(args);
+}
+
+// Parses a RESP array of bulk strings. Returns false on malformed input,
+// in which case *out is left empty.
+bool ParseRespArray(std::string_view data, std::vector<std::string>* out) {
+  out->clear();
+  if (data.empty() || data[0] != '*')
+    return false;
+
+  size_t pos = 0;
+  auto skip_crlf = [&](size_t p) -> size_t {
+    auto end = data.find("\r\n", p);
+    return end == std::string_view::npos ? std::string_view::npos : end + 2;
+  };
+
+  // Array count.
+  auto count_end = data.find("\r\n", 1);
+  if (count_end == std::string_view::npos)
+    return false;
+  size_t count = 0;
+  {
+    std::string_view num = data.substr(1, count_end - 1);
+    for (char c : num) {
+      if (c < '0' || c > '9')
+        return false;
+      count = count * 10 + (c - '0');
+    }
+  }
+  pos = count_end + 2;
+
+  for (size_t i = 0; i < count; i++) {
+    if (pos + 1 >= data.size() || data[pos] != '$')
+      return false;
+    auto len_end = data.find("\r\n", pos + 1);
+    if (len_end == std::string_view::npos)
+      return false;
+    size_t len = 0;
+    for (size_t p = pos + 1; p < len_end; p++) {
+      char c = data[p];
+      if (c < '0' || c > '9')
+        return false;
+      len = len * 10 + (c - '0');
+    }
+    pos = len_end + 2;
+    if (pos + len > data.size())
+      return false;
+    out->emplace_back(data.substr(pos, len));
+    pos += len;
+    if (pos + 2 > data.size() || data[pos] != '\r' || data[pos + 1] != '\n')
+      return false;
+    pos += 2;
+  }
+  return true;
 }
 
 ReplicatedCommand ReplicatedCommand::Deserialize(std::string_view data) {
   ReplicatedCommand cmd;
   cmd.type = CommandType::SET;
 
-  size_t pos = 0;
-  while (pos < data.size()) {
-    size_t end = data.find(' ', pos);
-    if (end == std::string_view::npos) {
-      cmd.args.emplace_back(data.substr(pos));
-      break;
+  std::vector<std::string> args;
+  if (!ParseRespArray(data, &args)) {
+    // Legacy space-joined format (kept for backward-compatible tests).
+    size_t pos = 0;
+    while (pos < data.size()) {
+      size_t end = data.find(' ', pos);
+      if (end == std::string_view::npos) {
+        args.emplace_back(data.substr(pos));
+        break;
+      }
+      args.emplace_back(data.substr(pos, end - pos));
+      pos = end + 1;
     }
-    cmd.args.emplace_back(data.substr(pos, end - pos));
-    pos = end + 1;
   }
+
+  cmd.args = std::move(args);
 
   if (!cmd.args.empty()) {
     std::string_view name = cmd.args[0];

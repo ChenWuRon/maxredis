@@ -44,22 +44,33 @@ class InMemoryKV : public IStateMachine {
 
   ApplyResult ApplyLogEntry(const LogEntry& entry) override {
     applied.push_back(entry);
-    std::string_view cmd = entry.command;
-    auto space1 = cmd.find(' ');
-    if (space1 == std::string_view::npos)
+    std::vector<std::string> args;
+    if (ParseRespArray(entry.command, &args) && args.empty())
       return {ApplyOp::ERROR, 0};
-    std::string_view name = cmd.substr(0, space1);
+    if (args.empty()) {
+      std::string_view cmd = entry.command;
+      size_t pos = 0;
+      while (pos < cmd.size()) {
+        size_t end = cmd.find(' ', pos);
+        if (end == std::string_view::npos) {
+          args.emplace_back(cmd.substr(pos));
+          break;
+        }
+        args.emplace_back(cmd.substr(pos, end - pos));
+        pos = end + 1;
+      }
+    }
+    if (args.size() < 2)
+      return {ApplyOp::ERROR, 0};
+    std::string_view name = args[0];
     if (name == "SET") {
-      auto space2 = cmd.find(' ', space1 + 1);
-      if (space2 == std::string_view::npos)
+      if (args.size() < 3)
         return {ApplyOp::ERROR, 0};
-      std::string_view key = cmd.substr(space1 + 1, space2 - space1 - 1);
-      std::string_view val = cmd.substr(space2 + 1);
-      Set(0, key, val);
+      Set(0, args[1], args[2]);
       return {ApplyOp::OK, 1};
     }
     if (name == "DEL") {
-      bool deleted = Del(0, cmd.substr(space1 + 1));
+      bool deleted = Del(0, args[1]);
       return {ApplyOp::OK, deleted ? 1u : 0u};
     }
     return {ApplyOp::ERROR, 0};
