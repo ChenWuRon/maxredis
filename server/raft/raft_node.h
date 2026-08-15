@@ -200,6 +200,25 @@ class RaftNode {
   // tearing down peers while a transport still holds references to this node).
   void Shutdown();
 
+  // --- RPC lifetime guard (used by transports) ---------------------------
+  // Acquires an in-flight RPC reference. Returns false if the node is
+  // shutting down — the caller must NOT invoke any handler.
+  bool TryAcquireRpcRef() noexcept {
+    uint32_t refs = rpc_refs_.load(std::memory_order_acquire);
+    while (true) {
+      if (!rpc_alive_.load(std::memory_order_acquire) || refs == 0)
+        return false;
+      if (rpc_refs_.compare_exchange_weak(refs, refs + 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+        return true;
+    }
+  }
+
+  void ReleaseRpcRef() noexcept {
+    rpc_refs_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
   void SetLogStorage(ILogStorage* storage) {
     log_storage_ = storage;
   }
@@ -248,7 +267,17 @@ class RaftNode {
 
   // Leader-side: replicates the log to all peers. Sends RPCs outside the
   // consensus lock. Returns the ApplyResult of the last committed entry.
-  ApplyResult ReplicateLog();
+  // Replicates the log tail to peers.
+  // low_latency=true (client write path): healthy-first ordering + stops as
+  //   soon as a quorum has ACKed — a straggler/partitioned peer must not sit
+  //   on the write's critical path; it catches up via the heartbeat-triggered
+  //   call below.
+  // low_latency=false (heartbeat/transfer catch-up path): pushes to EVERY
+  //   peer that is behind (next_index <= last_index) and reachable (ACKed the
+  //   last heartbeat round). No early break: an early quorum break here is
+  //   what left lagging followers permanently stale — the peers that ACK
+  //   first are already caught up, so the quorum condition excludes nobody.
+  ApplyResult ReplicateLog(bool low_latency = false);
 
   // Advances commit_index when a majority of peers have replicated an entry.
   // Applies the Figure 8 guard (§5.4.2): only entries from the CURRENT term
@@ -302,9 +331,16 @@ class RaftNode {
   void SetRoleLocked(RaftRole new_role);
   void BecomeFollowerLocked(Term term);
   void BecomeCandidateLocked();
+  // Campaign in a fresh term (election-timer retry after a lost round).
+  void BecomeCandidateNewTermLocked();
   void TryBecomeLeaderLocked();
   void BecomeLeaderLocked();
   void BecomeLeaderInitPeersLocked();
+
+  // Releases the base RPC ref and blocks (with a bounded wait) until all
+  // in-flight RPC handlers have returned. Called from Shutdown() so member
+  // destruction never races an active transport dispatch.
+  void WaitForRpcDrain();
 
   std::vector<NodeId> GetPeerIdsLocked() const;
   void AdvanceCommitIndexLocked();
@@ -394,10 +430,33 @@ class RaftNode {
   std::vector<NodeId> last_peer_ids_;
   std::vector<LogIndex> peer_next_index_;
   std::vector<LogIndex> peer_last_log_index_;
+  // Whether each peer ACKed the most recent heartbeat round. ReplicateLog
+  // sends to healthy peers first so a partitioned peer never sits on the
+  // critical path of a majority write.
+  std::vector<bool> peer_hb_ok_;
+  // Node-level shutdown flag: set ONLY in Shutdown(). Once set, no background
+  // consensus activity (election timer, heartbeat) may (re)start. Distinct
+  // from heartbeat_stop_ — StopHeartbeat() is part of every role transition
+  // and must not flip the node into "shutdown" mode.
   std::atomic<bool> shutdown_{false};
+  // Stops the current heartbeat loop. Set by StopHeartbeat(), cleared by
+  // StartHeartbeat(). The loop exits when this is set OR the node shuts down.
+  std::atomic<bool> heartbeat_stop_{true};
   // Bumped on every StartHeartbeat so stale heartbeat fibers (from a
   // previous leadership) self-terminate at their next scheduling point.
   std::atomic<uint64_t> heartbeat_epoch_{0};
+
+  // RPC lifetime guard: transport-dispatched RPC handlers may run
+  // concurrently with the node's destruction (e.g. another node's heartbeat
+  // fiber calling into a node that is being torn down). rpc_refs_ counts
+  // in-flight handler invocations; the base ref (1) is released by
+  // WaitForRpcDrain() which then waits for the count to drop to zero so
+  // member destruction can never race an active handler.
+  std::atomic<uint32_t> rpc_refs_{1};
+  std::atomic<bool> rpc_alive_{true};
+  // Set when WaitForRpcDrain has dropped the base ref — makes the drain
+  // (and hence Shutdown) idempotent.
+  std::atomic<bool> drain_started_{false};
   util::fb2::Fiber heartbeat_fiber_;
   uint32_t heartbeat_interval_ms_ = 50;
   ElectionTimer election_timer_;

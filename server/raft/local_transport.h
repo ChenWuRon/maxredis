@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "server/raft/transport.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly {
 
@@ -59,8 +60,14 @@ class LocalTransport : public Transport {
   bool HasNode(GroupId group_id, const NodeId& id) const;
 
  private:
-  RaftNode* Lookup(GroupId group_id, const NodeId& node_id) const;
+  // Returns the node for (group, node) with an in-flight RPC ref acquired
+  // (RaftNode::TryAcquireRpcRef), or nullptr if the node is unknown or being
+  // torn down. The caller MUST ReleaseRpcRef() after invoking the handler.
+  // The registry lock is held only around the lookup — handlers run outside
+  // it so a handler that issues its own RPCs cannot deadlock on the registry.
+  RaftNode* LookupAcquire(GroupId group_id, const NodeId& node_id);
 
+  mutable util::fb2::Mutex mutex_;
   absl::flat_hash_map<GroupNodeKey, RaftNode*, GroupNodeKeyHash> nodes_;
 };
 

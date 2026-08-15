@@ -60,9 +60,46 @@ void RaftNode::Shutdown() {
     std::lock_guard guard(mutex_);
     shutdown_.store(true, std::memory_order_release);
   }
+  // From this point no NEW transport RPC may be dispatched to this node.
+  rpc_alive_.store(false, std::memory_order_release);
+  if (transport_) {
+    transport_->UnregisterNode(group_id_, node_id_);
+    // Clear the back-pointer: Shutdown is idempotent and the transport may
+    // be destroyed before this node (member destruction order), so a second
+    // call must not dereference a stale pointer.
+    transport_ = nullptr;
+  }
   StopHeartbeat();
   JoinHeartbeat();
   election_timer_.Stop();
+  // Wait for RPCs that were already in flight when we flipped rpc_alive_ (a
+  // peer's heartbeat/election fiber may be inside one of our handlers). They
+  // observe shutdown_ and return promptly; blocking here guarantees the
+  // mutex_ and all members below are destroyed without concurrent access.
+  WaitForRpcDrain();
+}
+
+void RaftNode::WaitForRpcDrain() {
+  // Drop the base ref exactly ONCE: Shutdown() is idempotent (called both by
+  // ~RaftNode and by Service::Shutdown/RaftEngine teardown) and a second
+  // fetch_sub would underflow the counter, making the drain spin on
+  // 0xFFFFFFFF until the 5s timeout (and double-wait on every shutdown).
+  if (drain_started_.exchange(true, std::memory_order_acq_rel))
+    return;
+  // In-flight handlers hold the remaining count.
+  rpc_refs_.fetch_sub(1, std::memory_order_acq_rel);
+  constexpr uint32_t kMaxWaitMs = 5000;
+  uint32_t waited = 0;
+  while (rpc_refs_.load(std::memory_order_acquire) != 0) {
+    if (waited >= kMaxWaitMs) {
+      LOG(WARNING) << node_id_ << ": RPC drain timed out after " << waited
+                   << "ms with " << rpc_refs_.load(std::memory_order_relaxed)
+                   << " in-flight RPC(s)";
+      break;
+    }
+    util::ThisFiber::SleepFor(std::chrono::milliseconds(1));
+    ++waited;
+  }
 }
 
 void RaftNode::SetNodeId(NodeId id) {
@@ -159,6 +196,7 @@ std::vector<NodeId> RaftNode::GetPeerIdsLocked() const {
 void RaftNode::ResizePeerArraysLocked(size_t n) {
   peer_next_index_.resize(n);
   peer_last_log_index_.resize(n);
+  peer_hb_ok_.resize(n, /*healthy=*/true);
   for (size_t i = 0; i < n; i++) {
     if (peer_next_index_[i] == 0) {
       // Standard Raft: a freshly known peer starts at LastIndex+1.
@@ -303,6 +341,15 @@ void RaftNode::BecomeCandidateLocked() {
   SetRoleLocked(RaftRole::Candidate);
 }
 
+// Re-enters campaigning in a FRESH term. Used when the election timer fires
+// for a candidate that lost the previous round (Raft §5.2: a candidate that
+// times out starts a NEW election with an incremented term). Re-running in
+// the same term could never win — the peers already rejected us for it.
+void RaftNode::BecomeCandidateNewTermLocked() {
+  storage_.SetState(storage_.current_term() + 1, node_id_);
+  SetRoleLocked(RaftRole::Candidate);
+}
+
 void RaftNode::BecomeLeader() {
   std::lock_guard guard(mutex_);
   BecomeLeaderLocked();
@@ -349,6 +396,8 @@ bool RaftNode::BootstrapSingleNode() {
 
 void RaftNode::OnElectionTimeout() {
   std::lock_guard guard(mutex_);
+  if (shutdown_.load(std::memory_order_acquire))
+    return;
   if (role_ != RaftRole::Follower)
     return;
   BecomeCandidateLocked();
@@ -403,8 +452,16 @@ ElectionResult RaftNode::StartElection() {
   VoteRequest req;
   {
     std::lock_guard guard(mutex_);
-    if (role_ == RaftRole::Follower)
+    if (shutdown_.load(std::memory_order_acquire))
+      return {};  // node is being torn down — never start an election
+    if (role_ == RaftRole::Follower) {
       BecomeCandidateLocked();
+    } else if (role_ == RaftRole::Candidate) {
+      // Election-timer retry (Raft §5.2): campaign in a FRESH term. A
+      // re-run in the current term could never win — the peers rejected
+      // it already.
+      BecomeCandidateNewTermLocked();
+    }
     if (role_ != RaftRole::Candidate) {
       return {};  // we are a leader already or have been deposed
     }
@@ -420,7 +477,9 @@ ElectionResult RaftNode::StartElection() {
             << " last_log=" << req.last_log_index << "/" << req.last_log_term;
   }
 
-  // Phase 2: vote RPCs WITHOUT holding the consensus lock.
+  // Phase 2: vote RPCs WITHOUT holding the consensus lock. Sequential sends
+  // with a short vote RPC timeout (500ms, set in the transport) keep each
+  // election round bounded even when a peer is partitioned.
   ElectionResult result;
   result.votes_received = 1;
   std::vector<NodeId> granters;
@@ -470,6 +529,20 @@ ElectionResult RaftNode::StartElection() {
       }
     }
     TryBecomeLeaderLocked();
+
+    // Raft §5.2: a candidate that loses the election steps back and waits
+    // for a fresh randomized timeout before campaigning in a NEW term.
+    // Stepping to Follower (rather than staying Candidate) is what breaks
+    // split-vote lockstep: a Follower GRANTS a higher-term vote request,
+    // while a Candidate rejects it — two candidates in sync would reject
+    // each other forever. voted_for is kept (same-term step-down), which
+    // also preserves Election Safety against same-term re-requests.
+    if (role_ == RaftRole::Candidate &&
+        !shutdown_.load(std::memory_order_acquire)) {
+      VLOG(1) << node_id_ << " election round lost (votes=" << result.votes_received
+              << "), stepping back to Follower for a fresh timer";
+      SetRoleLocked(RaftRole::Follower);  // Reset()s the election timer
+    }
   }
   return result;
 }
@@ -521,7 +594,8 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
   if (request.term < cur_term) {
     VLOG(2) << node_id_ << " rejects Heartbeat from " << request.leader_id
             << ": stale term " << request.term << " < " << cur_term;
-    return {group_id_, cur_term, false};
+    return {group_id_, cur_term, false,
+            log_storage_ ? log_storage_->LastIndex() : 0};
   }
 
   if (request.term > cur_term || role_ != RaftRole::Leader) {
@@ -531,12 +605,34 @@ HeartbeatResponse RaftNode::OnHeartbeat(const HeartbeatRequest& request) {
   } else {
     // Same term and we are the leader (split-brain recovery): stay.
     election_timer_.Reset();
-    return {group_id_, storage_.current_term(), true};
+    return {group_id_, storage_.current_term(), true,
+            log_storage_ ? log_storage_->LastIndex() : 0};
   }
 
   election_timer_.Reset();
 
-  return {group_id_, storage_.current_term(), true};
+  // A heartbeat is an empty AppendEntries: advance commit_index from the
+  // leader's and apply. Without this, entries replicated by AppendEntries
+  // stay unapplied on the follower until the next write. State Machine
+  // Safety holds: leader_commit only ever references entries the leader has
+  // committed, and the min() with our own last index prevents applying
+  // entries we never stored.
+  if (request.leader_commit > commit_index_ && log_storage_) {
+    LogIndex my_last = log_storage_->LastIndex();
+    if (request.leader_commit > my_last) {
+      VLOG(1) << node_id_ << " heartbeat: leader_commit " << request.leader_commit
+              << " beyond our log (" << my_last << ") — ignoring";
+    } else {
+      commit_index_ = request.leader_commit;
+      ApplyCommittedLogsLocked();
+    }
+  }
+
+  // Report our log length so the leader can detect we missed entries while
+  // partitioned (it then pushes them via AppendEntries) and can advance its
+  // commit index from the ACK.
+  return {group_id_, storage_.current_term(), true,
+          log_storage_ ? log_storage_->LastIndex() : 0};
 }
 
 ReadIndexResponse RaftNode::OnReadIndex(const ReadIndexRequest& request) {
@@ -590,18 +686,29 @@ bool RaftNode::HeartbeatTickImpl(bool is_loop, uint64_t epoch) {
     req.group_id = group_id_;
     req.term = storage_.current_term();
     req.leader_id = node_id_;
+    req.leader_commit = commit_index_;
     peers = GetPeerIdsLocked();
   }
 
   // --- Phase 2: RPCs WITHOUT the lock. ---
+  // Sequential sends are safe BECAUSE the heartbeat RPC timeout (150ms) is
+  // far below the follower election timeout (300-600ms): a partitioned peer
+  // delays the round by at most ~150ms, so healthy followers still receive
+  // a heartbeat every ~200ms and never start spurious elections (the old
+  // 1s RPC timeout made a single dead peer starve everyone into election
+  // livelock).
   size_t ack_count = 1;  // self
   Term max_peer_term = req.term;
+  // (peer_id -> follower last_log_index) for successful same-term ACKs.
+  std::vector<std::pair<NodeId, LogIndex>> rsp_last_log;
   for (const auto& peer_id : peers) {
     if (!transport_)
       break;
     HeartbeatResponse rsp = transport_->SendHeartbeat(peer_id, req);
-    if (rsp.success && rsp.term == req.term)
+    if (rsp.success && rsp.term == req.term) {
       ack_count++;
+      rsp_last_log.emplace_back(peer_id, rsp.last_log_index);
+    }
     if (rsp.term > max_peer_term)
       max_peer_term = rsp.term;
   }
@@ -621,6 +728,37 @@ bool RaftNode::HeartbeatTickImpl(bool is_loop, uint64_t epoch) {
               << ", stepping down";
       BecomeFollowerLocked(max_peer_term);
       return true;
+    }
+
+    // Update match progress from heartbeat ACKs (etcd MsgHeartbeatResp):
+    // lets commit advance between writes and detects followers that are
+    // behind (e.g. a restarted node that missed entries) so we can push
+    // them via AppendEntries. The arrays are refreshed from the current
+    // peer set first; ids are matched by value so ordering drift is safe.
+    {
+      auto peer_ids = GetPeerIdsLocked();
+      ResizePeerArraysLocked(peer_ids.size());
+      last_peer_ids_ = peer_ids;
+      // Fresh round: everyone is presumed unreachable until proven otherwise;
+      // ACKed peers are marked healthy below.
+      std::fill(peer_hb_ok_.begin(), peer_hb_ok_.end(), false);
+      LogIndex my_last = log_storage_ ? log_storage_->LastIndex() : 0;
+      for (const auto& [peer_id, last_log] : rsp_last_log) {
+        auto it = std::find(last_peer_ids_.begin(), last_peer_ids_.end(), peer_id);
+        if (it == last_peer_ids_.end())
+          continue;
+        size_t i = it - last_peer_ids_.begin();
+        peer_hb_ok_[i] = true;
+        peer_last_log_index_[i] = last_log;
+        if (last_log < my_last)
+          need_replicate = true;  // follower behind: push missing entries
+      }
+      AdvanceCommitIndexLocked();
+      // NOTE: no state-machine apply here. The leader applies on the write
+      // path (ReplicateLog) and via WaitForApplied for linearizable reads;
+      // applying inside the heartbeat fiber can block it on the shard
+      // threads (RunBriefInParallel waits across proactors), freezing
+      // heartbeats for the whole cluster and triggering election churn.
     }
 
     size_t majority;
@@ -665,13 +803,14 @@ bool RaftNode::HeartbeatTickImpl(bool is_loop, uint64_t epoch) {
   if (send_timeout_now)
     SendTimeoutNowToTarget();
   if (need_replicate)
-    ReplicateLog();
+    ReplicateLog(/*low_latency=*/false);  // heartbeat catch-up: push to ALL behind peers
   return false;
 }
 
 void RaftNode::HeartbeatLoop() {
   uint64_t epoch = heartbeat_epoch_.load(std::memory_order_acquire);
-  while (!shutdown_.load(std::memory_order_acquire)) {
+  while (!heartbeat_stop_.load(std::memory_order_acquire) &&
+         !shutdown_.load(std::memory_order_acquire)) {
     bool stop = HeartbeatTickImpl(true, epoch);
     if (stop)
       break;
@@ -686,7 +825,7 @@ void RaftNode::SendHeartbeatToPeers() {
 
 void RaftNode::StartHeartbeat(uint32_t interval_ms) {
   heartbeat_interval_ms_ = interval_ms;
-  shutdown_.store(false, std::memory_order_release);
+  heartbeat_stop_.store(false, std::memory_order_release);
   heartbeat_epoch_.fetch_add(1, std::memory_order_acq_rel);
   if (heartbeat_fiber_.IsJoinable()) {
     // A previous leader's fiber may still be winding down. Detach it — it
@@ -698,7 +837,7 @@ void RaftNode::StartHeartbeat(uint32_t interval_ms) {
 }
 
 void RaftNode::StopHeartbeat() {
-  shutdown_.store(true, std::memory_order_release);
+  heartbeat_stop_.store(true, std::memory_order_release);
 }
 
 void RaftNode::JoinHeartbeat() {
@@ -858,7 +997,7 @@ bool RaftNode::StartTransfer(const NodeId& target) {
   }
 
   // Push entries to the target (RPCs happen outside the lock).
-  ReplicateLog();
+  ReplicateLog(/*low_latency=*/false);  // transfer catch-up: target must be fully caught up
 
   bool send_now = false;
   {
@@ -1088,12 +1227,13 @@ ApplyResult RaftNode::SubmitEntry(LogEntry entry) {
     entry.index = 0;  // the log assigns the index
     log_storage_->Append(std::move(entry));
   }
-  return ReplicateLog();
+  return ReplicateLog(/*low_latency=*/true);  // client write: quorum suffices
 }
 
-ApplyResult RaftNode::ReplicateLog() {
+ApplyResult RaftNode::ReplicateLog(bool low_latency) {
   struct PeerReq {
     NodeId id;
+    size_t idx = 0;  // position in the peer arrays (peer_next_index_ etc.)
     LogIndex next = 0;
     LogEntry prev;
     bool need_snapshot = false;
@@ -1110,6 +1250,8 @@ ApplyResult RaftNode::ReplicateLog() {
   for (int round = 0; round < 8; round++) {
     // --- Phase 1 (locked): capture peers + build requests. ---
     Term current_term = 0;
+    size_t majority = 1;  // self
+    LogIndex my_last = 0;
     std::vector<PeerReq> preq;
     bool retry_needed = false;
     {
@@ -1122,10 +1264,23 @@ ApplyResult RaftNode::ReplicateLog() {
       auto peer_ids = GetPeerIdsLocked();
       ResizePeerArraysLocked(peer_ids.size());
       last_peer_ids_ = peer_ids;
+      majority = cluster_config_.voters.size() / 2 + 1;
+      my_last = log_storage_->LastIndex();
 
-      for (size_t i = 0; i < peer_ids.size(); i++) {
+      // Send to peers that ACKed the last heartbeat round FIRST: a write
+      // needs only a MAJORITY of responses, so a partitioned peer must
+      // never sit on the critical path of the healthy majority.
+      std::vector<size_t> order(peer_ids.size());
+      for (size_t i = 0; i < order.size(); i++)
+        order[i] = i;
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return peer_hb_ok_[a] && !peer_hb_ok_[b];
+      });
+
+      for (size_t i : order) {
         PeerReq r;
         r.id = peer_ids[i];
+        r.idx = i;
         r.next = peer_next_index_[i];
         if (r.next <= 1)
           r.next = 1;
@@ -1165,13 +1320,33 @@ ApplyResult RaftNode::ReplicateLog() {
     }
 
     // --- Phase 2: RPCs WITHOUT the lock. ---
+    // low_latency (client write path): healthy-first order, break as soon as
+    // the responses received (plus self) satisfy the quorum — a frozen peer
+    // costs nothing on the write path.
+    // Catch-up path: send to EVERY reachable, behind peer — no early break
+    // (see the declaration comment).
     std::vector<LogIndex> rsp_match(preq.size(), 0);
     std::vector<bool> rsp_ok(preq.size(), false);
+    std::vector<bool> rsp_attempted(preq.size(), false);
     std::vector<Term> rsp_term(preq.size(), 0);
+    size_t successes = 1;  // self
     for (size_t i = 0; i < preq.size(); i++) {
       if (!transport_)
         break;
       const PeerReq& r = preq[i];
+      if (low_latency) {
+        if (successes >= majority)
+          break;
+      } else {
+        // Catch-up: skip peers that are unreachable (no heartbeat ACK last
+        // round — a dead peer would block the heartbeat fiber for the full
+        // RPC timeout and starve healthy followers' heartbeats) or already
+        // caught up (nothing to push). Skipped peers must NOT be marked
+        // failed in phase 3 (their nextIndex must stay put).
+        if (!peer_hb_ok_[r.idx] || r.next > my_last)
+          continue;
+      }
+      rsp_attempted[i] = true;
       if (r.need_snapshot) {
         std::string snapshot_path = snapshot_dir_ + "snapshot.bin";
         SnapshotSender sender(snapshot_path, transport_);
@@ -1180,6 +1355,7 @@ ApplyResult RaftNode::ReplicateLog() {
         if (ok) {
           rsp_match[i] = r.snapshot_index;
           rsp_ok[i] = true;
+          successes++;
         }
         continue;
       }
@@ -1198,6 +1374,7 @@ ApplyResult RaftNode::ReplicateLog() {
       if (resp.success) {
         rsp_ok[i] = true;
         rsp_match[i] = r.prev.index + r.entries.size();
+        successes++;
       } else {
         rsp_match[i] = 0;
       }
@@ -1221,20 +1398,22 @@ ApplyResult RaftNode::ReplicateLog() {
         return result;
 
       for (size_t i = 0; i < preq.size(); i++) {
+        if (!rsp_attempted[i])
+          continue;  // skipped (caught up / unreachable) — state unchanged
         if (rsp_ok[i]) {
-          peer_last_log_index_[i] = rsp_match[i];
-          peer_next_index_[i] = rsp_match[i] + 1;
+          peer_last_log_index_[preq[i].idx] = rsp_match[i];
+          peer_next_index_[preq[i].idx] = rsp_match[i] + 1;
         } else {
           // nextIndex backoff: drop to min(next-1, follower_last+1) so
           // conflicts converge exponentially instead of resending everything.
           LogIndex hint = rsp_match[i] + 1;
-          LogIndex backoff = std::min(peer_next_index_[i] - 1, hint);
+          LogIndex backoff = std::min(peer_next_index_[preq[i].idx] - 1, hint);
           if (backoff < 1)
             backoff = 1;
-          peer_next_index_[i] = backoff;
+          peer_next_index_[preq[i].idx] = backoff;
           retry_needed = true;
           if (backoff <= last_snapshot_index_)
-            peer_last_log_index_[i] = last_snapshot_index_;  // force snapshot path
+            peer_last_log_index_[preq[i].idx] = last_snapshot_index_;  // force snapshot path
         }
       }
 

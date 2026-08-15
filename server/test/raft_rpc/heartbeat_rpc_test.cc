@@ -18,13 +18,15 @@ class HeartbeatRpcTest : public Test {
 TEST_F(HeartbeatRpcTest, HeartbeatRequestDefault) {
   HeartbeatRequest req;
   EXPECT_EQ(0u, req.term);
+  EXPECT_EQ(0u, req.leader_commit);
   EXPECT_TRUE(req.leader_id.empty());
 }
 
 TEST_F(HeartbeatRpcTest, HeartbeatRequestFields) {
-  HeartbeatRequest req{0, 5, "node1"};
+  HeartbeatRequest req{0, 5, "node1", 17};
   EXPECT_EQ(5u, req.term);
   EXPECT_EQ("node1", req.leader_id);
+  EXPECT_EQ(17u, req.leader_commit);
 }
 
 TEST_F(HeartbeatRpcTest, HeartbeatResponseDefault) {
@@ -40,9 +42,10 @@ TEST_F(HeartbeatRpcTest, HeartbeatResponseFields) {
 }
 
 TEST_F(HeartbeatRpcTest, HeartbeatRequestEquality) {
-  HeartbeatRequest a{0, 2, "x"}, b{0, 2, "x"}, c{0, 3, "x"};
+  HeartbeatRequest a{0, 2, "x"}, b{0, 2, "x"}, c{0, 3, "x"}, d{0, 2, "x", 9};
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
+  EXPECT_NE(a, d);  // differs only in leader_commit
 }
 
 TEST_F(HeartbeatRpcTest, HeartbeatResponseEquality) {

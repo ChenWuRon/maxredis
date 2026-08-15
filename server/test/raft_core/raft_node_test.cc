@@ -455,7 +455,7 @@ TEST_F(RaftNodeTest, ThreeNodesTwoVotesBecomesLeader) {
   EXPECT_EQ(RaftRole::Leader, n1.role());
 }
 
-TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
+TEST_F(RaftNodeTest, ThreeNodesOneVoteStepsBackToFollower) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3");
   // both peers already voted for other
@@ -473,7 +473,11 @@ TEST_F(RaftNodeTest, ThreeNodesOneVoteStaysCandidate) {
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(1u, r.votes_received);  // only self
-  EXPECT_EQ(RaftRole::Candidate, n1.role());
+  // Raft §5.2: a candidate that loses steps back to Follower and waits for a
+  // fresh randomized timeout before campaigning in a NEW term. Staying
+  // Candidate would reject the next higher-term candidate's request and
+  // keep two nodes in split-vote lockstep forever.
+  EXPECT_EQ(RaftRole::Follower, n1.role());
 }
 
 TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
@@ -496,7 +500,7 @@ TEST_F(RaftNodeTest, FiveNodesThreeVotesBecomesLeader) {
   EXPECT_EQ(RaftRole::Leader, n1.role());
 }
 
-TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
+TEST_F(RaftNodeTest, FiveNodesTwoVotesStepsBackToFollower) {
   LocalTransport transport;
   RaftNode n1("N1"), n2("N2"), n3("N3"), n4("N4"), n5("N5");
   // three peers already voted for other
@@ -520,7 +524,8 @@ TEST_F(RaftNodeTest, FiveNodesTwoVotesStaysCandidate) {
 
   ElectionResult r = n1.StartElection();
   EXPECT_EQ(2u, r.votes_received);  // self + n5
-  EXPECT_EQ(RaftRole::Candidate, n1.role());
+  // Lost round -> step back to Follower (see ThreeNodesOneVoteStepsBack...).
+  EXPECT_EQ(RaftRole::Follower, n1.role());
 }
 
 // --- OnHeartbeat tests ---

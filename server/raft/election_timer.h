@@ -15,7 +15,10 @@
 namespace dfly {
 
 // Implements ITimer with a fiber-based asynchronous wait.
-// The timeout is randomly chosen in [150, 300] ms per Raft spec.
+// The timeout is randomly chosen in [300, 1200] ms (Raft §5.2 randomization;
+// bounded BELOW by the leader's worst-case heartbeat cadence — heartbeat
+// interval + RPC timeout to an unreachable peer — so a single partitioned
+// node can never cause spurious elections among the healthy members).
 class ElectionTimer : public ITimer {
  public:
   ElectionTimer();
@@ -45,7 +48,7 @@ class ElectionTimer : public ITimer {
   std::atomic<bool> active_{false};
   std::atomic<uint64_t> epoch_{0};
   std::mt19937 rng_;
-  std::uniform_int_distribution<int> dist_{150, 300};
+  std::uniform_int_distribution<int> dist_{300, 1200};
 };
 
 }  // namespace dfly

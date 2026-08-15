@@ -22,6 +22,7 @@ class AcceptServer;
 namespace dfly {
 
 class PersistenceManager;
+class TcpTransport;
 
 class Service {
   friend class SnapshotFiber;
@@ -69,6 +70,11 @@ class Service {
 
   void RegisterCommands();
 
+  // Multi-node mode: parses --raft_peers, wires the TCP transport into the
+  // Raft node, adds peers to the cluster config, and registers the Raft RPC
+  // listener with the accept server. No-op in single-node mode.
+  bool InitRaftCluster(util::AcceptServer* acceptor);
+
   base::VarzValue::Map GetVarzStats();
 
   void ReplayAof();
@@ -79,6 +85,13 @@ class Service {
   PersistenceManager* persistence_manager_ = nullptr;
   bool replay_mode_ = false;
   SnapshotFiber snapshot_fiber_{this};
+
+  // Multi-node mode: TCP transport (the RPC listener is owned by the
+  // AcceptServer). Declared BEFORE engine_ so it is destroyed AFTER the
+  // Raft node (reverse declaration order) — the node's fibers reference the
+  // transport until Shutdown joins them.
+  std::unique_ptr<TcpTransport> raft_transport_;
+
   RaftEngine engine_;
 
   // Real INFO statistics (atomic: written from connection fibers on any

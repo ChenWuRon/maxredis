@@ -4,9 +4,11 @@
 
 #include "server/service/main_service.h"
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_split.h>
 #include <xxhash.h>
 
 #include "base/flags.h"
@@ -18,6 +20,8 @@ extern "C" {
 #include "server/protocol/conn_context.h"
 #include "server/service/debugcmd.h"
 #include "server/persistence/persistence_manager.h"
+#include "server/raft/tcp_transport.h"
+#include "util/accept_server.h"
 #include "util/metrics/metrics.h"
 #include "util/varz.h"
 
@@ -43,6 +47,16 @@ ABSL_FLAG(uint32_t, raft_fsync_interval_ms, 0,
           "(fully durable). >0 = batch fsync every interval: appends write to "
           "the page cache (kill -9 safe) and a background fiber fsyncs; a "
           "power failure may lose the last interval (AOF 'everysec' analogue).");
+ABSL_FLAG(std::string, raft_node_id, "",
+          "This node's Raft id. Required when --raft_peers is set.");
+ABSL_FLAG(std::string, raft_peers, "",
+          "Comma-separated initial cluster membership: id1:host1:port1,"
+          "id2:host2:port2,... where port is the peer's Raft RPC port "
+          "(--raft_port). Must include an entry for this node itself "
+          "(--raft_node_id). Empty = single-node mode.");
+ABSL_FLAG(uint32_t, raft_port, 0,
+          "Local port for the Raft RPC server (AppendEntries/Vote/Heartbeat). "
+          "Used when --raft_peers is set.");
 
 namespace dfly {
 
@@ -146,6 +160,14 @@ void Service::Init(util::AcceptServer* acceptor) {
     }
   }
 
+  // Multi-node mode: wire the TCP transport into the Raft node, register the
+  // peers from --raft_peers and start the Raft RPC listener. Must run before
+  // the bootstrap below (which is a no-op when peers exist).
+  if (!InitRaftCluster(acceptor)) {
+    LOG(WARNING) << "Raft: multi-node setup failed; continuing in degraded "
+                    "single-node mode";
+  }
+
   // Bootstrap a single-node Raft cluster into Leader state BEFORE replaying the
   // AOF: replayed writes go through SubmitCommand, which requires Leader. This
   // is a no-op if peers are configured. It makes writes (SET/DEL/EXPIRE) and
@@ -169,6 +191,109 @@ void Service::Init(util::AcceptServer* acceptor) {
   // already-durable writes; the WAL replay above is authoritative instead.
   if (!raft_persistence)
     ReplayAof();
+}
+
+bool Service::InitRaftCluster(util::AcceptServer* acceptor) {
+  using absl::GetFlag;
+
+  std::string peers_flag = GetFlag(FLAGS_raft_peers);
+  if (peers_flag.empty())
+    return true;  // single-node mode
+
+  std::string node_id = GetFlag(FLAGS_raft_node_id);
+  uint32_t raft_port = GetFlag(FLAGS_raft_port);
+  if (node_id.empty()) {
+    LOG(ERROR) << "Raft: --raft_peers is set but --raft_node_id is empty";
+    return false;
+  }
+  if (raft_port == 0) {
+    LOG(ERROR) << "Raft: --raft_peers is set but --raft_port is 0";
+    return false;
+  }
+
+  // Parse "id1:host1:port1,id2:host2:port2,...". Id is up to the first ':',
+  // port is after the last ':' (supports hostnames and IPv4 literals).
+  absl::flat_hash_map<NodeId, TcpPeer> peers;
+  for (std::string_view entry : absl::StrSplit(peers_flag, ',')) {
+    if (entry.empty())
+      continue;
+    size_t first = entry.find(':');
+    size_t last = entry.rfind(':');
+    if (first == std::string_view::npos || first == last ||
+        last + 1 >= entry.size()) {
+      LOG(ERROR) << "Raft: malformed --raft_peers entry '" << entry
+                 << "' (expected id:host:port)";
+      return false;
+    }
+    TcpPeer peer;
+    peer.host = std::string(entry.substr(first + 1, last - first - 1));
+    uint32_t port = 0;
+    if (!absl::SimpleAtoi(entry.substr(last + 1), &port) || port == 0 ||
+        port > 65535) {
+      LOG(ERROR) << "Raft: invalid port in --raft_peers entry '" << entry << "'";
+      return false;
+    }
+    peer.port = static_cast<uint16_t>(port);
+    NodeId id = std::string(entry.substr(0, first));
+    if (!peers.emplace(id, peer).second) {
+      LOG(WARNING) << "Raft: duplicate peer id '" << id << "' in --raft_peers";
+    }
+  }
+
+  auto self_it = peers.find(node_id);
+  if (self_it == peers.end()) {
+    LOG(ERROR) << "Raft: --raft_node_id '" << node_id
+               << "' is not present in --raft_peers";
+    return false;
+  }
+  // Keep the self entry in the map (harmless: RPCs to self are never issued —
+  // GetPeerIdsLocked excludes the local id), but validate the port matches
+  // --raft_port so a misconfigured cluster fails fast.
+  if (self_it->second.port != raft_port) {
+    LOG(WARNING) << "Raft: self entry port " << self_it->second.port
+                 << " != --raft_port " << raft_port << "; using --raft_port";
+    self_it->second.port = static_cast<uint16_t>(raft_port);
+  }
+
+  raft_transport_ = std::make_unique<TcpTransport>();
+  for (const auto& [id, peer] : peers) {
+    if (id != node_id) {
+      raft_transport_->SetPeerEndpoint(id, peer);
+      engine_.group().node().AddPeer(id);
+    }
+  }
+  engine_.group().node().SetNodeId(node_id);
+  engine_.group().node().SetTransport(raft_transport_.get());
+
+  // Kick the consensus state machine into Follower so the election timer
+  // starts (it is started lazily on the first role transition). Runs on
+  // proactor 0 — the node's consensus home thread — not the calling thread.
+  pp_.AwaitBrief([&](uint32_t index, ProactorBase*) {
+    if (index == 0)
+      engine_.group().node().BecomeFollower(engine_.group().node().term());
+  });
+
+  // RPC server: routes an incoming request's group id to the local node.
+  // (Single group in this deployment; a multi-group deployment registers a
+  // RaftGroupManager-based resolver instead.) The AcceptServer takes
+  // ownership of the listener and deletes it after the connection fibers
+  // have drained — never after Service destruction.
+  auto* rpc_listener = RaftRpcServer::CreateListener(
+      [this](GroupId gid) -> RaftNode* {
+        return gid == engine_.group().group_id() ? &engine_.group().node()
+                                                 : nullptr;
+      });
+  std::error_code ec = acceptor->AddListener(nullptr, static_cast<uint16_t>(raft_port),
+                                             rpc_listener);
+  if (ec) {
+    LOG(ERROR) << "Raft: could not bind RPC listener on port " << raft_port
+               << ": " << ec.message();
+    return false;
+  }
+
+  LOG(INFO) << "Raft: multi-node mode — id=" << node_id << " rpc_port=" << raft_port
+            << " peers=" << (peers.size() - 1);
+  return true;
 }
 
 void Service::Shutdown() {
