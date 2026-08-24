@@ -57,7 +57,13 @@ class SegmentLogStorage : public ILogStorage {
   const LogEntry* Get(LogIndex index) const final;
   Term GetTerm(LogIndex index) const final;
   void SetSnapshotAnchor(LogIndex index, Term term) final;
-  LogIndex Append(LogEntry entry) final;
+  LogIndex Append(LogEntry entry, bool flush = true) final;
+
+  // Flush (fsync) the WAL, respecting the durability policy. No-op in
+  // everysec mode (a background fiber owns the periodic fsync) and in
+  // in-memory mode. Callers use this to move the fsync OUT of the consensus
+  // lock: append with flush=false, then Persist() after releasing mutex_.
+  void Persist() override;
   std::vector<LogEntry> GetRange(LogIndex start, size_t limit = 0) const final;
   void TruncateFrom(LogIndex new_last) final;
   bool CompactUpTo(LogIndex index) final;

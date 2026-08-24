@@ -1,7 +1,7 @@
 // Copyright 2026, The MaxRedis Authors.
 // See LICENSE for licensing terms.
 //
-// Binary wire codec for Raft RPCs over TCP.
+// Wire codec for Raft RPCs over TCP.
 //
 // Every message is wrapped in a frame:
 //
@@ -9,6 +9,11 @@
 //   | magic  "RF01"  | type |  seq  | payload_len LE | payload | crc32c LE  |
 //   |     (4 bytes)  | (1B) | (4B)  |    (4 bytes)   |         |  (4 bytes) |
 //   +----------------+------+-------+----------------+---------+------------+
+//
+// The payload is a serialized protocol-buffer message (see
+// server/raft/proto/raft_rpc.proto) — field-level versioning, binary safety
+// and unknown-field tolerance come from protobuf; the frame provides the
+// transport-level guarantees protobuf does not (see below).
 //
 // seq is a per-connection request sequence number (client-assigned, server-
 // echoed). It lets the client REUSE a pooled connection after an RPC timeout:
@@ -23,8 +28,7 @@
 // CRC does not match is rejected (drop the connection) — same corruption
 // guarantee the segmented WAL provides.
 //
-// All multi-byte integers are little-endian. Strings are length-prefixed
-// (uint32 LE). Vectors are count-prefixed (uint32 LE).
+// All multi-byte header integers are little-endian.
 
 #pragma once
 
@@ -61,58 +65,6 @@ inline constexpr char kRpcFrameMagic[] = "RF01";
 inline constexpr size_t kRpcFrameHeaderSize = 4 + 1 + 4 + 4;  // magic + type + seq + len
 inline constexpr size_t kRpcFrameCrcSize = 4;
 
-// --- primitive (de)serialization helpers --------------------------------
-
-// Appends little-endian primitives / length-prefixed strings to |out|.
-class RaftEncoder {
- public:
-  void U8(uint8_t v);
-  void U32(uint32_t v);
-  void U64(uint64_t v);
-  void Bool(bool v);
-  void Str(std::string_view s);
-  void Bytes(std::string_view s) {
-    Str(s);
-  }
-
-  const std::string& data() const {
-    return buf_;
-  }
-
-  std::string Take() {
-    return std::move(buf_);
-  }
-
- private:
-  std::string buf_;
-};
-
-// Bounds-checked reader over a serialized payload. All Read* methods return
-// false on truncated/malformed input, leaving *out untouched on failure.
-class RaftDecoder {
- public:
-  explicit RaftDecoder(std::string_view data) : data_(data) {
-  }
-
-  bool U8(uint8_t* out);
-  bool U32(uint32_t* out);
-  bool U64(uint64_t* out);
-  bool Bool(bool* out);
-  bool Str(std::string_view* out);
-  bool Str(std::string* out);
-
-  // True if the whole buffer was consumed.
-  bool AtEnd() const {
-    return pos_ == data_.size();
-  }
-
- private:
-  bool Take(size_t n, std::string_view* out);
-
-  std::string_view data_;
-  size_t pos_ = 0;
-};
-
 // --- frame (de)serialization --------------------------------------------
 
 // Encodes |payload| into a complete CRC-protected frame for |type| with the
@@ -125,6 +77,12 @@ bool ParseRpcFrame(std::string_view frame, RpcType* type, uint32_t* seq,
                    std::string_view* payload);
 
 // --- payload (de)serialization ------------------------------------------
+//
+// Each Serialize* call encodes the C++ struct into a protobuf message
+// (raft_rpc.proto) and returns its wire bytes. Parse* decodes the protobuf
+// payload back into the struct and returns false on empty, truncated or
+// malformed input (matching the bounds-checked behavior of the previous
+// hand-rolled codec).
 
 std::string SerializeAppendEntriesRequest(const AppendEntriesRequest& req);
 bool ParseAppendEntriesRequest(std::string_view payload, AppendEntriesRequest* req);
@@ -155,9 +113,5 @@ std::string SerializeTimeoutNowRequest(const TimeoutNowRequest& req);
 bool ParseTimeoutNowRequest(std::string_view payload, TimeoutNowRequest* req);
 std::string SerializeTimeoutNowResponse(const TimeoutNowResponse& rsp);
 bool ParseTimeoutNowResponse(std::string_view payload, TimeoutNowResponse* rsp);
-
-// Shared LogEntry encoding (AppendEntriesRequest::entries).
-void SerializeLogEntry(RaftEncoder* enc, const LogEntry& e);
-bool ParseLogEntry(RaftDecoder* dec, LogEntry* e);
 
 }  // namespace dfly

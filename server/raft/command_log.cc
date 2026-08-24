@@ -57,7 +57,7 @@ void CommandLog::SetSnapshotAnchor(LogIndex index, Term term) {
   anchor_.term = term;
 }
 
-LogIndex CommandLog::Append(LogEntry entry) {
+LogIndex CommandLog::Append(LogEntry entry, bool flush) {
   entry.index = LastIndex() + 1;
   entries_.push_back(std::move(entry));
   return entry.index;

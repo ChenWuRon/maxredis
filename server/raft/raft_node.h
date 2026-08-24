@@ -68,6 +68,18 @@ namespace dfly {
 
 class RaftSnapshotManager;
 
+// Per-call synchronization for the group-commit path. SubmitEntry appends the
+// entry under the consensus lock, then either becomes the batch coordinator
+// (doing one Persist + one ReplicateLog + one apply sweep for the whole batch)
+// or joins the in-flight batch and waits here. The coordinator fulfills `done`.
+struct RaftWaiter {
+  LogIndex idx = 0;
+  util::fb2::Mutex mu;
+  util::fb2::CondVar cv;
+  ApplyResult res;
+  bool done = false;
+};
+
 class RaftNode {
  public:
   explicit RaftNode(NodeId node_id = "");
@@ -279,6 +291,13 @@ class RaftNode {
   //   first are already caught up, so the quorum condition excludes nobody.
   ApplyResult ReplicateLog(bool low_latency = false);
 
+  // Group-commit coordinator: flushes the WAL once (group fsync), drives a
+  // single replication round for the whole in-flight batch, applies committed
+  // entries, then fulfills every waiter in group_waiters_ (including the
+  // caller). Runs WITHOUT holding group_mu_ during the expensive replication so
+  // it cannot deadlock with the consensus lock or heartbeat fiber.
+  void CoordinatorCommit();
+
   // Advances commit_index when a majority of peers have replicated an entry.
   // Applies the Figure 8 guard (§5.4.2): only entries from the CURRENT term
   // may advance commit_index directly.
@@ -417,6 +436,13 @@ class RaftNode {
 
   Transport* transport_ = nullptr;
   PeerManager peer_manager_{&cluster_config_};
+
+  // --- Group commit (P1-b) ---
+  // Separate lock from mutex_ to avoid holding the consensus lock across fsync /
+  // replication. Lock order is always: (briefly mutex_) -> group_mu_ -> waiter.mu.
+  util::fb2::Mutex group_mu_;
+  bool group_active_ = false;
+  std::vector<RaftWaiter*> group_waiters_;
 
   ILogStorage* log_storage_ = nullptr;
   IStateMachine* state_machine_ = nullptr;

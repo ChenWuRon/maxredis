@@ -556,9 +556,26 @@ A：当前实现选举/心跳/复制都是锁外**串行**发送（raft_node.cc 
 
 **先说三个"不是"**：不是生产压测、不是多连接并发、不是持久化全开（无 WAL fsync）。**不能说"maxredis 性能是 4K QPS"**，只能说"该固定口径下测得这些结果"。另注意：INCR 数字与当前源码注册表不符（见下文），被追问时以源码为准。
 
+### redis-benchmark 实测（2026-08-17，多连接口径）
+
+**口径**：`redis-benchmark -p 6380 -t ping,get,set -n 30000 --threads 1 --precision 3`，50 并发连接、keep-alive、3 字节 payload；服务端与上文同配置（`--port=6380 --conn_threads=2`、无 raft_dir）。benchmark 启动时打出 `WARNING: Could not fetch server CONFIG`——服务端未实现 CONFIG GET，redis-benchmark 的探测失败，不影响压测数据本身。
+
+| 命令 | QPS | avg | P50 | P99 | max |
+|---|---|---|---|---|---|
+| PING_INLINE | 40,053 | 1.20ms | 1.15ms | 2.38ms | 18.2ms |
+| PING_MBULK | 35,971 | 1.34ms | 1.32ms | 1.74ms | 9.2ms |
+| SET | 5,292 | 9.43ms | 3.45ms | 112.7ms | 598ms |
+| GET | 21,292 | 2.31ms | 2.41ms | 3.83ms | 14.7ms |
+
+**和单连接口径对照**：PING 8.6K→40K、GET 4.7K→21.3K、SET 4.2K→5.3K。GET 提升 4.5 倍，直接验证了"单连接测的是 RTT 延迟下限、不是吞吐上限"——多连接把跨 shard 投递 + 回包流水线填满了。PING 40K 与存储引擎文档里的"PING ~40K"一致（客户端不同但都到 4 万量级，说明这是服务端 PING 路径的真实上限）。
+
+**SET 长尾（诚实说"未定位"）**：SET P50 只有 3.45ms，但 P99 112.7ms、max 598ms，长尾极重。假设：50 个并发写全部打到同一个 leader 写路径（WAL flush + AOF append 的串行化点），排队放大了尾部延迟。**没做 perf 定位前不下确定结论**——面试被问就说"写路径存在长尾，怀疑串行化点在 WAL/AOF 刷盘，已记录待定位"。
+
+**面试报数口径升级**：现在有两组实测——单连接延迟口径（SET P50 241μs / GET 4.7K）和多连接吞吐口径（PING 40K / GET 21.3K / SET 5.3K + 长尾未定位）。报数字先报口径："redis-benchmark 50 并发下 PING 40K、GET 21K、SET 5.3K；SET 长尾待定位；单连接串行下 SET P50 241μs。"
+
 ### 为什么 PING 比 SET 快？
 
-PING 不进 Raft、不碰 shard（直接回 PONG），纯"解析 + 回包"，是协议栈裸开销上限 ≈ 8.6K。SET 多了：WAL append + 复制路径 + 状态机 apply + AOF 记录，约慢一倍 → 4.2K。
+PING 不进 Raft、不碰 shard（直接回 PONG），纯"解析 + 回包"。**单连接口径下** 8.6K 是"Python 客户端 + RTT"的链路上限；换成 redis-benchmark 50 并发后 PING 到 40K（见上表），那才是协议栈裸开销的真实上限。SET 多了：WAL append + 复制路径 + 状态机 apply + AOF 记录，单连接口径下约慢一倍 → 4.2K。
 
 ### 为什么 INCR 比 SET 快（7.9K vs 4.1K）？
 
@@ -578,11 +595,12 @@ EXPIRE 走 Raft 写路径 + TTL 数据结构的更新，比 SET 多一次过期�
 
 ### 单连接 benchmark 的最大问题
 
-它测的是 **RTT 链路的延迟下限**，不是吞吐上限。服务端实际并发能力完全没被压出来（单连接时服务端大部分时间在等网络）。
+它测的是 **RTT 链路的延迟下限**，不是吞吐上限。服务端实际并发能力完全没被压出来（单连接时服务端大部分时间在等网络）。**2026-08-17 用 redis-benchmark 50 并发实测验证了这一点**：同一服务端配置下 GET 4.7K→21.3K、PING 8.6K→40K，只有 SET（受写路径串行化点限制）基本没涨还出现重长尾。
 
 ### 条件变化推演（面试官必问，按模型回答）
 
-- **100/1000 连接**：QPS 会大幅上升直到 CPU 打满；2 核上 io_uring + fiber 的优势开始显现（每连接一个 fiber，无线程爆炸）。但**没有实测数字，不给具体数**。
+- **50 连接（已实测）**：GET 4.7K→21.3K、PING 8.6K→40K，SET 仅 5.3K 且 P99 112ms——见上文 redis-benchmark 一节。
+- **100/1000 连接**：QPS 会继续上升直到 CPU 打满；2 核上 io_uring + fiber 的优势开始显现（每连接一个 fiber，无线程爆炸）。但**没有实测数字，不给具体数**。
 - **换 C++ 客户端**：客户端不再是瓶颈，P50 应该能压到 50μs 以内级别，QPS 由服务端 CPU 决定。同样不编数字。
 - **开 WAL fsync（always）**：2 核 VM 磁盘 fsync 若 ~0.5ms，SET 会掉到 ~1-2K 甚至更低，P99 会被 fsync 尾部拖高——**持久化成本直接可见**。
 - **3 节点 Raft**：写路径增加 1 次 RPC RTT（本地回环或真实网络）；网络 RTT 1ms 时，SET 延迟下限就是 1ms+，QPS 掉到百级。**跨机房（10ms+ RTT）单组 Raft 写入 QPS 上限 ≈ 100/RTT 数量级**——这是 Raft 的架构级限制，只能靠 batch/多 group 缓解。

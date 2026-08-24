@@ -6,9 +6,12 @@
 
 #include <cstring>
 
+#include "raft_rpc.pb.h"
 #include "server/raft/crc32.h"
 
 namespace dfly {
+
+namespace pb = dfly::raft;
 
 namespace {
 
@@ -19,97 +22,17 @@ void AppendU32LE(std::string* s, uint32_t v) {
   s->push_back(static_cast<char>((v >> 24) & 0xFF));
 }
 
-void AppendU64LE(std::string* s, uint64_t v) {
-  AppendU32LE(s, static_cast<uint32_t>(v & 0xFFFFFFFF));
-  AppendU32LE(s, static_cast<uint32_t>(v >> 32));
+// Rejects empty payloads explicitly: protobuf would happily parse them as
+// all-default messages, but a real RPC always carries at least one field.
+// Also guards against size_t -> int truncation in ParseFromArray (frames are
+// bounded by the TCP layer, but LocalTransport callers may pass anything).
+bool ParseMessage(std::string_view payload, google::protobuf::MessageLite* msg) {
+  if (payload.empty() || payload.size() > static_cast<size_t>(INT32_MAX))
+    return false;
+  return msg->ParseFromArray(payload.data(), static_cast<int>(payload.size()));
 }
 
 }  // namespace
-
-// --- RaftEncoder --------------------------------------------------------
-
-void RaftEncoder::U8(uint8_t v) {
-  buf_.push_back(static_cast<char>(v));
-}
-
-void RaftEncoder::U32(uint32_t v) {
-  AppendU32LE(&buf_, v);
-}
-
-void RaftEncoder::U64(uint64_t v) {
-  AppendU64LE(&buf_, v);
-}
-
-void RaftEncoder::Bool(bool v) {
-  buf_.push_back(v ? 1 : 0);
-}
-
-void RaftEncoder::Str(std::string_view s) {
-  U32(static_cast<uint32_t>(s.size()));
-  buf_.append(s.data(), s.size());
-}
-
-// --- RaftDecoder --------------------------------------------------------
-
-bool RaftDecoder::Take(size_t n, std::string_view* out) {
-  if (n > data_.size() - pos_)
-    return false;
-  *out = data_.substr(pos_, n);
-  pos_ += n;
-  return true;
-}
-
-bool RaftDecoder::U8(uint8_t* out) {
-  std::string_view chunk;
-  if (!Take(1, &chunk))
-    return false;
-  *out = static_cast<uint8_t>(chunk[0]);
-  return true;
-}
-
-bool RaftDecoder::U32(uint32_t* out) {
-  std::string_view chunk;
-  if (!Take(4, &chunk))
-    return false;
-  *out = static_cast<uint32_t>(static_cast<uint8_t>(chunk[0])) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(chunk[1])) << 8) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(chunk[2])) << 16) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(chunk[3])) << 24);
-  return true;
-}
-
-bool RaftDecoder::U64(uint64_t* out) {
-  uint32_t lo = 0, hi = 0;
-  if (!U32(&lo) || !U32(&hi))
-    return false;
-  *out = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
-  return true;
-}
-
-bool RaftDecoder::Bool(bool* out) {
-  uint8_t v = 0;
-  if (!U8(&v))
-    return false;
-  *out = v != 0;
-  return true;
-}
-
-bool RaftDecoder::Str(std::string_view* out) {
-  uint32_t len = 0;
-  if (!U32(&len))
-    return false;
-  if (!Take(len, out))
-    return false;
-  return true;
-}
-
-bool RaftDecoder::Str(std::string* out) {
-  std::string_view v;
-  if (!Str(&v))
-    return false;
-  out->assign(v.data(), v.size());
-  return true;
-}
 
 // --- frames -------------------------------------------------------------
 
@@ -166,248 +89,295 @@ bool ParseRpcFrame(std::string_view frame, RpcType* type, uint32_t* seq,
 
 // --- AppendEntries ------------------------------------------------------
 
-void SerializeLogEntry(RaftEncoder* enc, const LogEntry& e) {
-  enc->U64(e.term);
-  enc->U64(e.index);
-  enc->Str(e.command);
-}
-
-bool ParseLogEntry(RaftDecoder* dec, LogEntry* e) {
-  if (!dec->U64(&e->term) || !dec->U64(&e->index) || !dec->Str(&e->command))
-    return false;
-  return true;
-}
-
 std::string SerializeAppendEntriesRequest(const AppendEntriesRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.leader_id);
-  enc.U64(req.prev_log_index);
-  enc.U64(req.prev_log_term);
-  enc.U32(static_cast<uint32_t>(req.entries.size()));
-  for (const LogEntry& e : req.entries)
-    SerializeLogEntry(&enc, e);
-  enc.U64(req.leader_commit);
-  return enc.Take();
+  pb::AppendEntriesRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_leader_id(req.leader_id);
+  msg.set_prev_log_index(req.prev_log_index);
+  msg.set_prev_log_term(req.prev_log_term);
+  for (const LogEntry& e : req.entries) {
+    pb::LogEntry* pb_entry = msg.add_entries();
+    pb_entry->set_term(e.term);
+    pb_entry->set_index(e.index);
+    pb_entry->set_command(e.command);
+  }
+  msg.set_leader_commit(req.leader_commit);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseAppendEntriesRequest(std::string_view payload, AppendEntriesRequest* req) {
-  RaftDecoder dec(payload);
-  uint32_t count = 0;
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->leader_id) || !dec.U64(&req->prev_log_index) ||
-      !dec.U64(&req->prev_log_term) || !dec.U32(&count))
+  pb::AppendEntriesRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  req->entries.resize(count);
-  for (uint32_t i = 0; i < count; ++i) {
-    if (!ParseLogEntry(&dec, &req->entries[i]))
-      return false;
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->leader_id = msg.leader_id();
+  req->prev_log_index = msg.prev_log_index();
+  req->prev_log_term = msg.prev_log_term();
+  req->entries.resize(msg.entries_size());
+  for (int i = 0; i < msg.entries_size(); ++i) {
+    const pb::LogEntry& e = msg.entries(i);
+    req->entries[i] = LogEntry(e.term(), e.index(), e.command());
   }
-  if (!dec.U64(&req->leader_commit))
-    return false;
-  return dec.AtEnd();
+  req->leader_commit = msg.leader_commit();
+  return true;
 }
 
 std::string SerializeAppendEntriesResponse(const AppendEntriesResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.success);
-  enc.U64(rsp.last_log_index);
-  return enc.Take();
+  pb::AppendEntriesResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_success(rsp.success);
+  msg.set_last_log_index(rsp.last_log_index);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseAppendEntriesResponse(std::string_view payload, AppendEntriesResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) || !dec.Bool(&rsp->success) ||
-      !dec.U64(&rsp->last_log_index))
+  pb::AppendEntriesResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->success = msg.success();
+  rsp->last_log_index = msg.last_log_index();
+  return true;
 }
 
 // --- Vote ---------------------------------------------------------------
 
 std::string SerializeVoteRequest(const VoteRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.candidate_id);
-  enc.U64(req.last_log_index);
-  enc.U64(req.last_log_term);
-  return enc.Take();
+  pb::VoteRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_candidate_id(req.candidate_id);
+  msg.set_last_log_index(req.last_log_index);
+  msg.set_last_log_term(req.last_log_term);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseVoteRequest(std::string_view payload, VoteRequest* req) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->candidate_id) || !dec.U64(&req->last_log_index) ||
-      !dec.U64(&req->last_log_term))
+  pb::VoteRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->candidate_id = msg.candidate_id();
+  req->last_log_index = msg.last_log_index();
+  req->last_log_term = msg.last_log_term();
+  return true;
 }
 
 std::string SerializeVoteResponse(const VoteResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.vote_granted);
-  return enc.Take();
+  pb::VoteResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_vote_granted(rsp.vote_granted);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseVoteResponse(std::string_view payload, VoteResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) ||
-      !dec.Bool(&rsp->vote_granted))
+  pb::VoteResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->vote_granted = msg.vote_granted();
+  return true;
 }
 
 // --- Heartbeat ----------------------------------------------------------
 
 std::string SerializeHeartbeatRequest(const HeartbeatRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.leader_id);
-  enc.U64(req.leader_commit);
-  return enc.Take();
+  pb::HeartbeatRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_leader_id(req.leader_id);
+  msg.set_leader_commit(req.leader_commit);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseHeartbeatRequest(std::string_view payload, HeartbeatRequest* req) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->leader_id) || !dec.U64(&req->leader_commit))
+  pb::HeartbeatRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->leader_id = msg.leader_id();
+  req->leader_commit = msg.leader_commit();
+  return true;
 }
 
 std::string SerializeHeartbeatResponse(const HeartbeatResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.success);
-  enc.U64(rsp.last_log_index);
-  return enc.Take();
+  pb::HeartbeatResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_success(rsp.success);
+  msg.set_last_log_index(rsp.last_log_index);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseHeartbeatResponse(std::string_view payload, HeartbeatResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) ||
-      !dec.Bool(&rsp->success) || !dec.U64(&rsp->last_log_index))
+  pb::HeartbeatResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->success = msg.success();
+  rsp->last_log_index = msg.last_log_index();
+  return true;
 }
 
 // --- InstallSnapshot ----------------------------------------------------
 
 std::string SerializeInstallSnapshotRequest(const InstallSnapshotRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.leader_id);
-  enc.U64(req.last_included_index);
-  enc.U64(req.last_included_term);
-  enc.U64(req.offset);
-  enc.Bool(req.done);
-  enc.Str(req.data);
-  return enc.Take();
+  pb::InstallSnapshotRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_leader_id(req.leader_id);
+  msg.set_last_included_index(req.last_included_index);
+  msg.set_last_included_term(req.last_included_term);
+  msg.set_offset(req.offset);
+  msg.set_done(req.done);
+  msg.set_data(req.data);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseInstallSnapshotRequest(std::string_view payload, InstallSnapshotRequest* req) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->leader_id) || !dec.U64(&req->last_included_index) ||
-      !dec.U64(&req->last_included_term) || !dec.U64(&req->offset) ||
-      !dec.Bool(&req->done) || !dec.Str(&req->data))
+  pb::InstallSnapshotRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->leader_id = msg.leader_id();
+  req->last_included_index = msg.last_included_index();
+  req->last_included_term = msg.last_included_term();
+  req->offset = msg.offset();
+  req->done = msg.done();
+  req->data = msg.data();
+  return true;
 }
 
 std::string SerializeInstallSnapshotResponse(const InstallSnapshotResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.success);
-  return enc.Take();
+  pb::InstallSnapshotResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_success(rsp.success);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseInstallSnapshotResponse(std::string_view payload, InstallSnapshotResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) ||
-      !dec.Bool(&rsp->success))
+  pb::InstallSnapshotResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->success = msg.success();
+  return true;
 }
 
 // --- ReadIndex ----------------------------------------------------------
 
 std::string SerializeReadIndexRequest(const ReadIndexRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.leader_id);
-  enc.U64(req.request_id);
-  return enc.Take();
+  pb::ReadIndexRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_leader_id(req.leader_id);
+  msg.set_request_id(req.request_id);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseReadIndexRequest(std::string_view payload, ReadIndexRequest* req) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->leader_id) || !dec.U64(&req->request_id))
+  pb::ReadIndexRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->leader_id = msg.leader_id();
+  req->request_id = msg.request_id();
+  return true;
 }
 
 std::string SerializeReadIndexResponse(const ReadIndexResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.success);
-  enc.U64(rsp.commit_index);
-  return enc.Take();
+  pb::ReadIndexResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_success(rsp.success);
+  msg.set_commit_index(rsp.commit_index);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseReadIndexResponse(std::string_view payload, ReadIndexResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) ||
-      !dec.Bool(&rsp->success) || !dec.U64(&rsp->commit_index))
+  pb::ReadIndexResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->success = msg.success();
+  rsp->commit_index = msg.commit_index();
+  return true;
 }
 
 // --- TimeoutNow ---------------------------------------------------------
 
 std::string SerializeTimeoutNowRequest(const TimeoutNowRequest& req) {
-  RaftEncoder enc;
-  enc.U32(req.group_id);
-  enc.U64(req.term);
-  enc.Str(req.leader_id);
-  return enc.Take();
+  pb::TimeoutNowRequest msg;
+  msg.set_group_id(req.group_id);
+  msg.set_term(req.term);
+  msg.set_leader_id(req.leader_id);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseTimeoutNowRequest(std::string_view payload, TimeoutNowRequest* req) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&req->group_id) || !dec.U64(&req->term) ||
-      !dec.Str(&req->leader_id))
+  pb::TimeoutNowRequest msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  req->group_id = msg.group_id();
+  req->term = msg.term();
+  req->leader_id = msg.leader_id();
+  return true;
 }
 
 std::string SerializeTimeoutNowResponse(const TimeoutNowResponse& rsp) {
-  RaftEncoder enc;
-  enc.U32(rsp.group_id);
-  enc.U64(rsp.term);
-  enc.Bool(rsp.accepted);
-  return enc.Take();
+  pb::TimeoutNowResponse msg;
+  msg.set_group_id(rsp.group_id);
+  msg.set_term(rsp.term);
+  msg.set_accepted(rsp.accepted);
+  std::string out;
+  msg.SerializeToString(&out);
+  return out;
 }
 
 bool ParseTimeoutNowResponse(std::string_view payload, TimeoutNowResponse* rsp) {
-  RaftDecoder dec(payload);
-  if (!dec.U32(&rsp->group_id) || !dec.U64(&rsp->term) ||
-      !dec.Bool(&rsp->accepted))
+  pb::TimeoutNowResponse msg;
+  if (!ParseMessage(payload, &msg))
     return false;
-  return dec.AtEnd();
+  rsp->group_id = msg.group_id();
+  rsp->term = msg.term();
+  rsp->accepted = msg.accepted();
+  return true;
 }
 
 }  // namespace dfly

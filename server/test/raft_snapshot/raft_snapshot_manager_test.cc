@@ -79,7 +79,7 @@ class TestLogStorage : public ILogStorage {
     // Synthetic log: every index up to last_index carries last_term.
     return (index > 0 && index <= last_index) ? last_term : 0;
   }
-  LogIndex Append(LogEntry) override { return 0; }
+  LogIndex Append(LogEntry, bool = true) override { return 0; }
   std::vector<LogEntry> GetRange(LogIndex, size_t) const override { return {}; }
   void TruncateFrom(LogIndex) override {}
   bool CompactUpTo(LogIndex) override { return true; }

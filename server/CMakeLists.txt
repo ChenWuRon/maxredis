@@ -3,18 +3,35 @@ add_subdirectory(persistence)
 add_executable(midi-redis service/dfly_main.cc)
 cxx_link(midi-redis base dragonfly_lib persistence_lib TRDP::mimalloc2)
 
+# Raft RPC payloads are protobuf messages (raft/proto/raft_rpc.proto).
+# protoc runs at build time; outputs land in the server build directory.
+set(RAFT_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/raft/proto)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/raft_rpc.pb.cc
+         ${CMAKE_CURRENT_BINARY_DIR}/raft_rpc.pb.h
+  COMMAND protobuf::protoc
+  ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR} -I ${RAFT_PROTO_DIR}
+       ${RAFT_PROTO_DIR}/raft_rpc.proto
+  DEPENDS protobuf::protoc ${RAFT_PROTO_DIR}/raft_rpc.proto
+  COMMENT "Generating raft_rpc.pb.{cc,h} from raft_rpc.proto"
+  VERBATIM)
+
 add_library(dragonfly_lib 
             protocol/conn_context.cc protocol/redis_parser.cc protocol/memcache_parser.cc
             protocol/resp_expr.cc protocol/reply_builder.cc
             raft/apply_progress.cc raft/command_log.cc raft/command_encoder.cc raft/election_timer.cc raft/file_log_storage.cc raft/local_transport.cc raft/manifest.cc raft/peer_manager.cc raft/raft_codec.cc raft/raft_engine.cc raft/raft_group.cc raft/raft_group_manager.cc raft/raft_node.cc raft/raft_storage.cc raft/segment_log_storage.cc             raft/snapshot_loader.cc raft/snapshot_manager.cc raft/snapshot_meta.cc raft/snapshot_receiver.cc raft/snapshot_sender.cc raft/snapshot_writer.cc raft/tcp_transport.cc raft/wal_writer.cc
+            ${CMAKE_CURRENT_BINARY_DIR}/raft_rpc.pb.cc
             service/command_registry.cc service/command_serializer.cc service/config_flags.cc
             service/debugcmd.cc service/dragonfly_connection.cc service/dragonfly_listener.cc
             service/main_service.cc service/snapshot_fiber.cc service/state_serializer.cc
             state_machine/kv_state_machine.cc
             storage/common_types.cc storage/db_slice.cc storage/engine_shard_set.cc)
 
+# raft_codec.cc includes the generated raft_rpc.pb.h from the build dir.
+add_include(dragonfly_lib ${CMAKE_CURRENT_BINARY_DIR})
+
 cxx_link(dragonfly_lib 
-         fibers2 strings_lib http_server_lib tls_lib redis_dict)
+         fibers2 strings_lib http_server_lib tls_lib redis_dict protobuf::libprotobuf)
 
 add_library(dfly_test_lib test/test_utils.cc)
 cxx_link(dfly_test_lib dragonfly_lib gtest_main_ext)
@@ -49,6 +66,8 @@ cxx_test(test/raft_rpc/heartbeat_rpc_test dragonfly_lib LABELS DFLY)
 cxx_test(test/raft_rpc/install_snapshot_rpc_test dragonfly_lib LABELS DFLY)
 cxx_test(test/raft_rpc/raft_types_test dragonfly_lib LABELS DFLY)
 cxx_test(test/raft_rpc/raft_codec_test dragonfly_lib LABELS DFLY)
+add_include(raft_codec_test ${CMAKE_CURRENT_BINARY_DIR})
+cxx_test(test/raft_rpc/transport_test dragonfly_lib LABELS DFLY)
 
 # --- Raft 日志 ---
 cxx_test(test/raft_log/command_log_test dragonfly_lib LABELS DFLY)

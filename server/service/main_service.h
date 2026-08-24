@@ -84,6 +84,10 @@ class Service {
   util::ProactorPool& pp_;
   PersistenceManager* persistence_manager_ = nullptr;
   bool replay_mode_ = false;
+  // True when --raft_dir is set: the Raft WAL is the authoritative durable
+  // write path, so the server-level AOF/snapshot persistence is redundant and
+  // must not be written (it would be discarded on replay anyway).
+  bool raft_persistence_ = false;
   SnapshotFiber snapshot_fiber_{this};
 
   // Multi-node mode: TCP transport (the RPC listener is owned by the

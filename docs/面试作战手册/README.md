@@ -486,7 +486,8 @@ kill -9 (强杀)
 
 ## 14. TCP Transport 【L1】
 
-- **为什么这么设计**：自定义帧协议 `magic(4)+type(1)+seq(4)+len(4)+payload+CRC32`；每(线程,peer) 一条长连接（thread_local 池，tcp_transport.cc:66-69），锁串行化该 peer 的整轮来回。
-- **为什么不用 gRPC**：gRPC 每 RPC 开销（HTTP/2 帧、流控、多线程池）对 50ms 心跳 × 数百节点不划算；帧协议 13 字节头 + 一次 syscall。诚实补充：面试先讲功能的取舍，再讲本项目为什么自制——这是验证过吞吐的取舍。
-- **缺陷（L4）**：a) 同步阻塞式 RPC 被锁串行——同一 peer 的 AppendEntries 与 Heartbeat 无法并行，大日志下心跳被拖；b) 帧头长度字段手写小端（:179-183）无静态断言。
+- **为什么这么设计**：帧协议 `magic(4)+type(1)+seq(4)+len(4)+payload+CRC32`，payload 用 **Protobuf**（`server/raft/proto/raft_rpc.proto` 定义全部 12 种 RPC 消息：AppendEntries/Vote/Heartbeat/InstallSnapshot/ReadIndex/TimeoutNow，字段级版本兼容 + 未知字段容忍）；每(线程,peer) 一条长连接（thread_local 池，tcp_transport.cc:66-69），锁串行化该 peer 的整轮来回。
+- **为什么不用 gRPC 但用 Protobuf**：gRPC 每 RPC 开销（HTTP/2 帧、流控、多线程池）对 50ms 心跳 × 数百节点不划算；帧协议 13 字节头 + 一次 syscall，但消息体用 Protobuf 序列化拿版本兼容性，而不是手写小端（旧版手写小端就是技术债，已替换）。诚实补充：面试先讲功能的取舍，再讲本项目为什么自制——这是验证过吞吐的取舍。
+- **测试证据**：`transport_test.cc` 用 Google Test 定义 WireTransport，把进程内 LocalTransport 的每条 RPC 强制走真实线上格式（Protobuf 序列化 → CRC 帧 → 帧解析 → 反序列化）双向跑，覆盖 3 节点选举/日志复制/二进制安全值；`set_corrupt_frames(true)` 翻转一字节 → CRC 拒绝 → 选举失败，证明线上格式的损坏检测在集群行为层面生效。
+- **缺陷（L4）**：a) 同步阻塞式 RPC 被锁串行——同一 peer 的 AppendEntries 与 Heartbeat 无法并行，大日志下心跳被拖；b) 帧头长度字段手写小端无静态断言。
 - **改进**：读写分帧器异步化；AppendEntries 与 Heartbeat 各一条连接。

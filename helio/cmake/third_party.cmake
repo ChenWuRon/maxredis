@@ -208,6 +208,41 @@ if (NOT gtest_POPULATED)
     add_subdirectory(${gtest_SOURCE_DIR} ${gtest_BINARY_DIR})
 endif ()
 
+# Protocol Buffers: wire serialization for Raft RPCs (see server/raft/proto).
+# Version 3.21.x builds standalone (no abseil), including libprotobuf + protoc.
+set(PROTOBUF_CPP_VERSION 3.21.12)
+set(PROTOBUF_TARBALL "${CMAKE_BINARY_DIR}/protobuf-cpp-${PROTOBUF_CPP_VERSION}.tar.gz")
+
+if(NOT EXISTS "${PROTOBUF_TARBALL}")
+  download_and_validate("https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-${PROTOBUF_CPP_VERSION}.tar.gz" "${PROTOBUF_TARBALL}" st1)
+  list(GET st1 0 rc1)
+  if(NOT rc1 EQUAL 0)
+    file(REMOVE "${PROTOBUF_TARBALL}")
+    message(STATUS "Primary protobuf download failed: ${st1}. Trying ghproxy mirror...")
+    download_and_validate("https://ghproxy.net/https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-${PROTOBUF_CPP_VERSION}.tar.gz" "${PROTOBUF_TARBALL}" st2)
+    list(GET st2 0 rc2)
+    if(NOT rc2 EQUAL 0)
+      file(REMOVE "${PROTOBUF_TARBALL}")
+      message(FATAL_ERROR "Failed to download protobuf.\nGitHub: ${st1}\nghproxy: ${st2}")
+    endif()
+  endif()
+endif()
+
+FetchContent_Declare(
+  protobuf
+  URL "${PROTOBUF_TARBALL}"
+)
+
+FetchContent_GetProperties(protobuf)
+if (NOT protobuf_POPULATED)
+  FetchContent_Populate(protobuf)
+  set(protobuf_BUILD_TESTS OFF CACHE BOOL "")
+  set(protobuf_BUILD_CONFORMANCE OFF CACHE BOOL "")
+  set(protobuf_BUILD_EXAMPLES OFF CACHE BOOL "")
+  set(protobuf_INSTALL OFF CACHE BOOL "")
+  add_subdirectory(${protobuf_SOURCE_DIR} ${protobuf_BINARY_DIR})
+endif ()
+
 FetchContent_Declare(
   benchmark
   URL https://github.com/google/benchmark/archive/v1.9.1.tar.gz

@@ -98,6 +98,7 @@ void Service::Init(util::AcceptServer* acceptor) {
 
   std::string raft_dir = absl::GetFlag(FLAGS_raft_dir);
   bool raft_persistence = !raft_dir.empty();
+  raft_persistence_ = raft_persistence;
 
   // When the Raft WAL is the durability mechanism, the Raft snapshot dir is
   // the ONLY authoritative state source: the server-level snapshot.bin / AOF
@@ -121,7 +122,11 @@ void Service::Init(util::AcceptServer* acceptor) {
     }
   }
 
-  persistence_manager_->Open("appendonly.aof");
+  // Server-level AOF is only meaningful in single-node mode: in Raft mode the
+  // WAL is the authoritative durable write path and the AOF is never replayed.
+  if (!raft_persistence) {
+    persistence_manager_->Open("appendonly.aof");
+  }
 
   if (raft_persistence) {
     // Durable Raft state: open the segmented WAL + meta, restore in-flight
@@ -577,7 +582,7 @@ void Service::Set(CmdArgList args, ConnectionContext* cntx) {
 
   cntx->SendStored();
 
-  if (!replay_mode_) {
+  if (!replay_mode_ && !raft_persistence_) {
     vector<string> cmd_args;
     cmd_args.reserve(pcmd.argc);
     for (unsigned i = 0; i < pcmd.argc; ++i) {
@@ -636,7 +641,7 @@ void Service::Del(CmdArgList args, ConnectionContext* cntx) {
 
   cntx->SendLong(result.affected_rows);
 
-  if (!replay_mode_) {
+  if (!replay_mode_ && !raft_persistence_) {
     vector<string> cmd_args;
     cmd_args.reserve(pcmd.argc);
     for (unsigned i = 0; i < pcmd.argc; ++i) {

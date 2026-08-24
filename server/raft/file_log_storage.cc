@@ -131,7 +131,7 @@ const LogEntry* FileLogStorage::Get(LogIndex index) const {
   return &cached_entry_;
 }
 
-LogIndex FileLogStorage::Append(LogEntry entry) {
+LogIndex FileLogStorage::Append(LogEntry entry, bool flush) {
   entry.index = last_index_ + 1;
 
   // Auto-rotate if current segment exceeds limit.

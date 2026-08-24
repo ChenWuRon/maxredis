@@ -7,6 +7,7 @@
 #include <gmock/gmock.h>
 
 #include "base/gtest.h"
+#include "raft_rpc.pb.h"
 #include "server/raft/crc32.h"
 
 namespace dfly {
@@ -191,6 +192,37 @@ TEST(RaftCodecTest, DecoderBoundsChecks) {
   payload.push_back(static_cast<char>(0xFF));
   VoteRequest parsed;
   EXPECT_FALSE(ParseVoteRequest(payload, &parsed));
+}
+
+TEST(RaftCodecTest, PayloadIsStandardProtobuf) {
+  // The wire payload must be a plain protobuf message: any protobuf
+  // implementation can decode it without knowing about our frame layer.
+  VoteRequest req{3, 9, "candidate", 88, 8};
+  string payload = SerializeVoteRequest(req);
+
+  dfly::raft::VoteRequest pb;
+  ASSERT_TRUE(pb.ParseFromString(payload));
+  EXPECT_EQ(3u, pb.group_id());
+  EXPECT_EQ(9u, pb.term());
+  EXPECT_EQ("candidate", pb.candidate_id());
+  EXPECT_EQ(88u, pb.last_log_index());
+  EXPECT_EQ(8u, pb.last_log_term());
+}
+
+TEST(RaftCodecTest, UnknownProtoFieldsAreIgnored) {
+  // Forward compatibility: a peer running a NEWER binary may append fields
+  // this build does not know. protobuf must skip them instead of failing.
+  VoteRequest req{3, 9, "candidate", 88, 8};
+  string payload = SerializeVoteRequest(req);
+
+  // Append an unknown field: field 99, varint, value 1 (tag 0x98 0x06).
+  payload.push_back(static_cast<char>(0x98));
+  payload.push_back(static_cast<char>(0x06));
+  payload.push_back(static_cast<char>(0x01));
+
+  VoteRequest parsed;
+  ASSERT_TRUE(ParseVoteRequest(payload, &parsed));
+  EXPECT_EQ(req, parsed);
 }
 
 }  // namespace dfly

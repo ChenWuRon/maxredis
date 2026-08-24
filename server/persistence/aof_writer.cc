@@ -33,12 +33,13 @@ bool AofWriter::Open(std::string_view path) {
 
 void AofWriter::Append(std::string_view record) {
   DCHECK(file_);
+  std::lock_guard<util::fb2::Mutex> lock(mu_);
   buf_.append(record.data(), record.size());
 }
 
 void AofWriter::Flush() {
   DCHECK(file_);
-
+  std::lock_guard<util::fb2::Mutex> lock(mu_);
   if (buf_.empty())
     return;
 

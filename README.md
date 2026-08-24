@@ -290,18 +290,21 @@ server/
 │   ├── Election
 │   │   └── election_timer.h/cc  Randomized election timer [150, 300]ms (fiber-based)
 │   │
-│   ├── RPC Messages (structs only)
-│   │   ├── vote_rpc.h           VoteRequest / VoteResponse
-│   │   ├── append_entries_rpc.h AppendEntriesRequest / AppendEntriesResponse
-│   │   ├── heartbeat_rpc.h      HeartbeatRequest / HeartbeatResponse
+│   ├── RPC Messages
+│   │   ├── proto/raft_rpc.proto  Protobuf wire schema for all 12 RPC messages
+│   │   ├── vote_rpc.h            VoteRequest / VoteResponse (C++ structs)
+│   │   ├── append_entries_rpc.h  AppendEntriesRequest / AppendEntriesResponse
+│   │   ├── heartbeat_rpc.h       HeartbeatRequest / HeartbeatResponse
 │   │   ├── install_snapshot_rpc.h InstallSnapshotRequest / InstallSnapshotResponse
-│   │   ├── read_index_rpc.h     ReadIndexRequest / ReadIndexResponse
-│   │   └── timeout_now_rpc.h    TimeoutNowRequest / TimeoutNowResponse
+│   │   ├── read_index_rpc.h      ReadIndexRequest / ReadIndexResponse
+│   │   └── timeout_now_rpc.h     TimeoutNowRequest / TimeoutNowResponse
 │   │
 │   ├── Transport
-│   │   ├── transport.h          Transport abstract interface (6 RPC methods)
-│   │   ├── local_transport.h/cc In-process transport for testing
-│   │   └── peer_manager.h/cc    Peer node management
+│   │   ├── transport.h           Transport abstract interface (6 RPC methods)
+│   │   ├── raft_codec.h/cc       Frame codec: Protobuf payload + magic/type/seq/len/CRC32C
+│   │   ├── tcp_transport.h/cc    TCP transport (pooled per-proactor connections)
+│   │   ├── local_transport.h/cc  In-process transport for testing
+│   │   └── peer_manager.h/cc     Peer node management
 │   │
 │   ├── Log Storage
 │   │   ├── log_storage.h        ILogStorage abstract interface
@@ -368,6 +371,64 @@ server/
 
 ---
 
+## Quick Start (build → run, verified)
+
+End-to-end sequence that was verified on this machine (Ubuntu 24.04, aarch64):
+
+```bash
+# 1. Clone
+git clone --recursive https://github.com/romange/midi-redis
+cd midi-redis
+
+# 2. Configure (WITH_AWS=OFF avoids the zlib1g-dev dependency; not used by this project)
+cmake -B build-opt -DCMAKE_BUILD_TYPE=Release -GNinja \
+      -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DWITH_AWS=OFF
+
+# 3. Build (~5-10 min; needs several GB free disk; -j limits build parallelism)
+ninja -C build-opt midi-redis            # full parallelism
+ninja -j4 -C build-opt midi-redis        # limit to 4 jobs (low-memory machines)
+
+# 4. Run (foreground)
+build-opt/midi-redis --logtostderr
+
+# 5. Verify — node self-bootstraps as Raft Leader on port 6380
+redis-cli -p 6380 PING          # → PONG
+redis-cli -p 6380 SET hello world
+redis-cli -p 6380 GET hello     # → "world"
+redis-cli -p 6380 INFO raft     # role:leader, term, commit/applied index
+
+# 6. Stop
+pkill -f midi-redis             # AOF + snapshot restore automatically on restart
+```
+
+Background variant:
+
+```bash
+nohup build-opt/midi-redis --logtostderr > /tmp/midi-redis.log 2>&1 &
+tail -f /tmp/midi-redis.log
+```
+
+Durable Raft mode (WAL-backed, see "Durable Raft mode" below for the disk layout):
+
+```bash
+build-opt/midi-redis --raft_dir=./data --logtostderr
+```
+
+Limiting CPU cores:
+
+```bash
+# runtime: cap the io/fiber thread pool (default: 0 = one thread per core)
+build-opt/midi-redis --proactor_threads=2 --logtostderr
+# log shows: "Running 2 io threads"
+
+# OS-level alternative (also restricts any helper threads)
+taskset -c 0-3 build-opt/midi-redis --logtostderr
+```
+
+If any step fails, check [Troubleshooting](#troubleshooting) below.
+
+---
+
 ## Building from source
 
 Tested on Ubuntu 21.04+.
@@ -397,6 +458,22 @@ If build files become stale after restructuring:
 cmake -B build-opt -DCMAKE_BUILD_TYPE=Release -GNinja -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 ninja -C build-opt midi-redis
 ```
+
+### Troubleshooting
+
+- **`ZLIB::ZLIB target not found`** — the AWS/S3 support in Helio needs `zlib1g-dev`
+  (`sudo apt-get install zlib1g-dev`). If you cannot install system packages, disable
+  AWS support (midi-redis itself does not use it):
+
+  ```
+  cmake -B build-opt -DCMAKE_BUILD_TYPE=Release -GNinja -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DWITH_AWS=OFF
+  ninja -C build-opt midi-redis
+  ```
+
+- **`No space left on device` during linking** — a full Release build (third-party
+  deps + binary) needs several GB of free disk space. Check with `df -h .`; large
+  reclaimable sources are usually `~/.vscode-server/cli/servers/*` (stale remote
+  server versions) and npm/pip caches.
 
 ### Running Tests
 
@@ -445,7 +522,62 @@ ninja -C build-opt midi-redis
 build-opt/midi-redis --logtostderr
 ```
 
+Default listeners (verified):
+
+| Port | Protocol | Flag |
+|------|----------|------|
+| 6380 | Redis RESP | `--port` |
+| 8080 | HTTP (metrics/status) | `--http_port` |
+| disabled | Memcached ASCII (enable by setting > 0) | `--memcache_port` |
+
+On startup the node self-bootstraps as Raft Leader of a single-node cluster
+(`INFO` shows `role:leader`). Quick check:
+
+```
+redis-cli -p 6380 PING     # → PONG
+```
+
 For more options, run `build-opt/midi-redis --help`.
+
+### Benchmarking vs Redis
+
+Measured on Ubuntu 24.04, aarch64, 6 cores, both servers local:
+
+```bash
+# midi-redis (left column below)
+build-opt/midi-redis --logtostderr --proactor_threads=2
+
+# reference Redis 7.2.5, pinned to 2 cores, page-cache AOF (comparable flush policy)
+redis-server --port 6381 --dir /tmp/redis-data --save '' \
+             --appendonly yes --appendfsync no
+taskset -c 0,1 redis-server ...   # as started above
+
+redis-benchmark -p <port> -t set,get -n 200000 -c 50 -d 64 -q        # basic
+redis-benchmark -p <port> -t set,get -n 200000 -c 50 -P 16 -d 64 -q  # pipelined
+```
+
+Results (`requests/sec`, n=200k, c=50, value=64B):
+
+| Workload | midi-redis (2 io threads) | Redis 7.2.5 (2 cores) | midi-redis / Redis |
+|----------|--------------------------:|----------------------:|-------------------:|
+| SET          | 30,883 | 195,695 | 16% |
+| GET          | 164,609 | 180,505 | **91%** |
+| SET (P16)    | 53,248 | 900,901 | 6% |
+| GET (P16)    | 1,398,601 | 1,869,159 | **75%** |
+
+Interpretation:
+
+- **Reads are competitive**: `kLocal` GETs reach ~75–91% of stock Redis.
+- **Writes pay the consensus tax**: every SET traverses the Raft pipeline
+  (RESP encode → WAL append + CRC32C → commit → state-machine apply → reply),
+  so even a single node costs ~6x vs Redis's in-place dict mutation. This buys
+  linearizable history, replication readiness, and crash-safe WAL recovery.
+- **More threads ≠ faster here**: with the default 6 io threads throughput drops
+  (SET ~21k, GET ~97k) because all writes serialize on the single RaftNode mutex
+  while cross-shard dispatch adds hops. On small boxes cap
+  `--proactor_threads=2`.
+- Pipelining (-P 16) mainly helps reads; write batching happens at the
+  connection layer but each entry still commits individually.
 
 ### Snapshot
 

@@ -268,7 +268,7 @@ const LogEntry* SegmentLogStorage::Get(LogIndex index) const {
   return nullptr;
 }
 
-LogIndex SegmentLogStorage::Append(LogEntry entry) {
+LogIndex SegmentLogStorage::Append(LogEntry entry, bool flush) {
   if (dir_.empty()) {
     // In-memory mode (no persistence directory configured).
     entry.index = last_index_ + 1;
@@ -296,7 +296,10 @@ LogIndex SegmentLogStorage::Append(LogEntry entry) {
 
   // Durability policy: fsync per append (default, kill -9 + power-loss safe)
   // or page-cache write (everysec mode — a background fiber fsyncs).
-  bool write_ok = fsync_per_append_ ? writer_->Flush() : writer_->WriteNoSync();
+  // When |flush| is false (leader write path), we only write the bytes and
+  // defer the fsync to Persist(), which the caller invokes OUTSIDE mutex_.
+  bool write_ok = (flush && fsync_per_append_) ? writer_->Flush()
+                                               : writer_->WriteNoSync();
   if (!write_ok) {
     LOG(ERROR) << "SegmentLogStorage: WAL write failed at index " << entry.index;
   }
@@ -428,6 +431,13 @@ bool SegmentLogStorage::Flush() {
   if (writer_ && writer_->IsOpen())
     return writer_->Flush();
   return true;
+}
+
+void SegmentLogStorage::Persist() {
+  // Per-append durability only: in everysec mode the periodic background
+  // fsync owns durability, so this is intentionally a no-op there.
+  if (writer_ && writer_->IsOpen() && fsync_per_append_)
+    writer_->Flush();
 }
 
 void SegmentLogStorage::PruneCompacted() {

@@ -51,8 +51,14 @@ class ILogStorage {
   }
 
   // Appends a single entry. Automatically assigns entry.index = LastIndex() + 1.
-  // Returns the assigned index.
-  virtual LogIndex Append(LogEntry entry) = 0;
+  // Returns the assigned index. When |flush| is false the implementation writes
+  // the bytes but defers the fsync, which the caller performs via Persist()
+  // (typically OUTSIDE the consensus lock).
+  virtual LogIndex Append(LogEntry entry, bool flush = true) = 0;
+
+  // Flush (fsync) any un-flushed WAL bytes. No-op by default; SegmentLogStorage
+  // overrides it to honor the per-append durability policy.
+  virtual void Persist() {}
 
   // Returns entries with index in [start, start + limit).
   // limit == 0 means all entries from start onward.

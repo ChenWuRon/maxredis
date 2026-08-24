@@ -1215,6 +1215,7 @@ InstallSnapshotResponse RaftNode::OnInstallSnapshot(const InstallSnapshotRequest
 }
 
 ApplyResult RaftNode::SubmitEntry(LogEntry entry) {
+  LogIndex idx = 0;
   {
     std::lock_guard guard(mutex_);
     if (!log_storage_)
@@ -1225,9 +1226,104 @@ ApplyResult RaftNode::SubmitEntry(LogEntry entry) {
     }
     entry.term = storage_.current_term();
     entry.index = 0;  // the log assigns the index
-    log_storage_->Append(std::move(entry));
+    // Append the bytes under the lock, but defer the fsync to Persist() (done by
+    // the batch coordinator). Index is assigned here so log order is fixed.
+    log_storage_->Append(std::move(entry), /*flush=*/false);
+    idx = log_storage_->LastIndex();
   }
-  return ReplicateLog(/*low_latency=*/true);  // client write: quorum suffices
+
+  // Group commit: N concurrent SETs that arrive in the same window share ONE
+  // WAL fsync + ONE ReplicateLog round + ONE apply sweep. One caller becomes the
+  // coordinator; the rest join its batch and wait. Safe under linearizability:
+  // indices are assigned above in order, commit/apply follow log order, and the
+  // coordinator replicates the ENTIRE tail (GetRange) so even late joiners'
+  // entries are included and applied before their waiters are released.
+  RaftWaiter w;
+  w.idx = idx;
+
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    bool became_coordinator = false;
+    {
+      std::lock_guard gg(group_mu_);
+      if (group_active_) {
+        group_waiters_.push_back(&w);
+      } else {
+        group_active_ = true;
+        group_waiters_.push_back(&w);
+        became_coordinator = true;
+      }
+    }
+
+    if (became_coordinator) {
+      CoordinatorCommit();
+    } else {
+      std::unique_lock wl(w.mu);
+      w.cv.wait(wl, [&] { return w.done; });
+    }
+
+    if (w.done)
+      return w.res;
+
+    // Not fulfilled by the batch we joined (e.g. coordinator hit a step-down or
+    // error path). Re-check whether our entry was applied by a concurrent commit;
+    // otherwise retry and possibly lead a fresh batch. Bounded by attempt count.
+    {
+      std::lock_guard guard(mutex_);
+      if (idx <= last_applied_) {
+        w.res = {ApplyOp::OK, 1};
+        return w.res;
+      }
+    }
+  }
+  return {ApplyOp::ERROR, 0};
+}
+
+void RaftNode::CoordinatorCommit() {
+  // Take ownership of the in-flight batch atomically: swap it out and clear
+  // group_active_ so that any request arriving from now on starts a FRESH
+  // group (its own coordinator). This guarantees every entry belongs to exactly
+  // one coordinator and is applied before its waiter is released.
+  std::vector<RaftWaiter*> batch;
+  {
+    std::lock_guard gg(group_mu_);
+    batch.swap(group_waiters_);
+    group_waiters_.clear();
+    group_active_ = false;
+  }
+
+  LogIndex applied_snapshot = 0;
+  try {
+    log_storage_->Persist();  // group fsync (no-op if not fsync_per_append_)
+    // Apply until every entry in this batch is committed + applied. Entries may
+    // have been appended by concurrent callers who already joined this batch;
+    // re-running ReplicateLog (which advances commit to LastIndex) + Apply picks
+    // them up. Bounded by a retry cap to avoid spinning on a stuck cluster.
+    for (int i = 0; i < 16; ++i) {
+      ReplicateLog(/*low_latency=*/true);  // replicates whole tail, advances commit
+      {
+        std::lock_guard guard(mutex_);
+        ApplyCommittedLogsLocked();
+        applied_snapshot = last_applied_;
+      }
+      LogIndex maxq = 0;
+      for (RaftWaiter* wp : batch)
+        maxq = std::max(maxq, wp->idx);
+      if (maxq <= applied_snapshot)
+        break;
+    }
+  } catch (...) {
+    applied_snapshot = 0;  // entries not applied -> batch waiters get ERROR
+  }
+
+  for (RaftWaiter* wp : batch) {
+    ApplyResult r;
+    r.op = (wp->idx <= applied_snapshot) ? ApplyOp::OK : ApplyOp::ERROR;
+    r.affected_rows = (r.op == ApplyOp::OK) ? 1 : 0;
+    std::lock_guard wl(wp->mu);
+    wp->res = r;
+    wp->done = true;
+    wp->cv.notify_one();
+  }
 }
 
 ApplyResult RaftNode::ReplicateLog(bool low_latency) {

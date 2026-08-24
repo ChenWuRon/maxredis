@@ -937,7 +937,7 @@ class MockLogStorage : public ILogStorage {
   MOCK_METHOD(const LogEntry*, Get, (LogIndex), (const, override));
   MOCK_METHOD(Term, GetTerm, (LogIndex), (const, override));
   MOCK_METHOD(void, SetSnapshotAnchor, (LogIndex, Term), (override));
-  MOCK_METHOD(LogIndex, Append, (LogEntry), (override));
+  MOCK_METHOD(LogIndex, Append, (LogEntry, bool), (override));
   MOCK_METHOD(std::vector<LogEntry>, GetRange, (LogIndex, size_t), (const, override));
   MOCK_METHOD(void, TruncateFrom, (LogIndex), (override));
   MOCK_METHOD(bool, CompactUpTo, (LogIndex), (override));
@@ -1041,7 +1041,7 @@ TEST_F(RaftNodeTest, MockStorageTruncateOnConflict) {
 
   // Should detect conflict at index 3, truncate to index 2, and append leader entry
   EXPECT_CALL(mock_storage, TruncateFrom(2));
-  EXPECT_CALL(mock_storage, Append(_));
+  EXPECT_CALL(mock_storage, Append(_, ::testing::_));
 
   AppendEntriesResponse rsp = follower.OnAppendEntries(req);
 
